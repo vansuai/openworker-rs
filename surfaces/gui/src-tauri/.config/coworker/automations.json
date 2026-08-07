@@ -1,0 +1,34 @@
+{
+  "runs": {},
+  "tasks": {
+    "task-c42c282b-3": {
+      "agent": "cowork",
+      "alwaysAllowedCommands": [],
+      "alwaysAllowedTools": [],
+      "createdAt": 1785920465.553035,
+      "enabled": true,
+      "id": "task-c42c282b-3",
+      "instructions": "Search the web for the most important technology and world news from the last 24 hours and write a concise 5-bullet briefing, saved as a markdown file.",
+      "lastRun": null,
+      "lastStatus": null,
+      "maxRuns": null,
+      "model": null,
+      "notifyOnCompletion": true,
+      "notifyTarget": null,
+      "originSessionId": "",
+      "originSurface": "cowork",
+      "runCount": 0,
+      "schedule": {
+        "cron": "0 8 * * *",
+        "fireAt": null,
+        "kind": "cron",
+        "timezone": "local"
+      },
+      "seenRunsAt": 1785920465.564324,
+      "taskSessionId": "__task__task-c42c282b-3",
+      "title": "Morning news briefing",
+      "updatedAt": 1785920465.564324,
+      "workspace": ""
+    }
+  }
+}

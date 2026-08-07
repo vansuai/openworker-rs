@@ -1,0 +1,3 @@
+[workspace]
+members = ["data", "provider", "engine", "server", "skills", "tools", "shell", "git", "connectors"]
+resolver = "2"

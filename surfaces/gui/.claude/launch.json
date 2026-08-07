@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "openworker",
+      "autoPort": false,
+      "port": 1420
+    }
+  ]
+}

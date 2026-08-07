@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+
+# Node
+node_modules/
+
+# Rust
+**/target/
+
+# Tauri
+surfaces/gui/dist/
+surfaces/gui/src-tauri/target/

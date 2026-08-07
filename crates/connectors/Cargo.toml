@@ -1,0 +1,26 @@
+[package]
+name = "ocw-connectors"
+version = "0.1.0"
+description = "OpenWorker messaging connector adapters + gateway + senders"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+
+[dependencies]
+ocw-engine = { path = "../engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"
+regex = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

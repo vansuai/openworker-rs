@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tauri-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "tauri", "--", "dev"],
+      "autoPort": true,
+      "cwd": "surfaces/gui",
+      "env": {
+        "COWORKER_SERVER_BIN": "/Users/ygqbasic/Documents/source/product/openworker/crates/target/release/ocw-server"
+      }
+    }
+  ]
+}
