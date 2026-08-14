@@ -1,10 +1,11 @@
 //! Shared server state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use parking_lot::RwLock as PlRwLock;
 use tokio::sync::broadcast;
 
 use crate::automations::AutomationStore;
@@ -31,6 +32,30 @@ use tokio::sync::RwLock as TokioRwLock;
 pub type Shared<T> = Arc<TokioRwLock<T>>;
 /// Standard library RwLock — safe to block on from async contexts.
 pub type StdShared<T> = Arc<StdRwLock<T>>;
+
+// When-to-remember rules, injected whenever the memory store is wired. Without these,
+// models either never call `remember` or save noise the repo already records.
+// Mirror of `coworker/agent.py::_MEMORY_GUIDANCE`.
+const MEMORY_GUIDANCE: &str = "Memory:\n\
+- You have persistent memory across sessions. Use `remember` for durable facts: the user's \
+corrections and stated preferences (include the why), and project context you couldn't \
+rederive from the code. Don't save what the repo already records (code structure, git \
+history, AGENTS.md) or details that only matter to the current task. Use absolute dates, \
+never \"yesterday\".\n\
+- Before saving, check the known-memories list: if an entry already covers it, revise that \
+entry with `memory_update` instead of adding a near-duplicate; retire wrong or obsolete \
+entries with `memory_forget`.\n\
+- Memories reflect when they were written. If one names a file, flag, or URL, verify it \
+still exists before relying on it.";
+
+// The GUI interleaves narration lines with humanized tool rows inside a collapsed "turn" —
+// they're what the user reads while the agent works. Universal (appended for every agent).
+// Mirror of `coworker/agent.py::_NARRATION_GUIDANCE`.
+const NARRATION_GUIDANCE: &str = "Narration: before each batch of tool calls, write ONE short \
+plain sentence saying what you're doing and why (e.g. \"Checking what merged since \
+yesterday's digest.\"). It is shown to the user as live progress. Don't narrate trivial \
+single-call follow-ups, don't repeat the previous line, and never let narration replace \
+your final answer.";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -703,8 +728,11 @@ impl SettingsManager {
                 env_ok || store_ok
             });
             first_configured
-                .and_then(|d| d.recommended_model.clone())
-                .unwrap_or_else(|| "deepseek:deepseek-v4-flash".into())
+                .and_then(|d| {
+                    let rec = d.recommended_model.clone()?;
+                    Some(if d.name == "openai" { rec } else { format!("{}:{}", d.name, rec) })
+                })
+                .unwrap_or_else(|| "gpt-5.6-sol".into())
         };
 
         // Determine source and has_key for the effective default model
@@ -819,7 +847,7 @@ impl SettingsManager {
             .unwrap_or(false)
     }
 
-    fn _model_provider(&self, model: &str) -> String {
+    pub(crate) fn _model_provider(&self, model: &str) -> String {
         if let Some(idx) = model.find(':') {
             let prefix = &model[..idx];
             if ocw_provider::get_descriptor(prefix).is_some() {
@@ -1100,6 +1128,30 @@ pub struct RootEntry {
 }
 
 // ---------------------------------------------------------------------------
+// SessionRunState — shared per-session engine + run/cancel state
+// ---------------------------------------------------------------------------
+
+/// Shared per-session runtime state. Stored in `running_engines` and shared
+/// across all WS connections to the same session. Mirrors Python's
+/// `SessionManager._engines` + the running/cancel flags that were previously
+/// per-WS on `SessionCtx`.
+pub struct SessionRunState {
+    pub engine: Arc<PlRwLock<Option<ocw_engine::TurnEngine>>>,
+    pub running: PlRwLock<bool>,
+    pub cancel: Arc<std::sync::Mutex<bool>>,
+}
+
+impl SessionRunState {
+    pub fn new() -> Self {
+        Self {
+            engine: Arc::new(PlRwLock::new(None)),
+            running: PlRwLock::new(false),
+            cancel: Arc::new(std::sync::Mutex::new(false)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -1111,6 +1163,10 @@ pub struct AppState {
     pub conversation_store: Arc<ConversationStore>,
     pub sessions: StdShared<HashMap<String, SessionMeta>>,
     pub session_messages: StdShared<HashMap<String, SessionMessages>>,
+    /// Shared engine registry — mirrors Python's `SessionManager._engines`.
+    /// When a WS reconnects to a session, it reuses the existing engine + run state
+    /// instead of building a new one.
+    pub running_engines: Arc<PlRwLock<HashMap<String, Arc<SessionRunState>>>>,
     pub ws_sessions: StdShared<HashMap<String, tokio::sync::broadcast::Sender<Value>>>,
     pub skill_store: Arc<SkillStore>,
     pub session_skills: Arc<SessionSkillStore>,
@@ -1153,6 +1209,41 @@ pub struct AppState {
     pub channel_buffer: Arc<ChannelBuffer>,
     /// Browser-session state contract (no Playwright in this build).
     pub browser: Arc<BrowserController>,
+    /// LLM auto-title bookkeeping (mirror of `manager.py`'s in-memory counters):
+    /// per-session attempt count and the IDs currently generating.
+    pub autotitle_attempts: StdShared<HashMap<String, u32>>,
+    pub autotitle_inflight: StdShared<HashSet<String>>,
+}
+
+/// The auto-title system prompt (verbatim mirror of `manager.py::_AUTOTITLE_PROMPT`).
+const AUTOTITLE_PROMPT: &str = "You title chat sessions. Given the user's opening message(s), \
+reply with ONLY a 4-5 word title for the session — no quotes or punctuation wrapping it. If \
+the opening is merely a greeting or small-talk with no topic (\"hey\", \"how are you\", \"hi \
+there\"), reply with exactly: small-talk";
+
+/// Sanitize a generated title: surrounding quotes off, whitespace collapsed, capped at 60.
+/// Returns None for empty/oversized titles or the small-talk sentinel — the sentinel leaves
+/// auto_title unset so the next turn's retry can run.
+fn sanitize_autotitle(raw: &str) -> Option<String> {
+    let stripped = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}'));
+    let title: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Sentinel tolerance: models riff on the exact token ("Small talk.", quoted, trailing
+    // period) — normalize before comparing, else the riff becomes the title.
+    let norm: String = title
+        .to_lowercase()
+        .trim_matches(|c| matches!(c, '.' | '!' | ',' | ';' | ':' | '\'' | '"'))
+        .chars()
+        .map(|c| if c == ' ' || c == '_' { '-' } else { c })
+        .collect();
+    if norm == "small-talk" || norm == "smalltalk" {
+        return None;
+    }
+    if title.is_empty() || title.chars().count() > 80 {
+        return None;
+    }
+    Some(title.chars().take(60).collect())
 }
 
 impl AppState {
@@ -1228,6 +1319,7 @@ impl AppState {
             conversation_store: Arc::new(conversation_store),
             sessions: Arc::new(StdRwLock::new(sessions)),
             session_messages: Arc::new(StdRwLock::new(HashMap::new())),
+            running_engines: Arc::new(PlRwLock::new(HashMap::new())),
             ws_sessions: Arc::new(StdRwLock::new(HashMap::new())),
             skill_store: Arc::new(SkillStore::new(data_dir.clone())),
             session_skills: Arc::new(SessionSkillStore::new(Some(
@@ -1267,6 +1359,8 @@ impl AppState {
                 Some(data_dir.join("channels.json")),
             )),
             browser: Arc::new(BrowserController::new()),
+            autotitle_attempts: Arc::new(StdRwLock::new(HashMap::new())),
+            autotitle_inflight: Arc::new(StdRwLock::new(HashSet::new())),
         }
     }
 
@@ -1304,20 +1398,18 @@ impl AppState {
     }
 
     /// Build initial system messages for a new turn engine.
-    /// Includes agent instructions, memory, skill catalog, and current date.
-    pub fn build_system_messages(
+    /// Includes agent instructions, narration guidance, environment snapshot, AGENTS.md,
+    /// memory guidance + entries, skill catalog, MCP tools, and connector tools.
+    /// Mirrors the assembly order of `coworker/agent.py::build_engine`.
+    pub async fn build_system_messages(
         &self,
         agent: &str,
         workspace: &str,
         _model: &str,
     ) -> Vec<ocw_engine::Message> {
         let mut messages = Vec::new();
-        let now = chrono::Local::now();
-        let date_str = now.format("%Y-%m-%d").to_string();
 
         let base_instructions = crate::agents::get_agent(agent).system_prompt;
-
-        let ws_info = format!("Current date: {date_str}\nWorkspace: {workspace}",);
 
         // Inject memory entries
         let memory_text = self.format_memory_for_prompt(workspace);
@@ -1325,11 +1417,26 @@ impl AppState {
         // Inject skill catalog
         let skill_text = self.format_skills_for_prompt(workspace);
 
+        // Inject MCP tool descriptions (cached only — does not block on connect)
+        let mcp_text = self.format_mcp_tools_for_prompt().await;
+
+        // Inject connector tool descriptions
+        let connector_text = self.format_connector_tools_for_prompt();
+
         let mut system = String::new();
         system.push_str(&base_instructions);
         system.push_str("\n\n");
-        system.push_str(&ws_info);
+        system.push_str(NARRATION_GUIDANCE);
+        // Always inject the current date — even without a workspace (Chat agent).
+        // The per-turn <system-context> provides the most current date; this baseline
+        // ensures the model has at least a session-start anchor.
+        let today = chrono::Local::now().format("%Y-%m-%d");
+        system.push_str(&format!("\n\nCurrent date: {today}"));
         if !workspace.trim().is_empty() {
+            // Environment snapshot (workspace/platform/date/git) + folder-scope warning —
+            // mirror of `agent.py`'s `environment_context(ws)`.
+            system.push_str("\n\n");
+            system.push_str(&crate::environment::environment_context(workspace).await);
             // AGENTS.md conventions (global + project root) — mirror of
             // `agent.py`'s `conventions = load_agents_md(ws)` branch.
             let conventions = crate::project::load_agents_md(workspace, &self.config.data_dir);
@@ -1338,6 +1445,8 @@ impl AppState {
                 system.push_str(&conventions);
             }
         }
+        system.push_str("\n\n");
+        system.push_str(MEMORY_GUIDANCE);
         if !memory_text.is_empty() {
             system.push_str("\n\n");
             system.push_str(&memory_text);
@@ -1346,9 +1455,79 @@ impl AppState {
             system.push_str("\n\n");
             system.push_str(&skill_text);
         }
+        if !mcp_text.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&mcp_text);
+        }
+        if !connector_text.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&connector_text);
+        }
 
         messages.push(ocw_engine::Message::system(system));
         messages
+    }
+
+    /// Format MCP server tools for the system prompt.
+    async fn format_mcp_tools_for_prompt(&self) -> String {
+        let servers = self.mcp_store.list();
+        if servers.is_empty() {
+            return String::new();
+        }
+        let mut blocks = Vec::new();
+        for s in &servers {
+            let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(tools) = self.mcp_runtime.cached_tools(name).await {
+                if tools.is_empty() {
+                    continue;
+                }
+                let tool_lines: Vec<String> = tools
+                    .iter()
+                    .map(|t| format!("- {}: {}", t.name, t.description))
+                    .collect();
+                blocks.push(format!(
+                    "MCP server \"{name}\" tools:\n{}",
+                    tool_lines.join("\n")
+                ));
+            }
+        }
+        if blocks.is_empty() {
+            return String::new();
+        }
+        format!(
+            "Connected MCP servers (use mcp__{{server}}__{{tool}} to call):\n{blocks}",
+            blocks = blocks.join("\n\n")
+        )
+    }
+
+    /// Format connected connector tools for the system prompt.
+    fn format_connector_tools_for_prompt(&self) -> String {
+        let descriptors = self.connector_store.list_descriptors();
+        let connected: Vec<_> = descriptors
+            .iter()
+            .filter(|d| self.connector_store.is_connected(&d.name))
+            .collect();
+        if connected.is_empty() {
+            return String::new();
+        }
+        let mut blocks = Vec::new();
+        for d in &connected {
+            if d.instructions.is_empty() {
+                continue;
+            }
+            let lines: Vec<String> = d.instructions.iter().map(|i| format!("- {i}")).collect();
+            blocks.push(format!("{}:\n{}", d.title, lines.join("\n")));
+        }
+        if blocks.is_empty() {
+            return String::new();
+        }
+        format!(
+            "Connected services (you can interact with these):\n{}",
+            blocks.join("\n\n")
+        )
     }
 
     /// Format memory entries for system prompt injection.
@@ -1404,7 +1583,10 @@ impl AppState {
                     .unwrap_or(false);
                 env_ok || store_ok
             })
-            .and_then(|d| d.recommended_model.clone())
+            .and_then(|d| {
+                let rec = d.recommended_model.clone()?;
+                Some(if d.name == "openai" { rec } else { format!("{}:{}", d.name, rec) })
+            })
             .unwrap_or_default()
     }
 
@@ -1477,6 +1659,210 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// Snapshot of a session's messages — in-memory cache first, JSONL fallback when the
+    /// cache is empty (typical right after a restart until the first post-restart push
+    /// repopulates the entry). JSONL is the authoritative source: when it has more messages
+    /// than the in-memory cache, the cache is incomplete and JSONL wins.
+    fn messages_snapshot(&self, session_id: &str) -> Vec<Value> {
+        let in_mem = self
+            .session_messages
+            .read()
+            .unwrap()
+            .get(session_id)
+            .map(|d| d.messages.clone())
+            .unwrap_or_default();
+        let from_disk = self.conversation_store.read_jsonl(session_id);
+        // JSONL is the authoritative source: prefer it when it has more messages
+        // than the in-memory cache (which may be incomplete after a restart).
+        if from_disk.len() > in_mem.len() {
+            return from_disk;
+        }
+        if !in_mem.is_empty() {
+            return in_mem;
+        }
+        from_disk
+    }
+
+    /// Post-turn persistence — mirror of Python's `_persist_session`: the first line of the
+    /// first user message becomes the title snapshot, and message_count/updated_at keep the
+    /// sidebar order live. Uses the targeted `update_turn_meta` — the whole-row replace in
+    /// `save()` would clobber auto_title/renamed.
+    ///
+    /// Also ensures the JSONL file is up-to-date (safety net — the ws/scheduler spawn blocks
+    /// write JSONL directly, but this covers edge cases like restarts).
+    pub fn persist_turn(&self, session_id: &str) {
+        let messages = self.messages_snapshot(session_id);
+
+        // Ensure JSONL has every message (defence-in-depth — the spawn blocks
+        // also write JSONL directly, but a restart or timing gap could leave
+        // the file behind the in-memory cache).
+        let existing = self.conversation_store.count_jsonl(session_id);
+        if messages.len() > existing {
+            let values: Vec<Value> = messages[existing..].to_vec();
+            let _ = self.conversation_store.append_jsonl(session_id, &values);
+        }
+
+        let n_msgs = messages.len() as i64;
+
+        let (renamed, auto_title) = self
+            .conversation_store
+            .title_state(session_id)
+            .ok()
+            .flatten()
+            .unwrap_or((false, None));
+
+        let first_line = ConversationStore::title_from_messages(&messages);
+        // In-memory meta backs `/v1/sessions`: keep its title at the display precedence
+        // (renamed > auto_title > first-line snapshot). A renamed session keeps whatever
+        // `patch_session` stored.
+        let display = (!renamed).then(|| auto_title.unwrap_or_else(|| first_line.clone()));
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            if let Some(meta) = sessions.get_mut(session_id) {
+                meta.message_count = n_msgs;
+                meta.updated_at = Some(now);
+                if let Some(t) = display {
+                    meta.title = Some(t);
+                }
+            }
+        }
+        // The title column only moves while un-renamed, so a manual rename survives
+        // later turns (Python's save() COALESCEs against the existing title).
+        let sql_title = (!renamed).then_some(first_line.as_str());
+        let _ = self
+            .conversation_store
+            .update_turn_meta(session_id, sql_title, n_msgs);
+    }
+
+    /// Persist session grants to the SQLite row so approved tools survive a
+    /// restart. Called after every turn from ws.rs / scheduler.rs.
+    pub fn persist_grants(&self, session_id: &str, grants: &Value) {
+        let _ = self.conversation_store.update_grants(session_id, grants);
+    }
+
+    // -- LLM auto-titles (FB-010, mirror of `manager.py::_maybe_autotitle`) ----
+
+    /// Kick off title generation after a turn completes, fire-and-forget. Only while the
+    /// session has neither a manual rename nor a generated title, at most twice: attempt 1
+    /// rides turn 1, and the second window exists solely for the small-talk retry.
+    pub fn maybe_autotitle(&self, session_id: &str) {
+        // Automation runs (`__run__*`) are titled by their task; internal sessions skip.
+        if session_id.starts_with("__") {
+            return;
+        }
+        if self.autotitle_inflight.read().unwrap().contains(session_id) {
+            return;
+        }
+        let attempts = self
+            .autotitle_attempts
+            .read()
+            .unwrap()
+            .get(session_id)
+            .copied()
+            .unwrap_or(0);
+        if attempts >= 2 {
+            return;
+        }
+        let Some((renamed, auto_title)) = self
+            .conversation_store
+            .title_state(session_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if renamed || auto_title.is_some() {
+            return;
+        }
+        let model = self
+            .sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .map(|m| m.model.clone())
+            .unwrap_or_default();
+        if model.is_empty() {
+            return;
+        }
+        // The first two user openers feed the titling call.
+        let openers: Vec<String> = self
+            .messages_snapshot(session_id)
+            .iter()
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+            .filter_map(|m| {
+                let text = crate::attachments::content_to_text(
+                    m.get("content").unwrap_or(&Value::Null),
+                    "",
+                )
+                .trim()
+                .to_string();
+                (!text.is_empty()).then_some(text)
+            })
+            .take(2)
+            .collect();
+        if openers.is_empty() {
+            return;
+        }
+        self.autotitle_attempts
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), attempts + 1);
+        self.autotitle_inflight
+            .write()
+            .unwrap()
+            .insert(session_id.to_string());
+
+        let state = self.clone();
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            // One cheap non-streaming completion on the session's own provider/model.
+            // Every failure is swallowed — the first-line snapshot stays.
+            let provider = state.provider.clone();
+            let turn = tokio::task::spawn_blocking(move || {
+                provider.complete(
+                    &model,
+                    vec![
+                        json!({"role": "system", "content": AUTOTITLE_PROMPT}),
+                        json!({"role": "user", "content": openers.join("\n\n")}),
+                    ],
+                    None,
+                    json!({"temperature": 0.2, "max_tokens": 64, "reasoning_effort": "none"}),
+                )
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+
+            if let Some(title) = turn
+                .as_ref()
+                .and_then(|t| t.text.as_deref())
+                .and_then(sanitize_autotitle)
+            {
+                if state
+                    .conversation_store
+                    .set_auto_title(&sid, &title)
+                    .unwrap_or(false)
+                {
+                    // The store guard (renamed=0) passed, so the display title may move.
+                    {
+                        let mut sessions = state.sessions.write().unwrap();
+                        if let Some(meta) = sessions.get_mut(&sid) {
+                            meta.title = Some(title.clone());
+                        }
+                    }
+                    // Best-effort nudge for live viewers; the sidebar's poll picks the
+                    // new title up regardless.
+                    state.broadcast_sync(
+                        &sid,
+                        json!({"type": "session_title", "data": {"session_id": sid, "title": title}}),
+                    );
+                }
+            }
+            state.autotitle_inflight.write().unwrap().remove(&sid);
+        });
+    }
+
     /// Get an existing session or create a new one with a specific id.
     /// Used by automation `__run__` sessions that need an explicit ID.
     pub fn get_or_create_session(
@@ -1486,9 +1872,30 @@ impl AppState {
         workspace: Option<&str>,
     ) -> SessionMeta {
         {
-            let sessions = self.sessions.read().unwrap();
-            if let Some(s) = sessions.get(session_id) {
-                return s.clone();
+            let existing = self.sessions.read().unwrap().get(session_id).cloned();
+            if let Some(s) = existing {
+                let ws_empty = s
+                    .workspace
+                    .as_deref()
+                    .map_or(true, |w| w.trim().is_empty());
+                // Defensive: legacy rows persisted with an empty workspace (pre
+                // scratch-provision fix) come back as None after a restart — adopt
+                // the caller's workspace so artifact reads don't fail with
+                // "no workspace". Persist via the message snapshot so the JSONL
+                // history is preserved (an empty `messages` slice would rewrite
+                // and shrink it).
+                if ws_empty {
+                    if let Some(provided) = workspace.filter(|w| !w.trim().is_empty()) {
+                        let mut sessions = self.sessions.write().unwrap();
+                        if let Some(meta) = sessions.get_mut(session_id) {
+                            meta.workspace = Some(provided.to_string());
+                            let msgs = self.messages_snapshot(session_id);
+                            let _ = self.persist_session_meta(meta, &msgs);
+                            return meta.clone();
+                        }
+                    }
+                }
+                return s;
             }
         }
         let model = self.default_model_or_configured();
@@ -1509,6 +1916,14 @@ impl AppState {
             let mut msgs = self.session_messages.write().unwrap();
             msgs.insert(session_id.to_string(), SessionMessages::default());
         }
+        // Persist to SQLite — mirror of `create_session`. Without this row the
+        // session lives only in memory and vanishes from `/v1/sessions` on the
+        // next restart (the WS connect path is the most common creator, and
+        // `list_sessions` reads from the in-memory HashMap that startup
+        // rebuilds from SQLite). Side-effect of the miss: `session_exists`
+        // returns false on restart, `getSessionMessages` 404s, and the GUI's
+        // `selectSession` catch-all clears the transcript.
+        let _ = self.persist_session_meta(&meta, &[]);
         meta
     }
 
@@ -1530,7 +1945,15 @@ impl AppState {
         let mut sessions = self.sessions.write().unwrap();
         let meta = sessions.get_mut(session_id)?;
         if let Some(t) = title {
+            // Persist the rename (sets renamed=1 so first-line snapshots and auto-titles
+            // stop displacing it) — mirror of `manager.py::rename_session`.
+            let _ = self.conversation_store.rename(session_id, t);
             meta.title = Some(t.to_string());
+        }
+        if pinned.is_some() || archived.is_some() {
+            let _ = self
+                .conversation_store
+                .set_flags(session_id, pinned, archived);
         }
         if let Some(p) = pinned {
             meta.pinned = p;
@@ -1557,24 +1980,155 @@ impl AppState {
         self.sessions.write().unwrap().remove(session_id);
         self.session_messages.write().unwrap().remove(session_id);
         self.ws_sessions.write().unwrap().remove(session_id);
+        self.running_engines.write().remove(session_id);
         let _ = self.conversation_store.delete(session_id);
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Vec<Value> {
-        self.session_messages
+        // Check running engine first — mirrors Python's `session_messages`
+        // which prefers the live engine's in-memory thread over persisted records.
+        // During a turn the engine is taken out, so this falls through to JSONL —
+        // mid-turn checkpoints keep JSONL current.
+        if let Some(run) = self.running_engines.read().get(session_id) {
+            if let Some(engine) = run.engine.read().as_ref() {
+                let msgs: Vec<Value> = engine
+                    .messages()
+                    .iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or_default())
+                    .collect();
+                if !msgs.is_empty() {
+                    return msgs;
+                }
+            }
+        }
+
+        let in_mem = self
+            .session_messages
             .read()
             .unwrap()
             .get(session_id)
             .map(|m| m.messages.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Always check JSONL as the authoritative source: the in-memory cache
+        // may have been populated with partial data by push_message_sync before
+        // the full history was loaded (race after a restart).
+        let from_disk = self.conversation_store.read_jsonl(session_id);
+
+        if from_disk.len() > in_mem.len() {
+            // JSONL has more messages — it is the authoritative source.
+            // Repopulate the in-memory cache with the full history so
+            // subsequent reads are O(1) and push_message_sync appends to
+            // the complete list.
+            let mut guard = self.session_messages.write().unwrap();
+            guard.insert(
+                session_id.to_string(),
+                SessionMessages {
+                    messages: from_disk.clone(),
+                },
+            );
+            return from_disk;
+        }
+
+        if !in_mem.is_empty() {
+            return in_mem;
+        }
+
+        // Both empty — may be a brand-new session with no messages yet.
+        from_disk
+    }
+
+    /// Persist engine messages to JSONL via the shared message mirror.
+    /// Called from the live event pump at checkpoint events during a turn
+    /// (mirrors Python's `manager.save(session_id, engine)` at checkpoints).
+    pub fn checkpoint_engine_messages(
+        &self,
+        session_id: &str,
+        mirror: &Arc<StdRwLock<Vec<ocw_engine::Message>>>,
+    ) {
+        let messages: Vec<Value> = mirror
+            .read()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or_default())
+            .collect();
+        self.persist_engine_messages_inner(session_id, &messages);
+    }
+
+    /// Core persistence: write engine messages to JSONL + the in-memory cache.
+    /// Mirror of Python's `manager.save(session_id, engine)`. Shared by the
+    /// normal turn path, retry path, checkpoint path, and panic guard.
+    pub fn persist_engine_messages_inner(&self, session_id: &str, all_messages: &[Value]) {
+        let existing = self.conversation_store.count_jsonl(session_id);
+        if all_messages.len() > existing {
+            // If the JSONL is missing the system message that the engine has
+            // (legacy files from before the format fix), do a full rewrite
+            // so system lands at position 0 — matching Python.
+            let disk_missing_system = if existing > 0 {
+                let disk = self.conversation_store.read_jsonl(session_id);
+                !disk
+                    .first()
+                    .and_then(|v| v.get("role"))
+                    .and_then(|v| v.as_str())
+                    .map(|r| r == "system")
+                    .unwrap_or(false)
+            } else {
+                false // new file: system will be written in first append
+            };
+
+            if disk_missing_system {
+                if let Err(e) = self
+                    .conversation_store
+                    .rewrite_jsonl(session_id, all_messages)
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to rewrite JSONL with system message"
+                    );
+                }
+            } else if let Err(e) = self
+                .conversation_store
+                .append_jsonl(session_id, &all_messages[existing..])
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist messages to JSONL"
+                );
+            }
+        }
+        // Sync the in-memory cache with the authoritative engine message list.
+        // Never let a shorter snapshot (e.g. an incomplete turn-delta mirror)
+        // clobber a longer cache — that produced orphan tool_calls histories.
+        if let Ok(mut guard) = self.session_messages.write() {
+            let entry = guard.entry(session_id.to_string()).or_default();
+            if all_messages.len() >= entry.messages.len() {
+                entry.messages = all_messages.to_vec();
+            }
+        }
     }
 
     pub async fn push_message(&self, session_id: &str, msg: Value) {
-        if let Some(data) = self.session_messages.write().unwrap().get_mut(session_id) {
-            data.messages.push(msg.clone());
+        {
+            // Create the entry on first touch — mirror of push_message_sync.
+            // Previously the in-memory push was silently dropped when no entry
+            // existed (typical after a restart).
+            let mut guard = self.session_messages.write().unwrap();
+            guard
+                .entry(session_id.to_string())
+                .or_default()
+                .messages
+                .push(msg.clone());
         }
         // Append to JSONL for persistence
-        let _ = self.conversation_store.append_jsonl(session_id, &[msg]);
+        if let Err(e) = self.conversation_store.append_jsonl(session_id, &[msg]) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to persist message to JSONL — data will be lost on restart"
+            );
+        }
     }
 
     pub async fn broadcast(&self, session_id: &str, msg: Value) {
@@ -1637,19 +2191,40 @@ impl AppState {
         }
     }
 
+    /// Sync variant of `list_messages` with JSONL fallback — mirror of the async version.
     pub fn list_messages_sync(&self, session_id: &str) -> Vec<Value> {
-        self.session_messages
+        let in_mem = self
+            .session_messages
             .read()
             .unwrap()
             .get(session_id)
             .map(|m| m.messages.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // JSONL is the authoritative source: fall back when the in-memory cache
+        // is empty or incomplete (typical after a restart).
+        let from_disk = self.conversation_store.read_jsonl(session_id);
+        if from_disk.len() > in_mem.len() {
+            let mut guard = self.session_messages.write().unwrap();
+            guard.insert(
+                session_id.to_string(),
+                SessionMessages {
+                    messages: from_disk.clone(),
+                },
+            );
+            return from_disk;
+        }
+        if !in_mem.is_empty() {
+            return in_mem;
+        }
+        from_disk
     }
 
     pub fn delete_session_sync(&self, session_id: &str) {
         self.sessions.write().unwrap().remove(session_id);
         self.session_messages.write().unwrap().remove(session_id);
         self.ws_sessions.write().unwrap().remove(session_id);
+        self.running_engines.write().remove(session_id);
         let _ = self.conversation_store.delete(session_id);
     }
 
@@ -1668,11 +2243,24 @@ impl AppState {
     }
 
     pub fn push_message_sync(&self, session_id: &str, msg: Value) {
-        if let Some(data) = self.session_messages.write().unwrap().get_mut(session_id) {
-            data.messages.push(msg.clone());
+        {
+            // Create the entry on first touch — previously the in-memory push was silently
+            // dropped when no entry existed (typical after a restart), which left persist_turn
+            // and the auto-title openers looking at an empty message list.
+            let mut guard = self.session_messages.write().unwrap();
+            guard
+                .entry(session_id.to_string())
+                .or_default()
+                .messages
+                .push(msg.clone());
         }
-        // Append to JSONL for persistence
-        let _ = self.conversation_store.append_jsonl(session_id, &[msg]);
+        if let Err(e) = self.conversation_store.append_jsonl(session_id, &[msg]) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to persist message to JSONL — data will be lost on restart"
+            );
+        }
     }
 
     // Skills helpers
@@ -1844,64 +2432,60 @@ impl AppState {
             return Vec::new();
         }
 
-        let suffixes: std::collections::HashSet<&str> = [
-            ".md",
-            ".markdown",
-            ".html",
-            ".htm",
-            ".txt",
-            ".json",
-            ".csv",
-            ".tsv",
-            ".py",
-            ".js",
-            ".ts",
-            ".tsx",
-            ".css",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".webp",
-            ".gif",
-            ".pdf",
-            ".xlsx",
-            ".xls",
-            ".pptx",
-            ".ppt",
-            ".pptm",
-            ".docx",
-            ".doc",
-            ".docm",
+        // Dot-less lowercase suffix set (mirrors Python's `path.suffix.lower()`
+        // whitelist, which is case-insensitive).
+        let suffixes: HashSet<String> = [
+            "md",
+            "markdown",
+            "html",
+            "htm",
+            "txt",
+            "json",
+            "csv",
+            "tsv",
+            "py",
+            "js",
+            "ts",
+            "tsx",
+            "css",
+            "png",
+            "jpg",
+            "jpeg",
+            "webp",
+            "gif",
+            "pdf",
+            "xlsx",
+            "xls",
+            "pptx",
+            "ppt",
+            "pptm",
+            "docx",
+            "doc",
+            "docm",
         ]
         .iter()
-        .copied()
+        .map(|s| s.to_string())
         .collect();
-        let skip_dirs: std::collections::HashSet<&str> =
-            ["node_modules", "target", "dist", "__pycache__", ".git"]
-                .iter()
-                .copied()
-                .collect();
+        let skip_dirs: HashSet<&str> = ["node_modules", "target", "dist", "__pycache__", ".git"]
+            .iter()
+            .copied()
+            .collect();
 
-        let mut artifacts: Vec<_> = std::fs::read_dir(&root)
+        // Recursive walk (mirrors Python's `root.rglob("*")` — the previous
+        // read_dir-only version missed every file under a subdirectory).
+        let mut artifacts: Vec<_> = walk_files(&root, &skip_dirs)
             .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
+            .filter_map(|path| {
                 let rel = path.strip_prefix(&root).ok()?;
-                // Skip hidden files/dirs and skip-dirs
-                if rel.components().any(|c| {
-                    let s = c.as_os_str().to_string_lossy();
-                    s.starts_with('.') || skip_dirs.contains(s.as_ref())
-                }) {
+                let ext = path.extension()?.to_str()?.to_lowercase();
+                if !suffixes.contains(&ext) {
                     return None;
                 }
-                if !path.is_file() { return None; }
-                let ext = path.extension()?.to_str()?;
-                if !suffixes.contains(ext) && !suffixes.contains(&format!(".{ext}").as_str()) { return None; }
                 let meta = path.metadata().ok()?;
                 let size = meta.len();
-                let modified = meta.modified().ok()
+                let modified = meta
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
@@ -1909,7 +2493,7 @@ impl AppState {
                     "path": rel.to_string_lossy(),
                     "abs_path": path.to_string_lossy(),
                     "name": path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                    "kind": "text",
+                    "kind": artifact_kind(&path),
                     "size": size,
                     "modified_at": modified,
                 }))
@@ -1947,17 +2531,28 @@ impl AppState {
             return json!({"ok": false, "error": "not found"});
         }
 
-        let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let binary_exts = ["png", "jpg", "jpeg", "webp", "gif", "pdf", "xlsx", "xls"];
+        let ext = target
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        // Classify by lowercased extension (mirrors Python `_artifact_kind` /
+        // `manager.read_artifact`). `artifact_kind` lowercases, so `PPTX` etc.
+        // classify correctly instead of falling into the text branch.
+        let kind = artifact_kind(&target);
+        if kind == "office" {
+            // PowerPoint/Word binaries can't be previewed inline; the UI offers
+            // "Open in default app" instead of trying to render them.
+            return json!({"ok": true, "path": path, "kind": "office"});
+        }
 
-        if binary_exts.contains(&ext) {
+        if kind == "image" || kind == "pdf" || kind == "sheet" {
             let Ok(data) = std::fs::read(&target) else {
                 return json!({"ok": false, "error": "failed to read file"});
             };
             if data.len() > 25 * 1024 * 1024 {
                 return json!({"ok": false, "error": "file too large to preview"});
             }
-            let mime = match ext {
+            let mime = match ext.as_str() {
                 "png" => "image/png",
                 "jpg" | "jpeg" => "image/jpeg",
                 "webp" => "image/webp",
@@ -1972,7 +2567,7 @@ impl AppState {
             return json!({
                 "ok": true,
                 "path": path,
-                "kind": if ext == "pdf" { "pdf" } else if ext.starts_with("xls") { "sheet" } else { "image" },
+                "kind": kind,
                 "data_url": format!("data:{mime};base64,{b64}"),
             });
         }
@@ -1983,8 +2578,10 @@ impl AppState {
                 json!({
                     "ok": true,
                     "path": path,
-                    "kind": "text",
-                    "content": if truncated { &text[..500_000] } else { &text },
+                    "kind": kind, // real kind: markdown/csv/code/html/text
+                    // clip_utf8 rounds down to a char boundary — a raw byte slice
+                    // panics on CJK content (owner-hit 2026-08-08 panic class).
+                    "content": if truncated { ocw_data::clip_utf8(&text, 500_000) } else { &text },
                     "truncated": truncated,
                 })
             }
@@ -2241,6 +2838,83 @@ impl AppState {
     }
 }
 
+/// Recursively collect files under `root` (stack DFS). Skips any entry whose name
+/// starts with `.` (hidden) or is in `skip_dirs` — mirrors Python's
+/// `any(part.startswith(".") for part in rel.parts)` skip logic.
+fn walk_files(root: &Path, skip_dirs: &HashSet<&str>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || skip_dirs.contains(name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// File-kind classification for artifact previews/iconography.
+/// Mirror of `coworker/server/manager.py::_artifact_kind`.
+fn artifact_kind(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match format!(".{ext}").as_str() {
+        ".md" | ".markdown" => "markdown",
+        ".html" | ".htm" => "html",
+        ".png" | ".jpg" | ".jpeg" | ".webp" | ".gif" => "image",
+        ".pdf" => "pdf",
+        ".xlsx" | ".xls" => "sheet",
+        ".pptx" | ".ppt" | ".pptm" | ".docx" | ".doc" | ".docm" => "office",
+        ".csv" | ".tsv" => "csv",
+        ".py" | ".js" | ".ts" | ".tsx" | ".css" | ".json" => "code",
+        _ => "text",
+    }
+}
+
+/// Files in the task workspace modified during the run — the run's artifacts.
+/// Mirror of `coworker/server/manager.py::_recent_files` (hidden paths skipped,
+/// `mtime >= since - 1`, capped at `limit`).
+pub(crate) fn recent_files(workspace: &str, since: f64, limit: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let root = PathBuf::from(workspace);
+    if !root.is_dir() {
+        return out;
+    }
+    let no_skip_dirs: HashSet<&str> = HashSet::new();
+    for path in walk_files(&root, &no_skip_dirs) {
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                let secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                if secs >= since - 1.0 {
+                    if let Ok(rel) = path.strip_prefix(&root) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2941,45 @@ mod tests {
         let provider: Arc<dyn ocw_provider::Provider> =
             Arc::new(ocw_provider::Router::new("anthropic"));
         AppState::new(config, provider)
+    }
+
+    fn make_state_with(
+        dir: PathBuf,
+        provider: Arc<dyn ocw_provider::Provider>,
+        default_model: &str,
+    ) -> AppState {
+        let config = Config {
+            data_dir: dir,
+            default_model: default_model.to_string(),
+            ..Config::default()
+        };
+        AppState::new(config, provider)
+    }
+
+    /// Fake provider for auto-title tests — every completion returns the same text.
+    struct TitleProvider(&'static str);
+    impl ocw_provider::Provider for TitleProvider {
+        fn complete(
+            &self,
+            _model: &str,
+            _messages: Vec<Value>,
+            _tools: Option<Vec<Value>>,
+            _settings: Value,
+        ) -> Result<ocw_provider::AssistantTurn, ocw_provider::Error> {
+            Ok(ocw_provider::AssistantTurn {
+                text: Some(self.0.to_string()),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                reasoning: None,
+                usage: None,
+            })
+        }
+        fn capabilities(&self, _model: &str) -> ocw_provider::ModelCapabilities {
+            ocw_provider::ModelCapabilities::default()
+        }
+        fn name(&self) -> &str {
+            "fake"
+        }
     }
 
     #[tokio::test]
@@ -2333,5 +3046,481 @@ mod tests {
         assert!(roots[0].primary);
         assert!(!roots[1].primary);
         assert!(roots[1].path.ends_with("granted"));
+    }
+
+    // -- Title persistence (FB-010 parity) ------------------------------------
+
+    #[tokio::test]
+    async fn persist_turn_snapshots_first_line_title() {
+        let dir = temp_data_dir("persist-turn");
+        let state = make_state(dir.clone());
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+
+        state.push_message_sync(
+            &sid,
+            json!({"role": "user", "content": "Fix the login bug\nsecond line"}),
+        );
+        state.push_message_sync(&sid, json!({"role": "assistant", "content": "On it."}));
+        state.persist_turn(&sid);
+
+        let meta = state.get_session(&sid).await.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Fix the login bug"));
+        assert_eq!(meta.message_count, 2);
+        assert!(meta.updated_at.is_some());
+
+        // Restart: the title survives via SQLite.
+        let state2 = make_state(dir);
+        let restored = state2.get_session(&sid).await.unwrap();
+        assert_eq!(restored.title.as_deref(), Some("Fix the login bug"));
+        assert_eq!(restored.message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn rename_persists_and_wins_over_turn_snapshot() {
+        let dir = temp_data_dir("rename");
+        let state = make_state(dir.clone());
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+
+        state.push_message_sync(&sid, json!({"role": "user", "content": "first line snapshot"}));
+        state
+            .patch_session(&sid, Some("Prod incident 42"), None, None)
+            .await
+            .unwrap();
+
+        // A later turn must not displace the manual rename.
+        state.push_message_sync(&sid, json!({"role": "assistant", "content": "ok"}));
+        state.persist_turn(&sid);
+        assert_eq!(
+            state.get_session(&sid).await.unwrap().title.as_deref(),
+            Some("Prod incident 42")
+        );
+        assert!(state.conversation_store.load(&sid).unwrap().unwrap().renamed);
+
+        // Restart keeps the rename.
+        let state2 = make_state(dir);
+        assert_eq!(
+            state2.get_session(&sid).await.unwrap().title.as_deref(),
+            Some("Prod incident 42")
+        );
+    }
+
+    async fn wait_for_auto_title(state: &AppState, sid: &str) -> Option<String> {
+        for _ in 0..200 {
+            if let Ok(Some((_, Some(t)))) = state.conversation_store.title_state(sid) {
+                return Some(t);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        state
+            .conversation_store
+            .title_state(sid)
+            .ok()
+            .flatten()
+            .and_then(|(_, t)| t)
+    }
+
+    #[tokio::test]
+    async fn maybe_autotitle_stores_generated_title() {
+        let dir = temp_data_dir("autotitle");
+        let state = make_state_with(
+            dir,
+            Arc::new(TitleProvider("Login Bug Investigation")),
+            "test-model",
+        );
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+        state.push_message_sync(&sid, json!({"role": "user", "content": "the login page 500s"}));
+
+        state.maybe_autotitle(&sid);
+        assert_eq!(
+            wait_for_auto_title(&state, &sid).await.as_deref(),
+            Some("Login Bug Investigation")
+        );
+        assert_eq!(
+            state.get_session(&sid).await.unwrap().title.as_deref(),
+            Some("Login Bug Investigation")
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_autotitle_small_talk_retries_then_gives_up() {
+        let dir = temp_data_dir("smalltalk");
+        let state = make_state_with(dir, Arc::new(TitleProvider("small-talk")), "test-model");
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+        state.push_message_sync(&sid, json!({"role": "user", "content": "hey"}));
+
+        state.maybe_autotitle(&sid); // attempt 1 — sentinel, no title
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(state
+            .conversation_store
+            .title_state(&sid)
+            .unwrap()
+            .unwrap()
+            .1
+            .is_none());
+
+        state.maybe_autotitle(&sid); // attempt 2 — the single retry
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        state.maybe_autotitle(&sid); // guarded: attempts exhausted
+        assert_eq!(
+            state.autotitle_attempts.read().unwrap().get(&sid).copied(),
+            Some(2)
+        );
+        assert!(state
+            .conversation_store
+            .title_state(&sid)
+            .unwrap()
+            .unwrap()
+            .1
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_autotitle_never_displaces_a_rename() {
+        let dir = temp_data_dir("autotitle-rename");
+        let state = make_state_with(dir, Arc::new(TitleProvider("sneaky")), "test-model");
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+        state.push_message_sync(&sid, json!({"role": "user", "content": "the login page 500s"}));
+        state
+            .patch_session(&sid, Some("My Thread"), None, None)
+            .await
+            .unwrap();
+
+        state.maybe_autotitle(&sid); // renamed guard stops it before any provider call
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(state
+            .conversation_store
+            .title_state(&sid)
+            .unwrap()
+            .unwrap()
+            .1
+            .is_none());
+        assert_eq!(
+            state.get_session(&sid).await.unwrap().title.as_deref(),
+            Some("My Thread")
+        );
+    }
+
+    #[test]
+    fn sanitize_autotitle_rules() {
+        assert_eq!(
+            sanitize_autotitle("\"Morning   Briefing\""),
+            Some("Morning Briefing".to_string())
+        );
+        assert_eq!(sanitize_autotitle("small-talk"), None);
+        assert_eq!(sanitize_autotitle("Small talk."), None);
+        assert_eq!(sanitize_autotitle(""), None);
+        assert_eq!(sanitize_autotitle(&"x".repeat(81)), None);
+        assert_eq!(sanitize_autotitle(&"y".repeat(80)), Some("y".repeat(60)));
+    }
+
+    // -- JSONL fallback when the in-memory cache is empty post-restart -------
+
+    #[tokio::test]
+    async fn list_messages_falls_back_to_jsonl_after_restart() {
+        let dir = temp_data_dir("restart-msg");
+        let state = make_state(dir.clone());
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+        state.push_message_sync(&sid, json!({"role": "user", "content": "first user line"}));
+        state.push_message_sync(&sid, json!({"role": "assistant", "content": "hello"}));
+
+        // Fresh AppState simulates a restart: session_messages is empty, only JSONL persists.
+        let state2 = make_state(dir);
+        assert!(state2
+            .session_messages
+            .read()
+            .unwrap()
+            .get(&sid)
+            .is_none());
+        let msgs = state2.list_messages(&sid).await;
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].get("role").and_then(|v| v.as_str()), Some("user"));
+        // The fallback repopulates the in-memory cache so subsequent reads are O(1).
+        assert_eq!(
+            state2.session_messages.read().unwrap().get(&sid).map(|d| d.messages.len()),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn push_message_sync_creates_entry_when_missing() {
+        let dir = temp_data_dir("push-missing");
+        let state = make_state(dir);
+        // No create_session: session_messages has no entry for this id yet.
+        let fake_id = "fake-session-id";
+        assert!(state.session_messages.read().unwrap().get(fake_id).is_none());
+
+        state.push_message_sync(fake_id, json!({"role": "user", "content": "hi"}));
+        assert_eq!(
+            state
+                .session_messages
+                .read()
+                .unwrap()
+                .get(fake_id)
+                .map(|d| d.messages.len()),
+            Some(1)
+        );
+        // And of course JSONL persisted.
+        let from_disk = state.conversation_store.read_jsonl(fake_id);
+        assert_eq!(from_disk.len(), 1);
+    }
+
+    // Regression: `get_or_create_session` (the WS-connect / scheduler /
+    // automation path) used to only insert into the in-memory HashMap. After a
+    // restart the row was missing from SQLite, `list_sessions` returned an
+    // empty list, and clicking a Rust-created session title 404'd, which the
+    // GUI's `selectSession` catch-all translated into `setItems([])`.
+    #[tokio::test]
+    async fn get_or_create_session_persists_to_sqlite() {
+        let dir = temp_data_dir("get-or-create-persist");
+        let state = make_state(dir.clone());
+        let _ = state.get_or_create_session("abc-123", "code", None);
+
+        // Fresh AppState simulates a restart: session_messages is empty and
+        // `self.sessions` is rebuilt from SQLite via conversation_store.list.
+        let state2 = make_state(dir);
+        assert!(
+            state2.session_exists("abc-123").await,
+            "session created via get_or_create_session must survive a restart"
+        );
+        let sessions = state2.list_sessions(None).await;
+        assert!(
+            sessions.iter().any(|s| s.session_id == "abc-123"),
+            "list_sessions should include the session after restart; got {sessions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_turn_uses_jsonl_after_restart() {
+        let dir = temp_data_dir("persist-restart");
+        let state = make_state(dir.clone());
+        let meta = state.create_session(None, "code").await;
+        let sid = meta.session_id.clone();
+        state.push_message_sync(&sid, json!({"role": "user", "content": "Restart title works"}));
+
+        // Fresh AppState — in-memory cache empty.
+        let state2 = make_state(dir);
+        assert!(state2
+            .session_messages
+            .read()
+            .unwrap()
+            .get(&sid)
+            .is_none());
+
+        state2.persist_turn(&sid);
+        assert_eq!(
+            state2.get_session(&sid).await.unwrap().title.as_deref(),
+            Some("Restart title works")
+        );
+        assert_eq!(state2.get_session(&sid).await.unwrap().message_count, 1);
+    }
+
+    /// The cowork system prompt must carry the same blocks the Python engine assembles
+    /// (`coworker/agent.py::build_engine`): narration guidance, the environment snapshot
+    /// with folder scope, memory guidance, and the full outcome-oriented instructions.
+    #[tokio::test]
+    async fn build_system_messages_includes_guidance_blocks() {
+        let dir = temp_data_dir("sysprompt");
+        let state = make_state(dir.clone());
+        let workspace = dir.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let messages = state
+            .build_system_messages("cowork", workspace.to_str().unwrap(), "test-model")
+            .await;
+        assert_eq!(messages.len(), 1);
+        let ocw_engine::Message::System { content } = &messages[0] else {
+            panic!("expected a system message");
+        };
+
+        // Base instructions (full Python text, incl. artifact-link rule).
+        assert!(content.contains("You are a Cowork agent"));
+        assert!(content.contains("artifact:relative/path"));
+        assert!(content.contains("no heredocs"));
+        // Narration guidance.
+        assert!(content.contains("Narration:"));
+        // Environment snapshot + folder scope.
+        assert!(content.contains("<environment>"));
+        assert!(content.contains("Workspace:"));
+        assert!(content.contains("Platform:"));
+        assert!(content.contains("Session started"));
+        assert!(content.contains("per-turn <system-context>"));
+        assert!(content.contains("Folder scope:"));
+        // Memory guidance.
+        assert!(content.contains("Memory:"));
+        assert!(content.contains("memory_update"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `recent_files` must mirror Python's `_recent_files`: only files modified
+    /// since the run started (mtime window) and no hidden-path entries.
+    #[test]
+    fn recent_files_filters_hidden_and_since() {
+        let dir = temp_data_dir("recent-files");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+
+        // Pre-existing file from before the run window. Python's `_recent_files`
+        // uses `mtime >= since - 1` (one-second grace), so sleep past that
+        // window to make "old" genuinely stale.
+        std::fs::write(dir.join("old.md"), "old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Files produced during the run (one hidden, one in a subdirectory).
+        std::fs::write(dir.join("sub").join("new.md"), "new").unwrap();
+        std::fs::write(dir.join(".hidden").join("secret.md"), "secret").unwrap();
+
+        let files = recent_files(&dir.to_string_lossy(), since, 20);
+        assert_eq!(files, vec!["sub/new.md".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `list_artifacts` must recurse into subdirectories (Python `rglob("*")`)
+    /// and classify file kinds by suffix.
+    #[test]
+    fn list_artifacts_includes_subdirectories() {
+        let dir = temp_data_dir("artifacts-subdir");
+        let state = make_state(dir.clone());
+        std::fs::create_dir_all(dir.join("output")).unwrap();
+        std::fs::write(dir.join("output").join("report.md"), "# report").unwrap();
+        std::fs::write(dir.join("root.txt"), "root").unwrap();
+        std::fs::write(dir.join("output").join("skip.bin"), "bin").unwrap();
+
+        let sid = "artifacts-sub-session".to_string();
+        state.get_or_create_session(&sid, "cowork", Some(&dir.to_string_lossy()));
+
+        let artifacts = state.list_artifacts(&sid);
+        let paths: Vec<String> = artifacts
+            .iter()
+            .filter_map(|a| a.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "output/report.md"),
+            "subdirectory file missing: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "root.txt"),
+            "root file missing: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == "output/skip.bin"),
+            "non-whitelisted suffix included: {paths:?}"
+        );
+        let report = artifacts
+            .iter()
+            .find(|a| a.get("path").and_then(|p| p.as_str()) == Some("output/report.md"))
+            .expect("report artifact present");
+        assert_eq!(report.get("kind").and_then(|k| k.as_str()), Some("markdown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy sessions persisted with an empty workspace (pre scratch-provision
+    /// fix) come back as None after a restart — `get_or_create_session` must
+    /// adopt the caller's workspace so artifact reads don't fail with
+    /// "no workspace".
+    #[tokio::test]
+    async fn get_or_create_session_adopts_workspace_for_legacy_rows() {
+        let dir = temp_data_dir("legacy-ws");
+        let state = make_state(dir.clone());
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Legacy row: session exists with an empty workspace (as created pre-fix).
+        let _ = state.get_or_create_session("run-legacy-1", "cowork", None);
+        // Simulate the restart rebuild path where the empty workspace became None.
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.get_mut("run-legacy-1").unwrap().workspace = None;
+        }
+
+        let meta = state.get_or_create_session(
+            "run-legacy-1",
+            "cowork",
+            Some(&ws.to_string_lossy()),
+        );
+        assert_eq!(meta.workspace.as_deref(), Some(ws.to_str().unwrap()));
+
+        // A fresh AppState (restart) must read the adopted workspace back.
+        let state2 = make_state(dir.clone());
+        let s2 = state2.get_session("run-legacy-1").await.unwrap();
+        assert_eq!(s2.workspace.as_deref(), Some(ws.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `provision_scratch` must allocate `scratch_base/{session_id}` — the Rust
+    /// mirror of Python's `_provision_scratch` used when creating automations.
+    #[tokio::test]
+    async fn provision_scratch_creates_task_workspace() {
+        let dir = temp_data_dir("provision");
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(dir.join("scratch").to_string_lossy().to_string())
+            .await;
+
+        let ws = crate::automations::provision_scratch(&state, "__task__t1").await;
+        assert!(!ws.is_empty(), "provision_scratch must return a path");
+        assert!(std::path::Path::new(&ws).is_dir(), "workspace dir must exist: {ws}");
+        assert!(
+            ws.contains("scratch") && ws.ends_with("__task__t1"),
+            "workspace must be scratch_base/task_session_id: {ws}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `read_artifact` kind semantics (mirror of Python `manager.read_artifact`):
+    /// office files → `kind: "office"` (no inline content, GUI offers
+    /// "Open in default app"), text files → their real artifact kind
+    /// (markdown/csv/...). Extensions must match lowercased (`PPTX` included).
+    #[tokio::test]
+    async fn read_artifact_kinds_match_python() {
+        let dir = temp_data_dir("artifact-kinds");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("deck.PPTX"), b"dummy-pptx").unwrap();
+        std::fs::write(ws.join("doc.docx"), b"dummy-docx").unwrap();
+        std::fs::write(ws.join("data.csv"), "a,b\n1,2\n").unwrap();
+        std::fs::write(ws.join("notes.md"), "# hi\n").unwrap();
+        // Canonicalize so the workspace-root containment check inside
+        // `read_artifact` matches (macOS temp dirs are symlinked).
+        let ws = ws.canonicalize().unwrap();
+        let state = make_state(dir.clone());
+        let meta = state
+            .create_session(Some(ws.to_string_lossy().as_ref()), "code")
+            .await;
+
+        // Office (even uppercase extension) → kind "office", no inline content.
+        let office = state.read_artifact(&meta.session_id, "deck.PPTX");
+        assert_eq!(office["ok"], true);
+        assert_eq!(office["kind"], "office");
+        assert!(office.get("content").is_none());
+        let docx = state.read_artifact(&meta.session_id, "doc.docx");
+        assert_eq!(docx["kind"], "office");
+
+        // CSV → real kind (GUI renders the table view).
+        let csv = state.read_artifact(&meta.session_id, "data.csv");
+        assert_eq!(csv["ok"], true);
+        assert_eq!(csv["kind"], "csv");
+        assert!(csv["content"].as_str().unwrap().contains("1,2"));
+
+        // Markdown → markdown kind.
+        let md = state.read_artifact(&meta.session_id, "notes.md");
+        assert_eq!(md["kind"], "markdown");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

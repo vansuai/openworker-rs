@@ -8,18 +8,53 @@
 import type { ConversationMessage } from "./api";
 import type { Attachment, Item } from "./types";
 
+// Truncate a tool-result content to a human-readable preview, matching the
+// engine's `preview(&value, 300)` behaviour: newlines become \\n, then
+// the string is capped at `maxChars` with a trailing "…".
+function truncatePreview(content: string, maxChars: number = 300): string {
+  if (!content) return content;
+  const text = content.replace(/\n/g, "\\n");
+  if (text.length <= maxChars) return text;
+  return text.slice(0, Math.max(0, maxChars - 1)) + "…";
+}
+
+// Derive the tool status from the persisted result content. The engine
+// writes `{"error":"tool call not executed","reason":"…"}` for denied /
+// interrupted tool calls and `{"error":"…"}` for execution errors; normal
+// results are plain strings or non-error JSON objects.
+function toolStatusFromContent(content: string): string {
+  if (!content) return "ok";
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === "object" && typeof parsed.error === "string") {
+      if (parsed.error === "tool call not executed") {
+        if (parsed.reason === "requires approval") return "denied";
+        if (parsed.reason === "interrupted by user") return "interrupted";
+        return "error";
+      }
+      return "error";
+    }
+  } catch {
+    // plain-text result → ok
+  }
+  return "ok";
+}
+
 export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
   const items: Item[] = [];
   // Index tool results by tool_call_id so replayed tool rows can show their output
   // (the live view gets this from `tool_finished` events; on replay it's the `role:"tool"` msgs).
   const results: Record<string, string> = {};
+  // Tool status derived from the result content (ok / denied / error / interrupted).
+  const statuses: Record<string, string> = {};
   // `_display` sidecar on a tool message = user-facing metadata the agent never saw
   // (e.g. how many hits the privacy filters hid) — surfaces on the tool card.
   const hiddenCounts: Record<string, number> = {};
   for (const m of messages || []) {
     if (m.role === "tool" && m.tool_call_id) {
-      results[m.tool_call_id] =
-        typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      results[m.tool_call_id] = truncatePreview(raw, 300);
+      statuses[m.tool_call_id] = toolStatusFromContent(raw);
       const hidden = Number(m._display?.hidden_by_filters || 0);
       if (hidden > 0) hiddenCounts[m.tool_call_id] = hidden;
     }
@@ -37,6 +72,8 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
       if (typeof m.ts === "number") user.ts = m.ts;
       if (user.text || user.attachments?.length) items.push(user);
     } else if (m.role === "assistant") {
+      // Replay the assistant narration before its proposed tools, matching both
+      // engines' live event order: assistant_message, then tool_proposed.
       if (m.content || m.reasoning)
         items.push({
           kind: "assistant",
@@ -58,7 +95,7 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
           id: tc.id,
           name: tc.function?.name,
           args,
-          status: "ok",
+          status: statuses[tc.id] || "ok",
           preview,
           ...(hidden ? { hidden } : {}),
         });

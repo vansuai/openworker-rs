@@ -31,7 +31,16 @@ import type { MessageSource } from "./api";
 
 // "always_task" persists to the owning automation's task record (standing scoped
 // approval, UX-DECISIONS §25) — offered only on automation-run approval cards, in-app.
-export type ApprovalDecision = "once" | "deny" | "always_tool" | "always_command" | "always_task";
+// "stale" marks an approval that the engine abandoned without an answer (timeout,
+// disconnected channel, turn_end). UI collapses the card; nothing was actually
+// decided by the user.
+export type ApprovalDecision =
+  | "once"
+  | "deny"
+  | "always_tool"
+  | "always_command"
+  | "always_task"
+  | "stale";
 
 export interface TodoItem {
   content: string;
@@ -114,6 +123,12 @@ export type Item =
       // context, the card offers "Allow every time" (§25).
       standingTarget?: string;
       resolved?: ApprovalDecision;
+      // Server-supplied Inbox id (attended WS broadcast + unattended mirror). The
+      // approval reply round-trips this id so a reconnect or second device converges
+      // to the same resolution.
+      itemId?: string;
+      // Server-supplied OpenAI tool_call_id (the engine-side correlation handle).
+      toolCallId?: string;
     }
   | {
       kind: "dirreq";
@@ -131,6 +146,7 @@ export type Item =
       // A live ask_user prompt (attended sessions answer inline; unattended ones route to the Inbox).
       kind: "question";
       question: string;
+      header?: string;
       options?: string[];
       allow_text?: boolean;
       multi?: boolean;

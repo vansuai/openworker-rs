@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
 import {
   announceInboxUnlock,
+  ApiError,
   finalizeAutomationRun,
   getArtifacts,
   getHealth,
@@ -215,6 +216,9 @@ export function App() {
   // composer's "No model connected" chip. Default true so we don't flash the chip before settings
   // load; corrected by loadSettings.
   const [modelReady, setModelReady] = useState(true);
+  // True when the settings API call itself failed (backend unreachable), so the composer can show
+  // a "Could not reach server" chip with a retry action instead of the perpetual "Loading models…".
+  const [modelsLoadError, setModelsLoadError] = useState(false);
   const [surface, setSurface] = useState<
     "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings"
   >("session");
@@ -465,7 +469,7 @@ export function App() {
           // The mount-time loadSettings races the sidecar boot and swallows its failure —
           // on a cold start that left "Loading models…" stuck until the user visited
           // Settings (owner-hit 2026-07-23). Health just answered, so this one lands.
-          loadSettings();
+          await loadSettings();
           if (!cancelled) setBooting(false);
         })
         .catch(() => {
@@ -499,16 +503,20 @@ export function App() {
     return () => clearTimeout(t);
   }, [uiReady, booting]);
 
-  const loadSettings = () =>
-    getSettings()
-      .then((s) => {
-        setModels(s.models || []);
-        setModelLabels(s.model_labels || {});
-        setModelContextWindows(s.model_context_windows || {});
-        setModelReady(s.model_ready);
-        if (s.surfaces) setSurfaces(s.surfaces);
-      })
-      .catch(() => {});
+  const loadSettings = async () => {
+    try {
+      const s = await getSettings();
+      setModels(s.models || []);
+      setModelLabels(s.model_labels || {});
+      setModelContextWindows(s.model_context_windows || {});
+      setModelReady(s.model_ready);
+      setModelsLoadError(false);
+      if (s.surfaces) setSurfaces(s.surfaces);
+    } catch {
+      setModelsLoadError(true);
+    }
+  };
+  const retryModels = () => loadSettings();
 
   // Open Settings → Configure Models (from the composer's "No model connected" chip).
   const openModelSetup = () => openSettings("models");
@@ -649,17 +657,40 @@ export function App() {
         case "permission_required":
           // Unattended → the backend parked it in the Inbox; don't also surface a live card.
           if (unattendedRef.current) break;
-          setItems((p) => [
-            ...p,
-            {
-              kind: "approval",
-              name: d.name,
-              args: d.arguments,
-              reason: d.reason,
-              category: d.category,
-              standingTarget: d.standing_target || undefined,
-            },
-          ]);
+          // Dedupe by tool_call_id: the engine live-emits an item_id-less copy and the
+          // Inbox approver broadcasts the authoritative copy (with item_id) for the same
+          // tool call. Prefer the item_id-bearing card (it resolves the Inbox row); drop
+          // duplicates so the user never sees two approval cards for one tool.
+          setItems((p) => {
+            const tcid = d.tool_call_id || undefined;
+            const dupe = tcid
+              ? p.find((it) => it.kind === "approval" && it.toolCallId === tcid)
+              : undefined;
+            if (dupe) {
+              if (!d.item_id) return p; // engine's copy — the approver card is already up
+              // Upgrade the existing card with the item_id instead of stacking a second one.
+              return p.map((it) =>
+                it === dupe ? { ...it, itemId: d.item_id } : it,
+              );
+            }
+            return [
+              ...p,
+              {
+                kind: "approval",
+                name: d.name,
+                args: d.arguments,
+                reason: d.reason,
+                category: d.category,
+                standingTarget: d.standing_target || undefined,
+                // Server supplies item_id (Inbox row) + tool_call_id (engine correlation). The
+                // approval reply round-trips these so a reconnect or a second device converges
+                // to the same single resolution. Without them the card would still answer the
+                // WS Sender, but a parallel Slack/email reply would create a second resolution.
+                itemId: d.item_id || undefined,
+                toolCallId: d.tool_call_id || undefined,
+              },
+            ];
+          });
           break;
         case "directory_requested":
           if (unattendedRef.current) break;
@@ -679,6 +710,7 @@ export function App() {
             {
               kind: "question",
               question: d.question || "",
+              header: d.header || "",
               options: d.options || [],
               allow_text: d.allow_text !== false,
               multi: !!d.multi,
@@ -701,10 +733,28 @@ export function App() {
           if (String(d.name || "").startsWith("browser_") || FILE_WRITE_TOOLS.has(d.name)) {
             setBrowserRefreshKey((k) => k + 1);
           }
+          // When a permission was denied / errored / cancelled without an answer, the live
+          // approval card on the Composer would otherwise stay stuck open forever (the
+          // user already moved on, the engine already gave up). Resolve the matching card
+          // by `tool_call_id` (authoritative) or, as a fallback, by tool name so the
+          // pending UI collapses.
+          if (
+            d.status === "denied" ||
+            d.status === "error" ||
+            d.status === "cancelled" ||
+            d.status === "missing tool name"
+          ) {
+            setItems((p) => resolveApprovalForTool(p, d.name, d.tool_call_id));
+          }
           break;
         case "turn_end":
           if (d.status === "max_iterations_exceeded")
             setItems((p) => [...p, { kind: "notice", tone: "warn", text: "Stopped: max iterations reached." }]);
+          // The turn is over — any still-unresolved approval / directory / plan / question
+          // card would otherwise linger on the Composer as a "ghost" that the user can't
+          // interact with (the engine has no receivers). Mark them all `stale` so the UI
+          // collapses them; the next session's permission flow renders fresh cards.
+          setItems((p) => resolveStalePending(p));
           break;
         case "model_changed":
           // Mid-session switch (server-applied): update the header fact and drop the
@@ -859,9 +909,23 @@ export function App() {
   const dropSessionInbox = (kind: string) =>
     setSessionInbox((cur) => cur.filter((it) => it.kind !== kind));
   const approve = (decision: ApprovalDecision) => {
-    setItems((p) => resolveLastApproval(p, decision));
+    // Pull the item_id / tool_call_id off the still-unresolved approval card so the
+    // WS reply can round-trip back into the same Inbox row (multi-device / Slack mirror).
+    let itemId: string | undefined;
+    let toolCallId: string | undefined;
+    setItems((p) => {
+      for (let i = p.length - 1; i >= 0; i--) {
+        const it = p[i];
+        if (it.kind === "approval" && !it.resolved) {
+          itemId = it.itemId;
+          toolCallId = it.toolCallId;
+          break;
+        }
+      }
+      return resolveLastApproval(p, decision);
+    });
     dropSessionInbox("approval");
-    sessionRef.current?.approve(decision);
+    sessionRef.current?.approve(decision, itemId, toolCallId);
   };
   const respondPlan = (approved: boolean, mode?: string, feedback?: string) => {
     setItems((p) => resolveLastPlan(p, approved ? "approved" : "rejected"));
@@ -967,10 +1031,16 @@ export function App() {
       const messages = await getSessionMessages(id);
       setItems(itemsFromMessages(messages));
       setUsage(usageFromMessages(messages));
-    } catch {
-      setItems([]);
-      setUsage(emptyUsage());
+    } catch (e) {
+      // Only a definitive "session is gone" (404) clears the view. Any other
+      // failure (server restarting, network blip) keeps the transcript on
+      // screen — wiping it turned a transient hiccup into "lost conversation".
+      if (e instanceof ApiError && e.status === 404) {
+        setItems([]);
+        setUsage(emptyUsage());
+      }
     }
+    followLatest(); // scroll to bottom after loading session history
   };
   const switchAgent = async (name: string) => {
     setSurface("session");
@@ -1567,6 +1637,8 @@ export function App() {
               running={running}
               connected={connected}
               modelReady={modelReady}
+              modelsLoadError={modelsLoadError}
+              onRetryModels={retryModels}
               onConnectModel={openModelSetup}
               onConfigureVoiceInput={() => openSettings("voice")}
               onSend={send}
@@ -1613,6 +1685,7 @@ export function App() {
                       options: pendingQuestion.options,
                       allow_text: pendingQuestion.allow_text,
                       multi: pendingQuestion.multi,
+                      header: pendingQuestion.header,
                     }}
                     onResolve={(_id, answer) => answerQuestion(answer)}
                     compact
@@ -1738,6 +1811,59 @@ function resolveLastApproval(items: Item[], decision: ApprovalDecision): Item[] 
     }
   }
   return copy;
+}
+
+/** Mark a specific approval card as resolved (denied), keyed by `tool_call_id`
+ * first (authoritative — survives multiple concurrent tools of the same name)
+ * and falling back to name match. Used when the engine reports the tool
+ * finished denied / errored / cancelled without the user having decided. */
+function resolveApprovalForTool(
+  items: Item[],
+  name: string,
+  toolCallId?: string,
+): Item[] {
+  if (!name) return items;
+  const copy = [...items];
+  for (let i = copy.length - 1; i >= 0; i--) {
+    const it = copy[i];
+    if (it.kind !== "approval" || it.resolved) continue;
+    if (toolCallId && it.toolCallId && it.toolCallId === toolCallId) {
+      copy[i] = { ...it, resolved: "deny" };
+      break;
+    }
+    if (!toolCallId && it.name === name) {
+      copy[i] = { ...it, resolved: "deny" };
+      break;
+    }
+  }
+  return copy;
+}
+
+/** turn_end swept: any still-unresolved prompt (approval / dirreq / planreq / question)
+ * would otherwise stay on the Composer as a ghost card. Mark them `stale` so the UI
+ * collapses them; the next turn's events render fresh cards. */
+function resolveStalePending(items: Item[]): Item[] {
+  let touched = false;
+  const copy = items.map((it) => {
+    if (it.kind === "approval" && !it.resolved) {
+      touched = true;
+      return { ...it, resolved: "stale" as ApprovalDecision };
+    }
+    if (it.kind === "dirreq" && !it.resolved) {
+      touched = true;
+      return { ...it, resolved: "denied" as const };
+    }
+    if (it.kind === "planreq" && !it.resolved) {
+      touched = true;
+      return { ...it, resolved: "rejected" as const };
+    }
+    if (it.kind === "question" && !it.resolved) {
+      touched = true;
+      return { ...it, resolved: "(turn ended)" };
+    }
+    return it;
+  });
+  return touched ? copy : items;
 }
 
 function resolveLastDirReq(items: Item[], resolved: "granted" | "denied"): Item[] {

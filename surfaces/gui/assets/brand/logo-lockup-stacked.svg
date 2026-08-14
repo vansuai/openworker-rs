@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 144" fill="none" role="img" aria-label="Vansu — 望舒">
+  <title>Vansu / 望舒</title>
+  <defs>
+    <mask id="vansu-stack" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="white"/>
+      <circle cx="42" cy="30" r="20" fill="black"/>
+    </mask>
+  </defs>
+  <!-- Mark, centered horizontally -->
+  <g transform="translate(28, 8)">
+    <path d="M5 16 Q32 -3 59 17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.55"/>
+    <circle cx="32" cy="34" r="22" fill="currentColor" mask="url(#vansu-stack)"/>
+    <circle cx="10" cy="14" r="2" fill="currentColor"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="60" y="104" text-anchor="middle"
+        font-family="'Songti SC','STSong','Source Han Serif SC','Noto Serif CJK SC','SimSun',serif"
+        font-size="22" font-weight="600"
+        fill="currentColor"
+        letter-spacing="3">望舒</text>
+  <text x="60" y="124" text-anchor="middle"
+        font-family="'Manrope','Inter','Helvetica Neue',system-ui,-apple-system,sans-serif"
+        font-size="9" font-weight="500"
+        fill="currentColor" opacity="0.6"
+        letter-spacing="4">VANSU</text>
+</svg>

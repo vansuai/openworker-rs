@@ -224,6 +224,24 @@ pub async fn handler_connect_provider(
         .provider
         .update_secrets(state.settings.secrets_providers_async().await);
     let recommended = ocw_provider::get_descriptor(name).and_then(|d| d.recommended_model.clone());
+
+    // First working provider wins the default: if the current default model belongs to a
+    // provider with no usable config, switch the default to this provider's recommended
+    // model (mirrors Python `configure_provider` in manager.py).
+    if let Some(ref rec) = recommended {
+        let current_default = state.default_model_or_configured();
+        let current_provider = state.settings._model_provider(&current_default);
+        if !state.settings.secrets_has_key(&current_provider).await {
+            let model_id = if name == "openai" {
+                rec.clone()
+            } else {
+                format!("{name}:{rec}")
+            };
+            state.settings.add_model(model_id.clone()).await;
+            state.settings.set_default_model(model_id).await;
+        }
+    }
+
     Ok(Json(
         serde_json::json!({ "ok": true, "provider": name, "recommended_model": recommended }),
     ))

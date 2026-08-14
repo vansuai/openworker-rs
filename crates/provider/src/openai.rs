@@ -6,6 +6,7 @@ use crate::error::Error;
 use crate::types::{AssistantTurn, StreamEvent, TokenUsage, ToolCall};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -246,7 +247,11 @@ pub struct SSEIterator {
     lines: std::sync::mpsc::IntoIter<String>,
     text_parts: Vec<String>,
     reasoning_parts: Vec<String>,
-    tool_calls: Vec<ToolCall>,
+    // Per OpenAI's streaming spec, a single tool call arrives across many deltas
+    // sharing the same `index`. Aggregating by index is required — without it, a
+    // `web_search` call with a multi-token JSON `arguments` payload becomes dozens
+    // of empty-name fragments (the symptom of "34 steps" and "Searched the web — ''").
+    tool_accum: BTreeMap<usize, (String, String, String)>,
     finish_reason: Option<String>,
     usage: Option<TokenUsage>,
     done: bool,
@@ -269,11 +274,54 @@ impl SSEIterator {
             lines: rx.into_iter(),
             text_parts: Vec::new(),
             reasoning_parts: Vec::new(),
-            tool_calls: Vec::new(),
+            tool_accum: BTreeMap::new(),
             finish_reason: None,
             usage: None,
             done: false,
         }
+    }
+
+    /// Drain the per-index accumulator and build the final `ToolCall` list. Each
+    /// entry is `(id, name, arguments_raw)`; only entries that actually received
+    /// a non-empty name are emitted (an empty name usually means a stranded delta
+    /// from a model that omitted id+name on every fragment — surfacing it would
+    /// just create the "Used <empty>" noise we want to avoid).
+    fn finalize_tool_calls(&mut self) -> Vec<ToolCall> {
+        let entries: Vec<(usize, (String, String, String))> =
+            std::mem::take(&mut self.tool_accum).into_iter().collect();
+        let mut out = Vec::with_capacity(entries.len());
+        for (_, (id, name, args_raw)) in entries {
+            if name.trim().is_empty() {
+                // A delta with only `arguments` and no `id`/`name` — keep the raw
+                // payload under `_raw` so downstream debugging can still inspect it.
+                let payload = if args_raw.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(&args_raw).unwrap_or_else(|_| {
+                        serde_json::json!({ "_raw": args_raw })
+                    })
+                };
+                out.push(ToolCall {
+                    id,
+                    name: String::new(),
+                    arguments: payload,
+                });
+                continue;
+            }
+            let arguments: Value = if args_raw.is_empty() {
+                Value::Object(Map::new())
+            } else {
+                serde_json::from_str(&args_raw).unwrap_or_else(|_| {
+                    serde_json::json!({ "_raw": args_raw })
+                })
+            };
+            out.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+        out
     }
 }
 
@@ -315,31 +363,44 @@ impl Iterator for SSEIterator {
                 return Some(StreamEvent::ReasoningDelta { reasoning });
             }
 
-            // Tool call delta
+            // Tool call delta — aggregate by `index` so a single tool call
+            // reassembles from many deltas. Per the OpenAI streaming spec:
+            //  - First delta: {index, id, function: {name, arguments: ""}}
+            //  - Subsequent deltas: {index, function: {arguments: "<chunk>"}}
+            // Without index-based accumulation, a JSON `arguments` payload with N
+            // tokens spawns N pseudo tool calls, each with an empty name and a
+            // partial JSON body that the engine later surfaces as a phantom tool.
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
-                    let id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = tc
+                    let idx = tc
+                        .get("index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let entry = self
+                        .tool_accum
+                        .entry(idx)
+                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            entry.0 = id.to_string();
+                        }
+                    }
+                    if let Some(name) = tc
                         .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args = tc
+                    {
+                        if !name.is_empty() {
+                            entry.1 = name.to_string();
+                        }
+                    }
+                    if let Some(args) = tc
                         .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let parsed: Value = serde_json::from_str(args).unwrap_or(Value::Null);
-                    self.tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: parsed,
-                    });
+                    {
+                        entry.2.push_str(args);
+                    }
                 }
             }
 
@@ -363,7 +424,7 @@ impl Iterator for SSEIterator {
                 } else {
                     Some(self.text_parts.join(""))
                 };
-                let tcs = std::mem::take(&mut self.tool_calls);
+                let tcs = self.finalize_tool_calls();
                 return Some(StreamEvent::Turn {
                     turn: AssistantTurn {
                         text,
@@ -378,7 +439,7 @@ impl Iterator for SSEIterator {
 
         // Stream ended without finish_reason
         if !self.text_parts.is_empty()
-            || !self.tool_calls.is_empty()
+            || !self.tool_accum.is_empty()
             || !self.reasoning_parts.is_empty()
         {
             self.done = true;
@@ -392,7 +453,7 @@ impl Iterator for SSEIterator {
             } else {
                 Some(self.text_parts.join(""))
             };
-            let tcs = std::mem::take(&mut self.tool_calls);
+            let tcs = self.finalize_tool_calls();
             return Some(StreamEvent::Turn {
                 turn: AssistantTurn {
                     text,
@@ -459,5 +520,89 @@ impl crate::router::Provider for OpenAiClient {
 
     fn name(&self) -> &str {
         "openai"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::StreamEvent;
+
+    /// Build a synthetic SSE body that mirrors what DeepSeek (and any OpenAI-
+    /// compatible server) sends for a single `web_search` tool call: the
+    /// arguments JSON arrives as a sequence of small string deltas, all sharing
+    /// the same `index`.
+    fn web_search_sse() -> String {
+        // Each `data: ...` line below is the SSE wire format. The value of
+        // `arguments` is itself a JSON string whose *unescaped* content is the
+        // chunk of the tool-call argument JSON. Concatenating those unescaped
+        // values across the four delta lines must yield
+        //     {"query":"上海下周天气"}
+        let chunks = [
+            // Delta 1: introduce id + name, empty arguments.
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","function":{"name":"web_search","arguments":""}}]},"finish_reason":null}]}"#,
+            // Delta 2: arguments chunk `{"query":` (5 chars inside the JSON string).
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]},"finish_reason":null}]}"#,
+            // Delta 3: arguments chunk `"上海下` (4 chars inside the JSON string, no closing quote yet).
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"上海下"}}]},"finish_reason":null}]}"#,
+            // Delta 4: arguments chunk `周天气"}` (6 chars inside the JSON string).
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"周天气\"}"}}]},"finish_reason":null}]}"#,
+            // Final delta: no more tool_calls, signal finish_reason.
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        chunks.join("\n")
+    }
+
+    #[test]
+    fn streaming_tool_calls_aggregated_by_index() {
+        let body = web_search_sse();
+        let mut iter = SSEIterator::new(&body);
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        while let Some(ev) = iter.next() {
+            if let StreamEvent::Turn { turn } = ev {
+                tool_calls = turn.tool_calls;
+            }
+        }
+        assert_eq!(tool_calls.len(), 1, "expected exactly one tool call after aggregation");
+        let tc = &tool_calls[0];
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.name, "web_search");
+        let query = tc
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(query, "上海下周天气");
+    }
+
+    /// Some OpenAI-compatible servers (and a few models on Ollama) forget the
+    /// `id`/`name` on every fragment and just stream the raw JSON of
+    /// `arguments`. The old code emitted a phantom tool call per fragment; the
+    /// fix still produces a single tool call, but the empty name forces the
+    /// engine to short-circuit it.
+    #[test]
+    fn streaming_tool_calls_without_id_or_name_still_aggregate() {
+        let body = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"ab"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"cd\"}"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let mut iter = SSEIterator::new(body);
+        let mut tcs: Vec<ToolCall> = Vec::new();
+        while let Some(ev) = iter.next() {
+            if let StreamEvent::Turn { turn } = ev {
+                tcs = turn.tool_calls;
+            }
+        }
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "");
+        // The raw JSON got concatenated; downstream should see the rescued payload.
+        let q = tcs[0].arguments.get("q").and_then(|v| v.as_str());
+        assert_eq!(q, Some("abcd"));
     }
 }

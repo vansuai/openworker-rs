@@ -16,3 +16,10 @@ node_modules/
 # Tauri
 surfaces/gui/dist/
 surfaces/gui/src-tauri/target/
+
+# IDE / agent workspace
+.qoder/
+
+# Runtime-generated automation artifacts
+surfaces/gui/src-tauri/briefing/
+surfaces/gui/src-tauri/briefings/

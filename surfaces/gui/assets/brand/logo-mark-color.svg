@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="Vansu mark (color)">
+  <title>Vansu</title>
+  <defs>
+    <mask id="vansu-crescent-c" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="white"/>
+      <circle cx="42" cy="30" r="20" fill="black"/>
+    </mask>
+    <!-- Soft moonlight glow behind the crescent. -->
+    <radialGradient id="vansu-glow" cx="50%" cy="55%" r="50%">
+      <stop offset="0%" stop-color="#F4ECD8" stop-opacity="0.18"/>
+      <stop offset="60%" stop-color="#F4ECD8" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#F4ECD8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Deep-night sky tile. -->
+  <rect width="64" height="64" rx="14" fill="#0E1A2E"/>
+  <!-- Soft glow halo behind the moon. -->
+  <circle cx="32" cy="34" r="26" fill="url(#vansu-glow)"/>
+  <!-- Chariot path: muted silver arc across the night sky. -->
+  <path d="M5 16 Q32 -3 59 17" stroke="#A8B2C0" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.55"/>
+  <!-- Crescent moon in warm moonlight. -->
+  <circle cx="32" cy="34" r="22" fill="#F4ECD8" mask="url(#vansu-crescent-c)"/>
+  <!-- Guiding star in warm gold (前驱·望舒). -->
+  <circle cx="10" cy="14" r="2" fill="#C9A86A"/>
+</svg>

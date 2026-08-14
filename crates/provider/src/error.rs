@@ -61,6 +61,32 @@ impl Error {
         if status == 429 {
             return Self::Other("Rate limit exceeded".to_string());
         }
-        Self::Other(format!("HTTP {status}: {}", &body[..body.len().min(200)]))
+        // Clip the body on a char boundary — error payloads can carry CJK text,
+        // and a byte-offset slice mid-sequence panics.
+        let mut end = body.len().min(200);
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::Other(format!("HTTP {status}: {}", &body[..end]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_response_clips_cjk_body_without_panicking() {
+        // Regression: `&body[..body.len().min(200)]` sliced mid-sequence on
+        // multi-byte error payloads (200 is not a boundary of 3-byte CJK chars).
+        let body = "错".repeat(100); // 300 bytes
+        let err = Error::from_response(500, &body, "test");
+        match err {
+            Error::Other(msg) => {
+                assert!(msg.starts_with("HTTP 500: "));
+                assert!(msg.len() <= "HTTP 500: ".len() + 200);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 }

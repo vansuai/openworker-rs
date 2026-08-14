@@ -84,7 +84,7 @@ export function InboxItemCard({
         </div>
       ) : (
         <>
-          <div className={SEC}>{item.kind}</div>
+          <div className={SEC}>{item.kind === "question" && item.header ? item.header : item.kind}</div>
           <div className="text-[15px] font-semibold mt-0.5 leading-snug">{item.title}</div>
         </>
       )}

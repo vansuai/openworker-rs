@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="Vansu mark">
+  <title>Vansu</title>
+  <defs>
+    <mask id="vansu-crescent" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="white"/>
+      <circle cx="42" cy="30" r="20" fill="black"/>
+    </mask>
+  </defs>
+  <!-- Chariot path: the arc the moon travels across the night sky. -->
+  <path d="M5 16 Q32 -3 59 17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.55"/>
+  <!-- Crescent moon: the celestial body 望舒 chariots. -->
+  <circle cx="32" cy="34" r="22" fill="currentColor" mask="url(#vansu-crescent)"/>
+  <!-- Guiding star: 前驱 — 望舒 leads the way. -->
+  <circle cx="10" cy="14" r="2" fill="currentColor"/>
+</svg>

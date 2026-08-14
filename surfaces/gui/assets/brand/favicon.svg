@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" role="img" aria-label="Vansu">
+  <title>Vansu</title>
+  <defs>
+    <mask id="vansu-fav" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
+      <rect width="32" height="32" fill="white"/>
+      <circle cx="21" cy="14" r="10" fill="black"/>
+    </mask>
+  </defs>
+  <!-- Crescent + a single star. Stripped to two shapes for legibility at 16px. -->
+  <circle cx="16" cy="17" r="11" fill="currentColor" mask="url(#vansu-fav)"/>
+  <circle cx="5" cy="7" r="1.5" fill="currentColor"/>
+</svg>

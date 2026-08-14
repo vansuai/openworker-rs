@@ -135,6 +135,15 @@ function buildRows(items: TurnItem[]): TurnRow[] {
 function approvalChip(resolved: ApprovalDecision | undefined) {
   if (resolved === "deny")
     return <span className="text-[10.5px] px-1.5 rounded-full bg-dangerSoft text-danger shrink-0">✕ declined</span>;
+  if (resolved === "stale")
+    return (
+      <span
+        className="text-[10.5px] px-1.5 rounded-full bg-paper2 text-muted shrink-0"
+        title="Turn ended before this could be answered"
+      >
+        · stale
+      </span>
+    );
   return (
     <span
       className="text-[10.5px] px-1.5 rounded-full bg-okSoft text-ok shrink-0"
@@ -275,7 +284,18 @@ function TurnGroup({
               </div>
             ) : row.type === "ask" ? (
               <div className="flex items-baseline gap-2 px-2 py-0.5" key={i} data-testid="turn-ask">
-                <span className={"w-3.5 text-center text-[10px] shrink-0 " + (row.approval.resolved === "deny" ? "text-danger" : "text-ok")}>●</span>
+                <span
+                  className={
+                    "w-3.5 text-center text-[10px] shrink-0 " +
+                    (row.approval.resolved === "deny"
+                      ? "text-danger"
+                      : row.approval.resolved === "stale"
+                      ? "text-muted"
+                      : "text-ok")
+                  }
+                >
+                  ●
+                </span>
                 <LineText line={humanizeAsk(row.approval.name, row.approval.args)} />
                 {approvalChip(row.approval.resolved)}
               </div>

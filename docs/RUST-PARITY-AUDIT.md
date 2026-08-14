@@ -1,10 +1,11 @@
 # OpenWorker Rust 协议兼容性审计（现行）
 
-- **基线**：`coworker/` Python 实现 + GUI (`surfaces/gui`) REST/WS 契约
-- **对照**：`crates/` Rust workspace（`ocw-server`）
+- **产品目标**：Rust `crates/`（`ocw-server`）为唯一运行时与发布路径
+- **Python 角色**：`coworker/` **仅作迁移对照参考**（行为/契约/测试的真相源），不再作为产品后端长期维护
+- **GUI 契约**：`surfaces/gui` REST/WS 仍以与 Python 基线 1:1 等价为验收口径
 - **口径**：HTTP/WS 路由、JSON 字段、事件、权限、SQLite/JSONL、桌面 sidecar
-- **修订**：2026-08-07（替换 2026-08-05 过时结论）
-- **总判定**：**路由壳接近可切换，语义与交付链路未达 1:1。** 阻断生产切流的是有路由但半实现/假成功，以及 dev/prod sidecar 不一致——不是「缺 90 条路由」。
+- **修订**：2026-08-07（替换 2026-08-05 过时结论；明确 Python = 参考、Rust = 产品；同日源码级复核见 [parity-report-2026-08-07.md](parity-report-2026-08-07.md)，本文 P0/P1 清单多处被修正）
+- **总判定**：**路由壳与数据存储层高保真，执行语义层多处断链。** 阻断生产的不再是「缺路由」，而是权限管道断裂（写路径根传错、会话 mode 不生效）、provider 四家请求构造/流式错误、inbox durable resume 缺失、入站 Gateway 未挂载，以及新发现的 HTTP 鉴权归零 + CORS 全开的安全回归（详见详细报告 §5）。
 
 ## 0. 相对 2026-08-05 审计：已推进
 
@@ -34,14 +35,14 @@
 | Python-only | **4** |
 | Rust-only | **12** |
 
-### 1.1 Python-only
+### 1.1 Python-only（2026-08-07 源码复核后更新）
 
 | Method | Path | 影响 |
 | --- | --- | --- |
-| GET | `/v1/connectors/slack/status` | GUI `api.ts` 硬编码 → Rust **404** |
-| GET | `/v1/connectors/github/status` | 同上 |
-| POST | `/v1/connectors/github/installations/{id}/disconnect` | `cloud::github_disconnect_installation` 有逻辑未挂路由 |
-| POST | `/v1/_debug/inject_inbound` | debug only |
+| POST | `/v1/_debug/inject_inbound` | debug only（唯一 Python-only 路由） |
+
+> 下表三条已于复核确认在 Rust 注册（app.rs L318-327），原列为过时信息，保留仅供追溯：
+> ~~GET /v1/connectors/slack/status、GET /v1/connectors/github/status、POST .../github/installations/{id}/disconnect~~
 
 ### 1.2 Rust-only（超集，不算回归）
 
@@ -65,64 +66,68 @@
 | browser | Missing | 无 Playwright |
 | ws `/ws/session` | Partial | turn/approval 有；整 turn 后刷事件；无 MCP tools；Stop 未接通 |
 | ws `/ws/events` | Equivalent | broadcast 存在 |
-| TUI CLI | Missing | 仍仅 Python Textual |
-| 打包生产 | Broken | stage Python `openworker-server`，Tauri 找 `ocw-server` |
+| TUI CLI | Missing | 参考实现仍在 Python Textual；产品路径为 GUI/`ocw-server` |
+| 打包生产 | Equivalent（默认） | 默认 stage `ocw-server`；`OCW_SIDECAR=python` 仅临时对照/应急 |
 
 ---
 
-## 2. P0–P3 清单（现行）
+## 2. P0–P3 清单（现行，2026-08-07 源码复核后修订）
+
+> 复核详情与全部证据见 [parity-report-2026-08-07.md](parity-report-2026-08-07.md)；状态标注：已修复 / 部分推翻（降级） / 确认。
 
 ### P0 — 切流阻断
 
-1. **打包 sidecar 与 Tauri 不一致** — `build_dmg.sh` / `build_windows.ps1` stage PyInstaller `openworker-server`；Tauri 找 `ocw-server`。
-2. **无端到端真流式** — `Router::stream` 走 `complete()`；WS 整 turn 后再广播。
-3. **Stop / interrupt 无效** — WS `ctx.cancel` 与 engine 本地 cancel 未共享。
-4. **MCP 运行时假实现** — `tools: []`；connect 直接 `connected: true`；OAuth 无 pending；WS 不注册 MCP tools。
-5. **五段 cron → now+60** — Python `croniter` 五段；Rust `cron` 要六段；失败回落 `now + 60`。
-6. **Inbox resolve 不 resume** — 无 Python `_durable_resume`。
+1. ~~**打包 sidecar 与 Tauri 不一致**~~ — **已修复**：build_dmg.sh / build_windows.ps1 默认 stage `ocw-server`，与 Tauri `server_bin()` 一致。
+2. **无端到端真流式** — **部分推翻**：WS live pump 已实时广播；但 provider 层仍全缓冲（openai/anthropic/gemini `resp.text()` 整读后重放；bedrock/vertex 无 stream）。
+3. **Stop / interrupt 无效** — **部分推翻**：cancel 链路已共享；残留：审批等待不响应停止、无 interrupt_hooks 杀 shell。
+4. **MCP 运行时假实现** — **改判**：tools/list 真实、connect 诚实；真缺口为 **tools/call 零路径（会话中不可执行）** 与 OAuth stub。
+5. ~~**五段 cron → now+60**~~ — **已修复**（补秒位 + 回归测试）；残留：timezone 恒 UTC、schedule_human dow 取错字段。
+6. **Inbox resolve 不 resume** — **确认**，叠加无 mid-turn checkpoint。
+7. **（新）安全回归**：无 HTTP 鉴权中间件、CorsLayer::permissive()、WS 鉴权退化且打印 token 明文、Origin starts_with 可绕过、/ws/events 无鉴权。
+8. **（新）权限管道断裂**：PermissionEngine workspace_root 传入 permissions.json 路径 → 写操作硬拒；会话 mode 不生效；plan 批准不翻转 mode；allowlist/task_rules 零注入。
+9. **（新）Provider 构造错误**：Anthropic system 形状非法/消息折叠死代码/图片键名错；Gemini 工具回放断裂；Bedrock 无 SigV4；Vertex region 字段不匹配；凭据 env 回退被短路；verify 为无条件 ok:true stub。
 
 ### P1 — GUI 可感知缺口
 
-7. Slack/GitHub 专用 status 路径缺失。  
-8. GitHub installation disconnect 未挂路由。  
-9. `GET /v1/agents` 响应形状错误。  
-10. 无 connectors Gateway（Slack Socket Mode / Telegram / Email 入站）。  
-11. Browser automation 不可用。  
-12. connector `mcp-connect` 假 `started: true`。
+7'. ~~Slack/GitHub 专用 status 路径缺失~~ / 8'. ~~GitHub disconnect 未挂路由~~ / 9'. ~~GET /v1/agents 形状错误~~ / 12'. ~~mcp-connect 假成功~~ — **均已修复**。
+10. **无 connectors Gateway** — **确认，且更严重**：gateway.rs start() 恒空且未挂 AppState，六条入站链路（allowlist 执行、reply-token、interaction、parked 重注入、mention、mirror）无运行时载体。
+11. **Browser automation 不可用** — 确认（诚实 unavailable，决策项）。
+13'. **（新）WS 层**：限流时钟 bug（30 条后永久拒绝）；question/directory/plan 不经 inbox；多视图被顶掉；nav-layout 参数名不兼容；token usage/工具消息不落盘。
+14'. **（新）数据/工具层**：Memory 三连锁断（内存版存储 + 键不匹配 + 无工具）；load_skill 未注册但 prompt 引用；persona 运行时不生效；send_message/attribution/scheduling/selfwake 等工具缺失。
 
 ### P2 — 体验 / 边界
 
 13. Personas disable 不 archive。  
 14. Skills REST 为 Rust 超集（需文档）。  
-15. TUI 未迁移 — **决策：桌面 + HTTP 为一等公民；TUI 过渡期保留 Python `openworker` CLI。**  
-16. CI 无 `cargo check/test`；无 Python↔Rust 契约门禁。  
-17. README / `setup_dev_env.sh` 仍主推 Python server。
+15. TUI 未移植 — **决策：不作为产品路径；需要时对照 `coworker/tui` 再迁，或废弃。**  
+16. CI 已加 `cargo check/test` + 路由探针；Python pytest 保留作参考回归。  
+17. README / `setup_dev_env.sh` 以 `ocw-server` 为主路径。
 
 ### P3 — 测试 / 文档
 
-18. Rust 测试远少于 Python；无系统化契约差分。  
-19. GUI e2e 默认仍对 Python 后端。
+18. Rust 测试仍少于 Python 参考套件；契约差分以 `scripts/rust_route_parity.py` 起步。  
+19. GUI e2e 应对准 Rust 后端（参考 Python 仅用于行为对照）。
 
 ---
 
 ## 3. GUI 调用矩阵（要点）
 
-`surfaces/gui/src/api.ts` 硬编码且会砸体验的路径：
+`surfaces/gui/src/api.ts` 硬编码且会砸体验的路径（相对参考实现）：
 
-- `GET /v1/connectors/github/status`、`GET /v1/connectors/slack/status`
-- `disconnectGithubInstallation` → `POST .../github/installations/{id}/disconnect`
-- 其余 `/v1/*` 在 Rust 路由面上大多已注册；风险转为 **假成功 / 空 tools / 错误 JSON 形状**，而非 404。
+- `GET /v1/connectors/github/status`、`GET /v1/connectors/slack/status`（Rust 已补）
+- `disconnectGithubInstallation` → `POST .../github/installations/{id}/disconnect`（Rust 已补）
+- 其余风险主要是 **假成功 / 空 tools / 错误 JSON 形状**，而非 404。
 
 ---
 
 ## 4. 切流策略与验收
 
-**策略**：分阶段双轨 — GUI 核心等价后打包默认 `ocw-server`，保留 `COWORKER_SERVER_BIN` / `OCW_SIDECAR=python` 回退；再清 Gateway / Browser / MCP OAuth。
+**策略**：Rust 为唯一产品路径。`coworker/` 只读对照；打包默认 `ocw-server`。`OCW_SIDECAR=python` / `COWORKER_SERVER_BIN` 仅用于迁移期对照或紧急回滚，**不是并行产品线**。
 
 | 门禁 | 标准 |
 | --- | --- |
-| Phase C 切流 | P0 项绿；打包 stage `ocw-server`；核心 GUI 无 404/假成功；流式与 Stop 可感一致 |
-| Phase D 完成 | 公开能力在 Rust 复现或文档明示废弃；默认发布可去 Python sidecar |
+| 切流可用 | P0 项绿；默认打包 `ocw-server`；核心 GUI 无 404/假成功；流式与 Stop 可感一致 |
+| 迁移完成 | 参考实现中的公开能力均在 Rust 复现（或文档明示废弃）；可移除 Python sidecar 与发布依赖 |
 
 ## 5. 优先改动文件
 
@@ -136,9 +141,10 @@
 
 | 主题 | 决策 |
 | --- | --- |
-| **TUI** | 桌面 GUI + HTTP/`ocw-server` 为一等公民。Textual TUI（`openworker` CLI）过渡期保留 Python；不阻塞切流。 |
-| **Browser** | Rust `BrowserController` 继续诚实返回 unavailable；Playwright 端口列入后续迭代，禁止假截图成功。 |
-| **Gateway inbound** | [`crates/connectors/src/gateway.rs`](../crates/connectors/src/gateway.rs) 提供生命周期壳；`start()` 返回空列表；Slack/Telegram/Email 入站仍未移植。 |
-| **MCP OAuth** | stdio/HTTP tools/list 已接线；connector managed OAuth MCP-connect 返回明确错误（非 `started:true`）。 |
-| **打包回退** | 默认 stage `ocw-server`；`OCW_SIDECAR=python` 或 `COWORKER_SERVER_BIN` 可回退。 |
-| **CI** | `cargo check/test --workspace` + `scripts/rust_route_parity.py` 进入 CI。 |
+| **Python 代码** | **仅迁移参考**；不以 Python 为发布/运行时产品。 |
+| **TUI** | 非产品一等路径；对照 `coworker/tui` 可选后迁或废弃。 |
+| **Browser** | Rust `BrowserController` 诚实返回 unavailable；对照 Python Playwright 后续移植。 |
+| **Gateway inbound** | [`crates/connectors/src/gateway.rs`](../crates/connectors/src/gateway.rs) 生命周期壳；入站对照 Python gateway 继续移植。 |
+| **MCP OAuth** | stdio/HTTP tools/list 已接线；managed OAuth 对照 Python 后续补齐。 |
+| **打包** | 默认 `ocw-server`；Python sidecar 仅临时对照/应急。 |
+| **CI** | `cargo check/test --workspace` + `scripts/rust_route_parity.py`；pytest 为参考回归。 |

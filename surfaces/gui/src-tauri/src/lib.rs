@@ -94,6 +94,18 @@ fn server_bin() -> PathBuf {
             }
         }
     }
+    // Dev mode: prefer the just-built Rust workspace binary (cargo build output).
+    // This avoids Tauri's resource copy step which can reuse locked inodes after
+    // sidecar crashes during previous sessions.
+    #[cfg(debug_assertions)]
+    {
+        let mut dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        dev_path.push("../../../crates/target/debug");
+        dev_path.push(if cfg!(windows) { "ocw-server.exe" } else { "ocw-server" });
+        if dev_path.exists() {
+            return dev_path;
+        }
+    }
     // Dev fallback: Rust workspace target directory
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

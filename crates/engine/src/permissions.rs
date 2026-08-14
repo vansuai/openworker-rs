@@ -120,7 +120,11 @@ pub fn classify_risk(tool_name: &str) -> RiskClass {
         | "read" => RiskClass::Read,
         "write_file" | "edit_file" | "create_directory" | "move_file" | "delete_file"
         | "delete_directory" => RiskClass::WriteLocal,
-        _ => RiskClass::External,
+        // Default to Read — mirrors Python's `classify()` which returns
+        // RiskClass.READ for any tool not explicitly listed as high-risk
+        // and not flagged `requires_approval` in its metadata. Unknown
+        // tools are treated as safe reads rather than blocked.
+        _ => RiskClass::Read,
     }
 }
 
@@ -206,6 +210,13 @@ impl PermissionEngine {
         self.task_rules = rules;
     }
 
+    /// Mint a single standing rule into the live engine's task rules (used by
+    /// the "Allow every time" flow, §25). Existing `set_task_rules` remains for
+    /// full-task seeding.
+    pub fn add_task_rule(&mut self, tool: String, target: String) {
+        self.task_rules.entry(tool).or_default().insert(target);
+    }
+
     /// Allow a tool for this session.
     pub fn allow_tool_for_session(&mut self, tool_name: String) {
         self.session_allow_tools.insert(tool_name);
@@ -216,6 +227,14 @@ impl PermissionEngine {
         if !command.is_empty() {
             self.session_allow_commands.insert(command);
         }
+    }
+
+    /// Return current session grants as a JSON object — tools + commands.
+    pub fn grants(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tools": self.session_allow_tools.iter().collect::<Vec<_>>(),
+            "commands": self.session_allow_commands.iter().collect::<Vec<_>>(),
+        })
     }
 
     /// Evaluate whether a tool call may proceed.
@@ -382,14 +401,66 @@ fn extract_target(
     tool_name: &str,
     args: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let key = match tool_name {
-        "web_search" | "web_fetch" => "url",
-        "mcp__*" | "connector__*" => "target",
-        _ => return None,
+    let key = if tool_name == "send_message"
+        || tool_name.starts_with("mcp__")
+        || tool_name.starts_with("connector__")
+    {
+        "target"
+    } else if tool_name == "web_search" || tool_name == "web_fetch" {
+        "url"
+    } else {
+        return None;
     };
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// The declared standing-rule target argument name for a tool, mirroring Python's
+/// `TARGET_ARGS` (`coworker/connectors/tool_defs.py`): only tools that declare a
+/// single "target" binding are eligible for task-scoped standing rules. Web tools
+/// do not declare one (Python's candidate table excludes them).
+pub fn target_arg_for(tool_name: &str) -> Option<&'static str> {
+    if tool_name == "send_message"
+        || tool_name.starts_with("mcp__")
+        || tool_name.starts_with("connector__")
+    {
+        Some("target")
+    } else {
+        None
+    }
+}
+
+/// The target value iff this call is eligible for a task-scoped standing rule
+/// (UX-DECISIONS §25): external-risk only (never exec/write-local — shell asks
+/// forever), the tool must declare a target argument, and the call must actually
+/// name a target. Returns None otherwise — ineligible calls keep parking
+/// approvals as today. Mirrors Python's `standing_rule_candidate`
+/// (`coworker/permissions.py`).
+pub fn standing_target_candidate(
+    tool_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    // Mirror Python's `classify(...) is not RiskClass.EXTERNAL → None`: write-local
+    // and exec tools never mint standing rules.
+    if matches!(
+        classify_risk(tool_name),
+        RiskClass::WriteLocal | RiskClass::Exec
+    ) {
+        return None;
+    }
+    let arg = target_arg_for(tool_name)?;
+    let value = args
+        .get(arg)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 // shlex for Rust
@@ -433,5 +504,82 @@ mod shlex {
             tokens.push(current);
         }
         Ok(tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn args(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn target_arg_for_matches_python_target_args() {
+        assert_eq!(target_arg_for("send_message"), Some("target"));
+        assert_eq!(target_arg_for("connector__slack"), Some("target"));
+        assert_eq!(target_arg_for("mcp__filesystem"), Some("target"));
+        // web tools are not in TARGET_ARGS.
+        assert_eq!(target_arg_for("web_search"), None);
+        assert_eq!(target_arg_for("read_file"), None);
+    }
+
+    #[test]
+    fn standing_target_candidate_rules() {
+        // Target-arg tools with a non-empty target → Some.
+        assert_eq!(
+            standing_target_candidate("send_message", &args(&[("target", "alice")])),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            standing_target_candidate("connector__slack", &args(&[("target", "#general")])),
+            Some("#general".to_string())
+        );
+        assert_eq!(
+            standing_target_candidate("mcp__x", &args(&[("target", "t")])),
+            Some("t".to_string())
+        );
+        // Write-local / exec tools never mint standing rules.
+        assert_eq!(
+            standing_target_candidate("write_file", &args(&[("path", "/tmp/a")])),
+            None
+        );
+        assert_eq!(
+            standing_target_candidate("shell", &args(&[("command", "ls")])),
+            None
+        );
+        // web_search has no target arg → None.
+        assert_eq!(
+            standing_target_candidate("web_search", &args(&[("query", "x")])),
+            None
+        );
+        // Empty / missing target → None.
+        assert_eq!(
+            standing_target_candidate("send_message", &args(&[("target", "  ")])),
+            None
+        );
+        assert_eq!(
+            standing_target_candidate("send_message", &serde_json::Map::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn add_task_rule_auto_allows_next_call() {
+        let mut engine = PermissionEngine::new(std::path::PathBuf::from("/tmp"));
+        engine.add_task_rule("send_message".to_string(), "alice".to_string());
+        let meta = json!({"risk_level": "write"});
+        // Same tool + target → allowed by the minted rule.
+        let d = engine.evaluate("send_message", &json!({"target": "alice"}), Some(&meta));
+        assert!(d.allowed, "expected rule hit, got {d:?}");
+        assert_eq!(d.rule, "send_message → alice");
+        // A different target still asks.
+        let d = engine.evaluate("send_message", &json!({"target": "bob"}), Some(&meta));
+        assert!(!d.allowed && d.needs_user, "expected ask, got {d:?}");
     }
 }

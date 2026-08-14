@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "cargo build -p ocw-server --manifest-path ../../crates/Cargo.toml && vite",
-    "beforeBuildCommand": "cargo build -p ocw-server --manifest-path ../../crates/Cargo.toml --release && npm run build"
+    "beforeDevCommand": "cargo build -p ocw-server --manifest-path ../../crates/Cargo.toml && mkdir -p src-tauri/binaries/sidecar src-tauri/target/debug/sidecar && rm -f src-tauri/binaries/sidecar/ocw-server src-tauri/binaries/sidecar/openworker-server && cp ../../crates/target/debug/ocw-server src-tauri/binaries/sidecar/openworker-server && rm -f src-tauri/target/debug/sidecar/ocw-server src-tauri/target/debug/sidecar/openworker-server && cp ../../crates/target/debug/ocw-server src-tauri/target/debug/sidecar/openworker-server && vite",
+    "beforeBuildCommand": "cargo build -p ocw-server --manifest-path ../../crates/Cargo.toml --release && mkdir -p src-tauri/binaries/sidecar && rm -f src-tauri/binaries/sidecar/ocw-server src-tauri/binaries/sidecar/openworker-server && cp ../../crates/target/release/ocw-server src-tauri/binaries/sidecar/openworker-server && npm run build"
   },
   "app": {
     "withGlobalTauri": true,

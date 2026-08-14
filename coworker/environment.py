@@ -62,13 +62,13 @@ def environment_context(workspace: str | Path) -> str:
     lines = [
         f"Workspace: {ws}",
         f"Platform: {sys.platform} ({os_name})",
-        f"Today's date: {date.today().isoformat()}",
+        f"Session started (date snapshot — prefer per-turn <system-context> for current date): {date.today().isoformat()}",
         *_git_snapshot(ws),
     ]
     body = "\n".join(lines)
     return (
-        "Environment (snapshot from session start — verify before relying on git "
-        f"state):\n<environment>\n{body}\n</environment>\n"
+        "Environment (snapshot from session start — date and git state may be stale; "
+        f"prefer per-turn <system-context>):\n<environment>\n{body}\n</environment>\n"
         "Folder scope: work inside the workspace and any folders the user has granted. Do not "
         "read or list other locations (home directory sweeps, ~/Desktop, ~/Downloads, photo "
         "libraries, etc.) — not even via shell commands like find/ls/grep. On macOS every such "

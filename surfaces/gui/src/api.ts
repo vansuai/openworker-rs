@@ -147,8 +147,19 @@ export interface ConversationMessage {
   [key: string]: any;
 }
 
+// Error carrying the HTTP status, so callers can tell a definitive 404
+// (session gone) apart from a transient failure (server restarting).
+export class ApiError extends Error {
+  constructor(public readonly status: number) {
+    super(`API error ${status}`);
+  }
+}
+
 export async function getSessionMessages(sessionId: string): Promise<ConversationMessage[]> {
-  const res = await fetch(`${httpBase()}/v1/sessions/${sessionId}/messages`);
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/messages`);
+  // Non-ok must reach the caller: swallowing a 404/500 into an empty array
+  // made `selectSession` wipe a live transcript whenever the server hiccupped.
+  if (!res.ok) throw new ApiError(res.status);
   return (await res.json()).messages ?? [];
 }
 
@@ -1067,6 +1078,8 @@ export interface InboxItem {
   options?: string[];
   allow_text?: boolean;
   multi?: boolean;
+  /** Short chip label from ask_user `header` (e.g. "城市"). */
+  header?: string;
   // Kind-specific payload (directory: {path, writable}; …).
   data?: Record<string, any>;
   // Originating-session context (server-joined) so the Inbox is self-contained.
@@ -1511,7 +1524,11 @@ export async function runAutomation(id: string): Promise<PreparedRun> {
 export async function finalizeAutomationRun(id: string, runId: string) {
   const res = await fetch(
     `${httpBase()}/v1/automations/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/finalize`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    },
   );
   return res.json();
 }
@@ -1816,8 +1833,18 @@ export class Session {
     });
   }
 
-  approve(decision: string) {
-    this.send({ type: "approval", decision });
+  /** `item_id` is the inbox item id (or `tool_call_id` for the live card) — the server
+   * routes the decision back into the same Inbox entry that originated the request so
+   * a reconnect / Slack reply / second device converges to a single resolution. Older
+   * callers that pass no id still work: the server falls back to whichever Sender is
+   * currently parked. */
+  approve(decision: string, itemId?: string, toolCallId?: string) {
+    this.send({
+      type: "approval",
+      decision,
+      ...(itemId ? { item_id: itemId } : {}),
+      ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+    });
   }
 
   // Reply to a `request_directory` prompt: grant a folder (with access level) or decline.

@@ -57,6 +57,10 @@ interface Props {
   // False when the default model's provider has no key — the composer shows a "connect a model"
   // banner and routes sends to setup (preserving the draft) instead of dropping them.
   modelReady?: boolean;
+  // True when the settings API call itself failed (backend unreachable). The composer shows a
+  // "Could not reach server" chip with a retry action instead of the perpetual "Loading models…".
+  modelsLoadError?: boolean;
+  onRetryModels?: () => void;
   onConnectModel?: () => void;
   onConfigureVoiceInput?: () => void;
   onSend: (text: string, attachments?: Attachment[]) => void;
@@ -484,7 +488,17 @@ export function Composer(props: Props) {
           {/* model — a quiet chip, now for the session's whole life (§17 rev 2026-07-22:
               mid-session switching shipped, so the picker stays actionable; the topbar
               subtitle still states the current model). */}
-          {!dictation?.recording && (needsModel ? (
+          {!dictation?.recording && (props.modelsLoadError ? (
+            <button
+              className="pill chip text-faint"
+              onClick={() => props.onRetryModels?.()}
+              data-testid="models-error"
+              title="Could not reach the server — click to retry"
+            >
+              <span className="pill-label">Server unreachable</span>
+              <span className="model-warn-ico" aria-hidden>↻</span>
+            </button>
+          ) : needsModel ? (
             <button
               className="pill model-warn chip"
               onClick={() => props.onConnectModel?.()}

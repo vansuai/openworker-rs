@@ -15,6 +15,16 @@ use ocw_provider::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+/// Truncate to at most `max_chars` characters without splitting a multi-byte
+/// UTF-8 sequence — file contents and grep hits routinely carry CJK text, and
+/// a byte-offset slice into it panics (same class as the `preview()` crash).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TodoList — shared per-session task list surfaced to the UI.
 // ---------------------------------------------------------------------------
@@ -203,7 +213,7 @@ fn make_read_file(workspace: PathBuf) -> ToolFn {
                 }
             };
             let text = if line.len() > MAX_LINE_CHARS {
-                format!("{}… (line truncated)", &line[..MAX_LINE_CHARS])
+                format!("{}… (line truncated)", truncate_chars(&line, MAX_LINE_CHARS))
             } else {
                 line
             };
@@ -560,7 +570,7 @@ fn make_grep(workspace: PathBuf) -> ToolFn {
                                 .unwrap_or_else(|_| Path::new(file))
                                 .display()
                                 .to_string();
-                            Some(json!({"file": rel, "line": ln, "text": &txt[..txt.len().min(300)]}))
+                            Some(json!({"file": rel, "line": ln, "text": truncate_chars(&txt, 300)}))
                         })
                         .collect();
                     return ToolResult::ok(
@@ -625,7 +635,7 @@ fn make_grep(workspace: PathBuf) -> ToolFn {
                     matches.push(json!({
                         "file": rel,
                         "line": i + 1,
-                        "text": &line[..line.len().min(300)]
+                        "text": truncate_chars(&line, 300)
                     }));
                 }
             }

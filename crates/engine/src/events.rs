@@ -90,6 +90,9 @@ impl Event {
         reason: String,
         category: String,
     ) -> Self {
+        let standing_target = arguments
+            .as_object()
+            .and_then(|m| crate::permissions::standing_target_candidate(&name, m));
         Self {
             event_type: EventType::PermissionRequired,
             data: EventData::PermissionRequired {
@@ -97,6 +100,34 @@ impl Event {
                 arguments,
                 reason,
                 category,
+                tool_call_id: None,
+                standing_target,
+            },
+        }
+    }
+
+    /// Variant carrying the originating `tool_call_id` so a downstream surface
+    /// (GUI, Inbox, Slack reply) can round-trip an approval response back to
+    /// the same in-flight permission request, even when several are queued.
+    pub fn permission_required_for(
+        name: String,
+        arguments: Value,
+        reason: String,
+        category: String,
+        tool_call_id: Option<String>,
+    ) -> Self {
+        let standing_target = arguments
+            .as_object()
+            .and_then(|m| crate::permissions::standing_target_candidate(&name, m));
+        Self {
+            event_type: EventType::PermissionRequired,
+            data: EventData::PermissionRequired {
+                name,
+                arguments,
+                reason,
+                category,
+                tool_call_id,
+                standing_target,
             },
         }
     }
@@ -153,6 +184,33 @@ impl Event {
                 reason,
                 display,
                 standing_rule,
+                tool_call_id: None,
+            },
+        }
+    }
+
+    /// Variant carrying the originating `tool_call_id` — used by the engine to
+    /// pair a `tool_finished: denied | error` with the matching
+    /// `permission_required` so the GUI can clear the now-stale approval card.
+    pub fn tool_finished_for(
+        name: String,
+        status: String,
+        result_preview: Option<String>,
+        reason: Option<String>,
+        display: Option<Value>,
+        standing_rule: Option<String>,
+        tool_call_id: Option<String>,
+    ) -> Self {
+        Self {
+            event_type: EventType::ToolFinished,
+            data: EventData::ToolFinished {
+                name,
+                status,
+                result_preview,
+                reason,
+                display,
+                standing_rule,
+                tool_call_id,
             },
         }
     }
@@ -218,6 +276,16 @@ pub enum EventData {
         arguments: Value,
         reason: String,
         category: String,
+        /// The provider-side `id` of the originating tool call (e.g. `call_1`).
+        /// Optional so older event producers can omit it; the GUI treats it as
+        /// opaque and uses it to clear stale approval cards on `tool_finished`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tool_call_id: Option<String>,
+        /// The target value iff this call is eligible for a task-scoped standing
+        /// rule (§25 "Allow every time"). None → the call is ineligible and keeps
+        /// parking approvals as today. Mirrors Python's `standing_rule_candidate`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        standing_target: Option<String>,
     },
     DirectoryRequested {
         reason: String,
@@ -245,6 +313,11 @@ pub enum EventData {
         display: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         standing_rule: Option<String>,
+        /// Same meaning as `PermissionRequired::tool_call_id`; the GUI uses
+        /// the pair to match a finished tool back to the approval card it
+        /// produced (and clear that card if the tool was denied / errored).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tool_call_id: Option<String>,
     },
     IterationEnd {
         iteration: usize,

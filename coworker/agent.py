@@ -9,6 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
+from datetime import date
+
 from .agents import Agent, AgentContext, code_agent
 from .automation import scheduling_tools
 from .selfwake import selfwake_tools
@@ -296,6 +298,9 @@ def build_engine(
 
     def context_provider() -> str:
         parts = []
+        # Every turn carries the real current date — models don't know "today" on their own,
+        # and the system-prompt date is a session-start snapshot that can go stale.
+        parts.append(f"Current date: {date.today().isoformat()}")
         if permissions.mode is Mode.PLAN:
             parts.append(_PLAN_MODE_CONTEXT)
         elif permissions.mode is Mode.DISCUSS:

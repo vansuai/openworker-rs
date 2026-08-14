@@ -100,8 +100,10 @@ pub fn args_preview(arguments: Option<&serde_json::Value>, limit: usize) -> Stri
                 v.to_string()
             };
             let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-            let truncated = if collapsed.len() > 80 {
-                format!("{}…", &collapsed[..79])
+            // Char-based truncation: tool args carry CJK content, and a byte slice
+            // mid-sequence panics (same class as the `preview()` crash).
+            let truncated = if collapsed.chars().count() > 80 {
+                format!("{}…", crate::truncate_chars(&collapsed, 79))
             } else {
                 collapsed
             };
@@ -109,8 +111,8 @@ pub fn args_preview(arguments: Option<&serde_json::Value>, limit: usize) -> Stri
         }
     }
     let out = parts.join(" · ");
-    if out.len() > limit {
-        format!("{}…", &out[..limit - 1])
+    if out.chars().count() > limit {
+        format!("{}…", crate::truncate_chars(&out, limit.saturating_sub(1)))
     } else {
         out
     }
@@ -423,9 +425,9 @@ impl InboxStore {
             item.state = STATE_RESOLVED.to_string();
             item.resolution = Some(resolution.to_string());
             item.resolved_at = Some(now_iso());
-            self.save_to_disk();
             self.waiter_for(item_id)
-        };
+        }; // lock released here; save_to_disk acquires it again safely
+        self.save_to_disk();
         notify.notify_waiters();
         true
     }
@@ -448,13 +450,18 @@ impl InboxStore {
 
     /// Await an item's resolution; returns the resolution string.
     pub async fn wait(&self, item_id: &str) -> String {
-        // Fast-path: already resolved.
-        if let Some(item) = self.get(item_id) {
-            if item.state == STATE_RESOLVED {
-                return item.resolution.unwrap_or_default();
+        // Acquire the notify handle first, then re-check state. tokio::Notify does
+        // not latch (unlike Python's asyncio.Event): a resolve() that fires between
+        // get() and notified().await would otherwise be lost.
+        let notify = self.waiter_for(item_id);
+        {
+            let state = self.state.lock();
+            if let Some(item) = state.get(item_id) {
+                if item.state == STATE_RESOLVED {
+                    return item.resolution.clone().unwrap_or_default();
+                }
             }
         }
-        let notify = self.waiter_for(item_id);
         loop {
             notify.notified().await;
             if let Some(item) = self.get(item_id) {
@@ -615,6 +622,16 @@ mod tests {
     }
 
     #[test]
+    fn args_preview_cjk_does_not_panic() {
+        // Regression (owner-hit 2026-08-08): byte-index slicing into CJK arg
+        // content panicked (79 is not a char boundary of 3-byte sequences).
+        let args = serde_json::json!({"content": "中".repeat(200)});
+        let preview = args_preview(Some(&args), 240);
+        assert!(preview.contains('…'));
+        assert!(preview.chars().count() <= 241); // 240 + the ellipsis
+    }
+
+    #[test]
     fn reconcile_returns_pending_and_recap() {
         let s = store();
         let item = s.add_notification("s", "x", String::new(), "default", VIS_INBOX);
@@ -622,5 +639,63 @@ mod tests {
         let report = s.reconcile_on_resume("s");
         assert_eq!(report["pending"].as_array().map(|a| a.len()), Some(0));
         assert_eq!(report["recap"].as_array().map(|a| a.len()), Some(1));
+    }
+
+    // -- file-backed store regression: resolve must not deadlock when save_to_disk
+    //    acquires self.state.lock() (parking_lot::Mutex is non-reentrant).
+
+    fn file_store() -> InboxStore {
+        let dir = std::env::temp_dir().join("ocw-inbox-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("test-{}.json", std::process::id()));
+        InboxStore::new(Some(&path)).expect("file-backed store")
+    }
+
+    #[test]
+    fn resolve_with_file_backed_store_does_not_deadlock() {
+        let s = file_store();
+        let item = s.add_question(
+            "s",
+            "q?",
+            String::new(),
+            "default",
+            VIS_INBOX,
+            vec!["A".into(), "B".into()],
+            true,
+            false,
+            None,
+        );
+        // Before the fix this would deadlock: resolve() held state.lock()
+        // and save_to_disk() tried to acquire it again.
+        assert!(s.resolve(&item.id, "A"));
+        // Verify the resolution was persisted in-memory.
+        let fetched = s.get(&item.id).expect("still present");
+        assert_eq!(fetched.state, STATE_RESOLVED);
+        assert_eq!(fetched.resolution.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn wait_returns_immediately_when_already_resolved() {
+        // Aligns with Python asyncio.Event latch semantics: resolve before wait
+        // must still succeed (tokio::Notify does not latch without the re-check).
+        let s = store();
+        let item = s.add_question(
+            "s",
+            "city?",
+            String::new(),
+            "default",
+            VIS_INBOX,
+            vec!["北京".into()],
+            true,
+            false,
+            None,
+        );
+        assert!(s.resolve(&item.id, "北京"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = rt.block_on(s.wait(&item.id));
+        assert_eq!(answer, "北京");
     }
 }

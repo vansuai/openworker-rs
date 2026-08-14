@@ -33,6 +33,37 @@ describe("itemsFromMessages _display sidecar", () => {
   });
 });
 
+describe("itemsFromMessages assistant/tool order", () => {
+  it("replays assistant narration before the tools it proposed", () => {
+    const items = itemsFromMessages([
+      {
+        role: "assistant",
+        content: "I will check the forecast.",
+        reasoning: "Need current weather data.",
+        ts: 1752969720,
+        tool_calls: [
+          { id: "t1", function: { name: "web_search", arguments: '{"query":"Shanghai weather"}' } },
+          { id: "t2", function: { name: "web_search", arguments: '{"query":"上海天气"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "t1", content: '{"ok":true}' },
+      { role: "tool", tool_call_id: "t2", content: '{"ok":true}' },
+      { role: "assistant", content: "It will rain today." },
+    ] as any);
+
+    expect(items.map((item) => item.kind)).toEqual(["assistant", "tool", "tool", "assistant"]);
+    expect(items[0]).toEqual({
+      kind: "assistant",
+      text: "I will check the forecast.",
+      reasoning: "Need current weather data.",
+      ts: 1752969720,
+    });
+    expect((items[1] as any).name).toBe("web_search");
+    expect((items[2] as any).name).toBe("web_search");
+    expect((items[3] as any).text).toBe("It will rain today.");
+  });
+});
+
 describe("itemsFromMessages timestamps", () => {
   it("carries the server ts through to user/assistant items; pre-stamp history gets none", () => {
     const items = itemsFromMessages([

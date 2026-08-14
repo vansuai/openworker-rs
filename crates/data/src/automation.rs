@@ -1,6 +1,7 @@
 //! Automation store — Rust reimplementation of `coworker/automation/store.py`.
 
 use crate::error::Error;
+use chrono::TimeZone;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -369,15 +370,42 @@ pub fn normalize_cron_expr(expr: &str) -> String {
     }
 }
 
+/// Resolve a schedule timezone for next-run math. Mirrors Python's `_tz`:
+/// 'local'/empty → the machine's local zone; a valid IANA name → that zone;
+/// anything else falls back to local. Returns None for "use chrono::Local".
+fn resolve_schedule_tz(name: &str) -> Option<chrono_tz::Tz> {
+    if name.is_empty() || name.eq_ignore_ascii_case("local") {
+        return None;
+    }
+    name.parse::<chrono_tz::Tz>().ok()
+}
+
 pub fn compute_next_run(task: &ScheduledTask, after: Option<f64>) -> Option<f64> {
     let now = after.unwrap_or_else(epoch_now);
     let sched = &task.schedule;
+    let named_tz = resolve_schedule_tz(&sched.timezone);
     if sched.kind == "once" {
         let fire_at = sched.fire_at.as_ref()?;
-        let dt = chrono::DateTime::parse_from_rfc3339(fire_at)
-            .ok()?
-            .with_timezone(&chrono::Utc);
-        let ts = dt.timestamp() as f64;
+        // RFC3339 (with an explicit offset) parses as-is; a naive datetime is
+        // interpreted in the schedule's timezone (mirrors Python, which attaches
+        // `_tz(sched.timezone)` to naive fire_at values).
+        let ts = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(fire_at) {
+            dt.timestamp()
+        } else {
+            let naive = chrono::NaiveDateTime::parse_from_str(fire_at, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(fire_at, "%Y-%m-%d %H:%M:%S"))
+                .ok()?;
+            match named_tz {
+                Some(tz) => tz
+                    .from_local_datetime(&naive)
+                    .earliest()
+                    .map(|dt| dt.timestamp())?,
+                None => chrono::Local
+                    .from_local_datetime(&naive)
+                    .earliest()
+                    .map(|dt| dt.timestamp())?,
+            }
+        } as f64;
         return if task.run_count == 0 && ts > now {
             Some(ts)
         } else {
@@ -391,16 +419,22 @@ pub fn compute_next_run(task: &ScheduledTask, after: Option<f64>) -> Option<f64>
         }
         let normalized = normalize_cron_expr(cron_expr);
         if let Ok(schedule) = normalized.parse::<cron::Schedule>() {
-            // `upcoming` yields times strictly after Utc::now(); when `after` is supplied
-            // (e.g. tests / catch-up), walk until we pass that watermark.
-            let after_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(now as i64, 0)
+            // Evaluate the cron wall-clock in the schedule's timezone (not UTC):
+            // '10:00 local' must fire at 10:00 on the machine's clock. Walk from
+            // the `after` watermark when supplied (tests / catch-up).
+            let watermark = chrono::DateTime::<chrono::Utc>::from_timestamp(now as i64, 0)
                 .unwrap_or_else(chrono::Utc::now);
-            for next in schedule.upcoming(chrono::Utc).take(64) {
-                let ts = next.timestamp() as f64;
-                if next > after_dt && ts > now {
-                    return Some(ts);
-                }
-            }
+            let next = match named_tz {
+                Some(tz) => schedule
+                    .after(&watermark.with_timezone(&tz))
+                    .next()
+                    .map(|dt| dt.timestamp() as f64),
+                None => schedule
+                    .after(&watermark.with_timezone(&chrono::Local))
+                    .next()
+                    .map(|dt| dt.timestamp() as f64),
+            };
+            return next;
         }
         // Do not silently fire every 60s — invalid cron means "no next run".
         return None;
@@ -415,6 +449,7 @@ pub fn compute_next_run(task: &ScheduledTask, after: Option<f64>) -> Option<f64>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Timelike};
 
     #[test]
     fn task_store_basic() {
@@ -473,6 +508,79 @@ mod tests {
     fn normalize_cron_prepends_seconds() {
         assert_eq!(normalize_cron_expr("0 9 * * 1"), "0 0 9 * * 1");
         assert_eq!(normalize_cron_expr("0 0 9 * * 1"), "0 0 9 * * 1");
+    }
+
+    // -- schedule timezone handling (parity with Python's _tz + croniter) -----
+
+    #[test]
+    fn cron_local_timezone_fires_at_local_wall_clock() {
+        let task = ScheduledTask {
+            id: "cron-local-tz".into(),
+            schedule: Schedule {
+                kind: "cron".into(),
+                cron: Some("30 10 * * *".into()),
+                fire_at: None,
+                timezone: "local".into(),
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        // Tuesday 2026-08-04 12:00 UTC watermark.
+        let after = 1785854400.0_f64;
+        let next = compute_next_run(&task, Some(after)).expect("next run");
+        let dt = chrono::Local
+            .timestamp_opt(next as i64, 0)
+            .single()
+            .expect("valid local time");
+        assert_eq!(
+            (dt.hour(), dt.minute()),
+            (10, 30),
+            "cron hour must be the machine's local wall clock, not UTC"
+        );
+    }
+
+    #[test]
+    fn cron_iana_timezone_fires_at_named_wall_clock() {
+        let task = ScheduledTask {
+            id: "cron-iana-tz".into(),
+            schedule: Schedule {
+                kind: "cron".into(),
+                cron: Some("0 10 * * *".into()),
+                fire_at: None,
+                timezone: "Asia/Shanghai".into(),
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        // Tuesday 2026-08-04 12:00 UTC watermark.
+        let after = 1785854400.0_f64;
+        let next = compute_next_run(&task, Some(after)).expect("next run");
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(next as i64, 0)
+            .unwrap();
+        // 10:00 Asia/Shanghai == 02:00 UTC (UTC+8, no DST)
+        assert_eq!((dt.hour(), dt.minute()), (2, 0));
+    }
+
+    #[test]
+    fn once_naive_fire_at_uses_schedule_timezone() {
+        let task = ScheduledTask {
+            id: "once-naive".into(),
+            schedule: Schedule {
+                kind: "once".into(),
+                cron: None,
+                fire_at: Some("2099-01-01T10:00:00".into()),
+                timezone: "Asia/Shanghai".into(),
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        let next = compute_next_run(&task, Some(0.0)).expect("next run");
+        let expected = chrono::Utc
+            .with_ymd_and_hms(2099, 1, 1, 2, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp() as f64;
+        assert_eq!(next, expected);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod connector_accounts;
 pub mod connectors;
 pub mod error;
 pub mod events_ws;
+pub mod environment;
 pub mod mcp;
 pub mod mcp_runtime;
 pub mod persona_manifest;

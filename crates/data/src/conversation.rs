@@ -98,8 +98,9 @@ impl ConversationStore {
         self.conv_dir.join(format!("{session_id}.jsonl"))
     }
 
-    /// Read all messages from a session's JSONL file.
-    fn read_jsonl(&self, session_id: &str) -> Vec<serde_json::Value> {
+    /// Read all messages from a session's JSONL file (public so the server layer can fall back
+    /// to disk when its in-memory cache is empty after a restart).
+    pub fn read_jsonl(&self, session_id: &str) -> Vec<serde_json::Value> {
         let path = self.jsonl_path(session_id);
         if !path.exists() {
             return Vec::new();
@@ -122,8 +123,9 @@ impl ConversationStore {
             .collect()
     }
 
-    /// Count lines in a session's JSONL file.
-    fn count_jsonl(&self, session_id: &str) -> usize {
+    /// Count lines in a session's JSONL file (public so the server layer can diff
+    /// engine messages against disk for incremental persistence).
+    pub fn count_jsonl(&self, session_id: &str) -> usize {
         let path = self.jsonl_path(session_id);
         if !path.exists() {
             return 0;
@@ -157,8 +159,9 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Rewrite the JSONL file with the given messages (used on rare truncation).
-    fn rewrite_jsonl(&self, session_id: &str, messages: &[serde_json::Value]) -> Result<(), Error> {
+    /// Rewrite the JSONL file with the given messages (used on rare truncation, or
+    /// when a legacy file is missing the leading system message).
+    pub fn rewrite_jsonl(&self, session_id: &str, messages: &[serde_json::Value]) -> Result<(), Error> {
         let path = self.jsonl_path(session_id);
         let file = fs::File::create(&path)?;
         let mut writer = std::io::BufWriter::new(file);
@@ -193,13 +196,18 @@ impl ConversationStore {
         if !jsonl_path.exists() {
             let messages_json: Option<String> = {
                 let conn = self.conn.lock();
-                conn.query_row(
-                    "SELECT messages FROM sessions WHERE session_id = ?",
-                    [&record.session_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| Error::Sqlite(e.to_string()))?
+                // `messages` is NULL for rows written by the summary upsert below
+                // (it omits the column) — read as Option<String> so NULL doesn't
+                // abort the whole `save` with "Invalid column type Null".
+                let res: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT messages FROM sessions WHERE session_id = ?",
+                        [&record.session_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|e| Error::Sqlite(e.to_string()))?;
+                res.flatten()
             };
             if let Some(json_str) = messages_json {
                 if !json_str.is_empty() {
@@ -464,13 +472,72 @@ impl ConversationStore {
         Ok(n > 0)
     }
 
+    /// The auto-title guard inputs (mirror of Python's `title_state`): whether the user
+    /// renamed the session and whether a generated title already exists. None when the
+    /// session has no row yet.
+    pub fn title_state(&self, session_id: &str) -> Result<Option<(bool, Option<String>)>, Error> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT renamed, auto_title FROM sessions WHERE session_id = ?",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>("renamed")?.unwrap_or(0) != 0,
+                    row.get::<_, Option<String>>("auto_title")?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Per-turn snapshot update (mirror of `manager.py`'s post-turn save): refresh the
+    /// first-line title, message count, and recency. A targeted UPDATE — the whole-row
+    /// replace in `save()` would clobber auto_title/renamed. `title = None` (a manual
+    /// rename is in place) leaves the title column untouched.
+    pub fn update_turn_meta(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+        n_msgs: i64,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock();
+        let n = match title {
+            Some(t) => conn.execute(
+                "UPDATE sessions SET title = ?1, n_msgs = ?2, updated_at = datetime('now') WHERE session_id = ?3",
+                params![t, n_msgs, session_id],
+            )?,
+            None => conn.execute(
+                "UPDATE sessions SET n_msgs = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+                params![n_msgs, session_id],
+            )?,
+        };
+        Ok(n > 0)
+    }
+
+    /// Update the grants JSON blob for a session (called after each turn so
+    /// approved tools survive a restart).
+    pub fn update_grants(
+        &self,
+        session_id: &str,
+        grants: &serde_json::Value,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE sessions SET grants = ?1 WHERE session_id = ?2",
+            params![serde_json::to_string(grants).unwrap_or_default(), session_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Rename a session (sets renamed=1 so auto-titleing skips it).
     pub fn rename(&self, session_id: &str, title: &str) -> Result<bool, Error> {
-        let clean: String = title.split_whitespace().collect();
+        // Collapse whitespace but keep single spaces — mirror of Python's `" ".join(split())`.
+        let clean: String = title.split_whitespace().collect::<Vec<_>>().join(" ");
         if clean.is_empty() {
             return Ok(false);
         }
-        let clean = &clean[..clean.len().min(120)];
+        let clean: String = clean.chars().take(120).collect();
         let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE sessions SET title = ?, renamed = 1, updated_at = datetime('now') WHERE session_id = ?",
@@ -481,11 +548,11 @@ impl ConversationStore {
 
     /// Set auto-generated title (never overwrites a manual rename).
     pub fn set_auto_title(&self, session_id: &str, title: &str) -> Result<bool, Error> {
-        let clean: String = title.split_whitespace().collect();
+        let clean: String = title.split_whitespace().collect::<Vec<_>>().join(" ");
         if clean.is_empty() {
             return Ok(false);
         }
-        let clean = &clean[..clean.len().min(60)];
+        let clean: String = clean.chars().take(60).collect();
         let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE sessions SET auto_title = ? WHERE session_id = ? AND renamed = 0",
@@ -603,13 +670,18 @@ fn parse_json_opt<T: for<'de> serde::Deserialize<'de>>(raw: &Option<String>) -> 
 }
 
 /// Extract plain text from an OpenAI message content value.
+///
+/// Skips non-text content parts (image_url, etc.) — only extracts from
+/// parts that have a "text" key with a string value.
 fn extract_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(parts) => parts
             .iter()
-            .filter_map(|p| p.get("text").or(Some(p)))
-            .filter_map(|p| p.as_str())
+            .filter_map(|p| {
+                // Only extract text from text-type parts; skip image_url etc.
+                p.get("text").and_then(|v| v.as_str())
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => content.to_string(),
@@ -651,7 +723,7 @@ mod tests {
 
         store.rename("test-1", "Renamed Session").unwrap();
         let reloaded = store.load("test-1").unwrap().unwrap();
-        assert_eq!(reloaded.title.as_deref(), Some("RenamedSession"));
+        assert_eq!(reloaded.title.as_deref(), Some("Renamed Session"));
 
         store.delete("test-1").unwrap();
         assert!(store.load("test-1").unwrap().is_none());

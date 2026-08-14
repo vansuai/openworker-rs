@@ -17,11 +17,11 @@ pub mod tool_types;
 pub mod types;
 
 pub use engine::{
-    ApprovalOutcome, Approver, DirectoryResult, EngineCallbacks, PermissionRequest, PlanResult,
-    TurnEngine,
+    ApprovalOutcome, Approver, AuditSink, DirectoryRequester, DirectoryResult,
+    PermissionRequest, PlanApprover, PlanResult, QuestionAsker, TurnEngine,
 };
 pub use events::{Event, EventData, EventType};
-pub use permissions::{Decision, Mode, PermissionEngine};
+pub use permissions::{classify_risk, standing_target_candidate, target_arg_for, Decision, Mode, PermissionEngine, RiskClass};
 pub use subagent::{run_explorer, ExplorerReport, EXPLORER_INSTRUCTIONS, EXPLORER_MAX_ITERATIONS};
 pub use tool_registry::ToolRegistry;
 pub use tool_types::{Error as ToolError, ToolArg, ToolFn, ToolResult, ToolSchema, ToolSpec};
