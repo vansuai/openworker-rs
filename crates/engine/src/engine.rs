@@ -9,6 +9,7 @@ use ocw_provider::{AssistantTurn, Error as ProviderError, Provider, StreamEvent}
 use serde_json::{Map, Value};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -108,6 +109,18 @@ fn now_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Monotonic sequence for fallback tool-call ids (see `fallback_tool_call_id`).
+static TOOL_CALL_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique id for a tool call that arrived without one. Some provider parsers
+/// (Bedrock / Anthropic conversion / Vertex) fall back to an empty id; the GUI
+/// dedupes approval events by tool_call_id and the server routes the approval
+/// reply back to the Inbox item by tool_call_id, so an empty id breaks both.
+fn fallback_tool_call_id() -> String {
+    let seq = TOOL_CALL_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("tc_{}_{}", (now_ts() * 1e6) as u64, seq)
 }
 
 /// Python `_handle_ask_user` status: ok iff `answer` is non-empty.
@@ -878,7 +891,15 @@ impl TurnEngine {
         let mut events = Vec::new();
         let mut cleared: Vec<ocw_provider::ToolCall> = Vec::new();
 
-        for tc in tool_calls {
+        for mut tc in tool_calls {
+            // Providers may parse a tool call without an id (Bedrock, the
+            // Anthropic conversion path, Vertex). Everything downstream — the
+            // live permission_required event, the Inbox item key, the GUI's
+            // approval-card dedupe, and the approval reply's tool_call_id
+            // lookup — needs a stable non-empty id, so mint one here.
+            if tc.id.is_empty() {
+                tc.id = fallback_tool_call_id();
+            }
             if *cancel.lock().unwrap() {
                 events.push(self.interrupted_tool(&tc));
                 continue;
@@ -1696,6 +1717,81 @@ mod tests {
             "permission_required must arrive BEFORE tool_finished in the live pump; got order={:?}",
             order
         );
+    }
+
+    /// A tool call parsed without an id (Bedrock / Anthropic conversion /
+    /// Vertex fall back to empty) must still produce a permission_required
+    /// event with a non-empty tool_call_id — the GUI dedupes approval cards
+    /// by it and the server routes the approval reply back to the Inbox item
+    /// by it. `handle_tool_calls` mints a fallback id before authorization.
+    #[tokio::test]
+    async fn empty_tool_call_id_gets_fallback_in_permission_required() {
+        let write_tool = ocw_provider::ToolCall {
+            id: String::new(), // <— the bug: some provider parsers yield an empty id
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+        };
+        let (mut eng, live_rx) = make_engine(vec![write_tool]);
+
+        // Force a permissions engine in Interactive mode (default requires approval).
+        let tmp = std::env::temp_dir().join(format!(
+            "ocw-engine-test-perms-{}.json",
+            std::process::id()
+        ));
+        let perms = Arc::new(tokio::sync::Mutex::new(PermissionEngine::new(tmp)));
+        {
+            let mut g = perms.lock().await;
+            g.set_mode(Mode::Interactive);
+        }
+        eng.permissions = perms;
+        // Default approver already returns Deny — no channel setup needed.
+
+        // The run loop is blocking; poll the live pump from a background task
+        // to capture the PermissionRequired event.
+        let live_rx_arc = StdArc::new(std::sync::Mutex::new(live_rx));
+        let probe_rx = StdArc::clone(&live_rx_arc);
+        let probe = tokio::task::spawn_blocking(move || {
+            let mut seen: Option<Event> = None;
+            for _ in 0..500 {
+                if let Ok(ev) = probe_rx.lock().unwrap().try_recv() {
+                    if matches!(ev.event_type, EventType::PermissionRequired) {
+                        seen = Some(ev);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            seen
+        });
+
+        let _events = eng.run_loop().await;
+        let seen = probe
+            .await
+            .unwrap()
+            .expect("permission_required should be live-emitted");
+        match &seen.data {
+            EventData::PermissionRequired { tool_call_id, .. } => {
+                let id = tool_call_id
+                    .as_deref()
+                    .expect("empty provider id must be replaced with a fallback");
+                assert!(
+                    id.starts_with("tc_"),
+                    "fallback id expected, got {id:?}"
+                );
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_tool_call_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(
+                seen.insert(fallback_tool_call_id()),
+                "fallback ids must be unique"
+            );
+        }
     }
 
     #[test]

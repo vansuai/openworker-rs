@@ -1871,13 +1871,17 @@ impl AppState {
         agent: &str,
         workspace: Option<&str>,
     ) -> SessionMeta {
+        // Normalize "/" (a polluted legacy workspace value persisted by older sessions) to
+        // None everywhere, so it never lands in a new SessionMeta and the legacy-adoption
+        // branch below sees it as empty.
+        let workspace = workspace.filter(|w| !w.trim().is_empty() && *w != "/");
         {
             let existing = self.sessions.read().unwrap().get(session_id).cloned();
             if let Some(s) = existing {
                 let ws_empty = s
                     .workspace
                     .as_deref()
-                    .map_or(true, |w| w.trim().is_empty());
+                    .map_or(true, |w| w.trim().is_empty() || w == "/");
                 // Defensive: legacy rows persisted with an empty workspace (pre
                 // scratch-provision fix) come back as None after a restart — adopt
                 // the caller's workspace so artifact reads don't fail with
@@ -3456,6 +3460,36 @@ mod tests {
         let state2 = make_state(dir.clone());
         let s2 = state2.get_session("run-legacy-1").await.unwrap();
         assert_eq!(s2.workspace.as_deref(), Some(ws.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `get_or_create_session` must treat "/" (a polluted legacy workspace value the
+    /// GUI can carry for old sessions) as "no workspace" everywhere: it never lands
+    /// in a new SessionMeta, and a legacy row persisted with "/" adopts the caller's
+    /// real workspace (same fix as the empty-workspace legacy branch).
+    #[tokio::test]
+    async fn get_or_create_session_normalizes_slash_workspace() {
+        let dir = temp_data_dir("slash-ws");
+        let state = make_state(dir.clone());
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Fresh create with "/" → treated as no workspace.
+        let meta = state.get_or_create_session("run-slash-1", "cowork", Some("/"));
+        assert_eq!(meta.workspace.as_deref(), None);
+
+        // Legacy row persisted with workspace "/" → adopted with the caller's workspace.
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.get_mut("run-slash-1").unwrap().workspace = Some("/".to_string());
+        }
+        let meta = state.get_or_create_session(
+            "run-slash-1",
+            "cowork",
+            Some(&ws.to_string_lossy()),
+        );
+        assert_eq!(meta.workspace.as_deref(), Some(ws.to_str().unwrap()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

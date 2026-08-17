@@ -484,30 +484,35 @@ fn make_inbox_approver(
                 data,
                 req.tool_call_id.as_deref(),
             );
-            // Mirror to live WS clients — the engine already emits
-            // PERMISSION_REQUIRED too, but we attach item_id so the WS handler
-            // can route the upcoming approval reply back into the inbox. The
-            // wire payload matches the engine's own `permission_required`
-            // shape (`name`, `arguments`, `reason`, `category`, `item_id`) so
-            // the GUI's `case "permission_required":` handler can render it
-            // with the same code path. (Earlier this broadcast used `tool`
-            // and the GUI ignored it as a result — see commit message.)
+            // Attended sessions: do NOT broadcast a second permission_required.
+            // The engine already emits the live card through the event pump; the
+            // parked Inbox item is durable-only — a reconnect, a second device,
+            // or a restart resolves it via the GUI's getInbox poll, which
+            // round-trips item_id back through the approval WS message. Mirrors
+            // Python's app.py approver ("park so the answer can also come from
+            // the Inbox / a reconnect / after a restart"). Broadcasting a second
+            // copy here stacks a duplicate card in the GUI when tool_call_id is
+            // empty (dedupe key) — the double-popup bug.
+            // Unattended sessions: the GUI suppresses live permission_required
+            // events, so broadcast here for the Inbox panel / other clients.
             let args_for_wire = permission_args_to_value(&req);
-            state.broadcast_sync(
-                &session_id,
-                serde_json::json!({
-                    "type": "permission_required",
-                    "data": {
-                        "name": req.tool_name,
-                        "arguments": args_for_wire,
-                        "reason": req.reason,
-                        "category": req.category,
-                        "item_id": item.id,
-                        "tool_call_id": req.tool_call_id,
-                        "standing_target": standing_target,
-                    },
-                }),
-            );
+            if visibility == VIS_INBOX {
+                state.broadcast_sync(
+                    &session_id,
+                    serde_json::json!({
+                        "type": "permission_required",
+                        "data": {
+                            "name": req.tool_name,
+                            "arguments": args_for_wire,
+                            "reason": req.reason,
+                            "category": req.category,
+                            "item_id": item.id,
+                            "tool_call_id": req.tool_call_id,
+                            "standing_target": standing_target,
+                        },
+                    }),
+                );
+            }
             // Suspend until a surface resolves the item.
             let resolution = state.inbox_store.wait(&item.id).await;
             if resolution == "always_task" {
@@ -1821,5 +1826,116 @@ mod tests {
         let d = guard.evaluate("send_message", &json!({"target": "alice"}), Some(&meta));
         assert!(d.allowed, "expected rule hit, got {d:?}");
         assert_eq!(d.rule, "send_message → alice");
+    }
+
+    /// Attended sessions: the engine's live permission_required is the ONLY
+    /// card. The approver parks the Inbox item for durability but must NOT
+    /// broadcast a second copy — a duplicate stacks a second card in the GUI
+    /// when the engine's tool_call_id is empty (dedupe key), the double-popup
+    /// bug this guards against. Mirrors Python's app.py approver.
+    #[tokio::test]
+    async fn attended_approver_broadcasts_nothing() {
+        let dir = temp_dir("attended");
+        let state = make_state(dir.clone());
+        let session_id = "sess-attended".to_string();
+        // Subscribe BEFORE the approver parks: a tokio broadcast sender drops
+        // messages with no receivers, which would false-pass the assertion.
+        let mut rx = state.register_ws_async(&session_id).await;
+        let perms = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
+            dir.join("permissions.json"),
+        )));
+        let approver = make_inbox_approver(
+            state.clone(),
+            session_id.clone(),
+            None,
+            StdArc::clone(&perms),
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), serde_json::Value::String("out.md".into()));
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            arguments: args,
+            reason: "test".to_string(),
+            category: String::new(),
+            tool_call_id: Some("call_1".to_string()),
+        };
+        let handle = tokio::spawn(approver(request));
+
+        let mut item = None;
+        for _ in 0..200 {
+            let pending = state.inbox_store.pending(Some(&session_id));
+            if let Some(i) = pending.into_iter().next() {
+                item = Some(i);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let item = item.expect("approver must park an inbox item");
+        assert_eq!(item.visibility, ocw_data::VIS_INLINE);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            recv.is_err(),
+            "attended approver must not broadcast a second permission_required"
+        );
+
+        // Resolve so the spawned approver completes.
+        state.inbox_store.resolve(&item.id, "once");
+        let outcome = handle.await.expect("approver join").expect("approver result");
+        assert!(matches!(outcome, ApprovalOutcome::Once));
+    }
+
+    /// Unattended sessions have no live card (the GUI suppresses
+    /// permission_required there), so the broadcast stays: it carries the
+    /// item_id that routes the approval reply back to this exact Inbox row.
+    #[tokio::test]
+    async fn unattended_approver_still_broadcasts() {
+        let dir = temp_dir("unattended");
+        let state = make_state(dir.clone());
+        let session_id = "sess-unattended".to_string();
+        state.unattended.set(&session_id, true);
+        let mut rx = state.register_ws_async(&session_id).await;
+        let perms = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
+            dir.join("permissions.json"),
+        )));
+        let approver = make_inbox_approver(
+            state.clone(),
+            session_id.clone(),
+            None,
+            StdArc::clone(&perms),
+        );
+
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            arguments: serde_json::Map::new(),
+            reason: "test".to_string(),
+            category: String::new(),
+            tool_call_id: Some("call_2".to_string()),
+        };
+        let handle = tokio::spawn(approver(request));
+
+        let mut item = None;
+        for _ in 0..200 {
+            let pending = state.inbox_store.pending(Some(&session_id));
+            if let Some(i) = pending.into_iter().next() {
+                item = Some(i);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let item = item.expect("approver must park an inbox item");
+        assert_eq!(item.visibility, ocw_data::VIS_INBOX);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("unattended approver must broadcast")
+            .expect("broadcast channel closed");
+        assert_eq!(msg["type"], "permission_required");
+        assert_eq!(msg["data"]["item_id"].as_str(), Some(item.id.as_str()));
+
+        state.inbox_store.resolve(&item.id, "once");
+        let outcome = handle.await.expect("approver join").expect("approver result");
+        assert!(matches!(outcome, ApprovalOutcome::Once));
     }
 }

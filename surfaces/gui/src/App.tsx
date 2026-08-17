@@ -593,8 +593,12 @@ export function App() {
           if (d.model) setModel(d.model);
           if (d.mode) setMode(d.mode);
           if (d.command_trust?.required) setWorkspaceTrustRequest(d.command_trust);
-          // Cowork: adopt the server-provisioned scratch dir (only when we don't already have one).
-          if (d.workspace) setWorkspace((cur) => cur || d.workspace);
+          // Cowork: adopt the server-provisioned scratch dir (only when we don't already have
+          // one). Ignore "/" — a polluted legacy workspace value that reads as truthy and would
+          // otherwise block adoption forever.
+          if (typeof d.workspace === "string" && d.workspace.trim() && d.workspace !== "/") {
+            setWorkspace((cur) => (!cur || cur === "/") ? d.workspace : cur);
+          }
           break;
         case "turn_start":
           setRunning(true);
@@ -755,6 +759,10 @@ export function App() {
           // interact with (the engine has no receivers). Mark them all `stale` so the UI
           // collapses them; the next session's permission flow renders fresh cards.
           setItems((p) => resolveStalePending(p));
+          // The parked Inbox mirror can outlive the turn (interrupt / approver timeout);
+          // drop the polled copy too, or the answer-in-context card would pop up in the
+          // same Composer slot right after the live card collapses (double-popup guard).
+          dropSessionInbox("approval");
           break;
         case "model_changed":
           // Mid-session switch (server-applied): update the header fact and drop the

@@ -1797,7 +1797,10 @@ export class Session {
   private outbox: object[] = [];
 
   constructor(sessionId: string, workspace: string, agent: string, handlers: Handlers) {
-    const q = `?workspace=${encodeURIComponent(workspace)}&agent=${encodeURIComponent(agent)}`;
+    // Normalize a polluted legacy workspace value ("/", seen on some persisted sessions) to
+    // empty so the server provisions a fresh scratch dir instead of adopting the filesystem root.
+    const ws = workspace === "/" ? "" : workspace;
+    const q = `?workspace=${encodeURIComponent(ws)}&agent=${encodeURIComponent(agent)}`;
     this.ws = openWebSocket(`${wsBase()}/ws/session/${sessionId}${q}`);
     this.ws.onmessage = (e) => handlers.onEvent(JSON.parse(e.data));
     this.ws.onopen = () => {
@@ -1892,6 +1895,20 @@ export class Session {
     this.ws.onopen = null;
     this.ws.onmessage = null;
     this.ws.onclose = null;
-    this.ws.close();
+    // Closing a CONNECTING socket makes WebKit log "Socket is not connected" /
+    // "WebSocket is closed before the connection is established" (noise on every fast
+    // session switch, doubled by StrictMode in dev). Defer the close until the handshake
+    // completes: an OPEN socket closes cleanly with no such error. If the handshake fails
+    // on its own, the socket terminates without our help.
+    if (this.ws.readyState === WebSocket.CONNECTING) {
+      const ws = this.ws;
+      ws.onopen = () => {
+        ws.onopen = null;
+        ws.close();
+      };
+      return;
+    }
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.close();
+    // CLOSING / CLOSED: nothing to do.
   }
 }
