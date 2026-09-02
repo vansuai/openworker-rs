@@ -68,9 +68,11 @@ const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" |
 export function SettingsView({
   initialTab,
   onOpenPersona,
+  onSettingsChanged,
 }: {
   initialTab?: SetTab;
   onOpenPersona?: (id: string) => void;
+  onSettingsChanged?: () => void;
 }) {
   // Personas is flag-gated (hidden for launch) — filter the tab AND coerce a stale
   // deep-link to it (openSettings("personas") callers) so the page never opens on a
@@ -113,7 +115,7 @@ export function SettingsView({
                 title="Models"
                 sub="Providers and the models offered in the composer's picker. Keys are stored only on this computer."
               />
-              <ModelsTab />
+              <ModelsTab onSettingsChanged={onSettingsChanged} />
               {/* Token savings is model-spend behavior, so it lives here (UX-021),
                   not under General. */}
               <div className="mt-6">

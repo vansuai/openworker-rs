@@ -30,7 +30,7 @@ export const KEY_HELP: Record<string, { url: string; label: string }> = {
   deepseek: { url: "https://platform.deepseek.com/api_keys", label: "platform.deepseek.com" },
   mistral: { url: "https://console.mistral.ai/api-keys", label: "console.mistral.ai" },
   qwen: { url: "https://modelstudio.console.alibabacloud.com", label: "alibabacloud.com" },
-  minimax: { url: "https://platform.minimax.io", label: "platform.minimax.io" },
+  minimax: { url: "https://platform.minimax.cn", label: "platform.minimax.cn" },
   xai: { url: "https://console.x.ai", label: "console.x.ai" },
 };
 

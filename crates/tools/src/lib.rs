@@ -86,6 +86,76 @@ fn normalize_todos(raw: &[Value]) -> Vec<TodoItem> {
         .collect()
 }
 
+/// Extract todo entries from model args. Accepts a direct array, the legacy
+/// `items` alias (Python parity), and MiniMax-style wrappers like
+/// `{"todos": {"item": [{...}]}}`.
+fn extract_todo_array(args: &Map<String, Value>) -> Vec<Value> {
+    let normalized =
+        ocw_provider::normalize_tool_input(serde_json::Value::Object(args.clone()));
+    let map = normalized.as_object().unwrap_or(args);
+
+    for key in ["todos", "items"] {
+        if let Some(arr) = coerce_todo_value(map.get(key)) {
+            return arr;
+        }
+    }
+    vec![]
+}
+
+fn coerce_todo_value(value: Option<&Value>) -> Option<Vec<Value>> {
+    let value = value?;
+    if let Some(arr) = value.as_array() {
+        return Some(arr.clone());
+    }
+    if let Some(obj) = value.as_object() {
+        for key in ["item", "items", "todos"] {
+            if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                return Some(arr.clone());
+            }
+        }
+        // Last resort: any single array-valued field in the wrapper object.
+        for val in obj.values() {
+            if let Some(arr) = val.as_array() {
+                return Some(arr.clone());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_todo_array_accepts_direct_array() {
+        let args = json!({"todos": [{"content": "a", "status": "pending"}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(extract_todo_array(&args).len(), 1);
+    }
+
+    #[test]
+    fn extract_todo_array_accepts_item_wrapper() {
+        let args = json!({"todos": {"item": [{"content": "a", "status": "pending"}]}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(extract_todo_array(&args).len(), 1);
+    }
+
+    #[test]
+    fn extract_todo_array_accepts_items_alias() {
+        let args = json!({"items": [{"content": "a", "status": "pending"}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(extract_todo_array(&args).len(), 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -132,6 +202,25 @@ fn resolve_in_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, String> 
 
 fn arg_str<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
+}
+
+/// Resolve write_file path/content, including aliases and salvaged `_raw` payloads.
+fn resolve_write_file_args(args: &Map<String, Value>) -> (Option<String>, Option<String>) {
+    let normalized =
+        ocw_provider::normalize_tool_input(serde_json::Value::Object(args.clone()));
+    let map = normalized.as_object().unwrap_or(args);
+
+    let path = ["path", "file", "filepath", "filename"]
+        .iter()
+        .find_map(|k| arg_str(map, k))
+        .map(str::to_string);
+
+    let content = ["content", "body", "text", "data"]
+        .iter()
+        .find_map(|k| arg_str(map, k))
+        .map(str::to_string);
+
+    (path, content)
 }
 
 fn arg_i64(args: &Map<String, Value>, key: &str) -> Option<i64> {
@@ -268,11 +357,12 @@ fn write_file_schema() -> ToolSchema {
 
 fn make_write_file(workspace: PathBuf) -> ToolFn {
     Arc::new(move |args: Map<String, Value>| -> ToolResult {
-        let path_str = match arg_str(&args, "path") {
+        let (path_opt, content_opt) = resolve_write_file_args(&args);
+        let path_str = match path_opt {
             Some(p) => p,
             None => return ToolResult::ok(json!({"error": "path is required"})),
         };
-        let content = match arg_str(&args, "content") {
+        let content = match content_opt {
             Some(c) => c,
             None => return ToolResult::ok(json!({"error": "content is required"})),
         };
@@ -311,14 +401,15 @@ fn make_write_file(workspace: PathBuf) -> ToolFn {
             }
         }
 
-        match fs::write(&target, content) {
+        let nbytes = content.len();
+        match fs::write(&target, &content) {
             Ok(()) => {
                 let rel = target
                     .strip_prefix(&workspace)
                     .unwrap_or(&target)
                     .display()
                     .to_string();
-                ToolResult::ok(json!({"path": rel, "bytes_written": content.len()}))
+                ToolResult::ok(json!({"path": rel, "bytes_written": nbytes}))
             }
             Err(e) => ToolResult::ok(json!({"error": format!("write failed: {e}")})),
         }
@@ -1067,11 +1158,7 @@ fn todo_write_schema() -> ToolSchema {
 
 fn make_todo_write(todo: Arc<TodoList>) -> ToolFn {
     Arc::new(move |args: Map<String, Value>| -> ToolResult {
-        let raw = args
-            .get("todos")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let raw = extract_todo_array(&args);
         let normalized = normalize_todos(&raw);
         let count = normalized.len();
         let display_items: Vec<Value> = normalized

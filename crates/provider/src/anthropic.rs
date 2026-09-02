@@ -1,6 +1,7 @@
 //! Anthropic Messages API client — native Claude support.
 
 use crate::error::Error;
+use crate::tool_args::{normalize_tool_input, parse_tool_arguments};
 use crate::types::{AssistantTurn, ModelCapabilities, StreamEvent, TokenUsage, ToolCall};
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -115,9 +116,9 @@ fn convert_messages(msgs: &[Value]) -> (Option<String>, Vec<Value>) {
                             .and_then(|f| f.get("arguments"))
                             .map(|a| {
                                 if let Some(s) = a.as_str() {
-                                    serde_json::from_str(s).unwrap_or_else(|_| a.clone())
+                                    parse_tool_arguments(s)
                                 } else {
-                                    a.clone()
+                                    normalize_tool_input(a.clone())
                                 }
                             })
                             .unwrap_or(serde_json::Value::Null);
@@ -257,7 +258,18 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
         let schema = match params {
             Some(p) => {
                 let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("object");
-                serde_json::json!({ "type": t, "properties": p.get("properties").cloned().unwrap_or(serde_json::Value::Object(Default::default())) })
+                let mut schema_obj = serde_json::Map::new();
+                schema_obj.insert("type".to_string(), serde_json::json!(t));
+                schema_obj.insert(
+                    "properties".to_string(),
+                    p.get("properties")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                );
+                if let Some(required) = p.get("required") {
+                    schema_obj.insert("required".to_string(), required.clone());
+                }
+                serde_json::Value::Object(schema_obj)
             }
             None => serde_json::json!({ "type": "object", "properties": {} }),
         };
@@ -315,16 +327,44 @@ pub struct AnthropicClient {
     #[allow(dead_code)]
     default_model: String,
     thinking_budget: usize,
+    base_url: String,
+    vendor: String,
 }
 
 impl AnthropicClient {
     pub fn new(api_key: String, default_model: String, thinking_budget: usize) -> Self {
+        Self::with_base_url(
+            api_key,
+            default_model,
+            thinking_budget,
+            "https://api.anthropic.com".into(),
+            "anthropic".into(),
+        )
+    }
+
+    pub fn with_base_url(
+        api_key: String,
+        default_model: String,
+        thinking_budget: usize,
+        base_url: String,
+        vendor: String,
+    ) -> Self {
         Self {
             http: Client::new(),
             api_key,
             default_model,
             thinking_budget,
+            base_url,
+            vendor,
         }
+    }
+
+    fn messages_endpoint(&self) -> String {
+        format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
+    }
+
+    fn is_native_anthropic(&self) -> bool {
+        self.vendor == "anthropic"
     }
 
     fn build_request(
@@ -340,11 +380,21 @@ impl AnthropicClient {
         body.insert("messages".to_string(), serde_json::json!(msgs));
 
         if let Some(s) = system {
-            // System as cached text
-            body.insert("system".to_string(), serde_json::json!({
-                "role": "system",
-                "content": [{ "type": "text", "text": s, "cache_control": { "type": "ephemeral" } }]
-            }));
+            if self.is_native_anthropic() {
+                // Anthropic prompt caching — array of blocks with cache_control.
+                body.insert(
+                    "system".to_string(),
+                    serde_json::json!([{
+                        "type": "text",
+                        "text": s,
+                        "cache_control": { "type": "ephemeral" }
+                    }]),
+                );
+            } else {
+                // MiniMax and other Anthropic-compatible vendors expect a plain string
+                // (see platform.minimax.cn Anthropic SDK docs) — NOT {role, content}.
+                body.insert("system".to_string(), serde_json::json!(s));
+            }
         }
 
         if let Some(tools) = tools {
@@ -352,26 +402,29 @@ impl AnthropicClient {
             body.insert("tools".to_string(), serde_json::json!(converted));
         }
 
-        // Cache last message block
-        if let Some(msgs_arr) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-            if let Some(last_msg) = msgs_arr.last_mut() {
-                if let Some(content) = last_msg.get_mut("content").and_then(|v| v.as_array_mut()) {
-                    if let Some(last_block) = content.last_mut() {
-                        // Build a new block with cache_control merged
-                        let mut merged = last_block.clone();
-                        if let Some(obj) = merged.as_object_mut() {
-                            obj.insert(
-                                "cache_control".to_string(),
-                                serde_json::json!({ "type": "ephemeral" }),
-                            );
-                        } else {
-                            merged = serde_json::json!({
-                                "type": "text",
-                                "text": "",
-                                "cache_control": { "type": "ephemeral" }
-                            });
+        // Prompt-cache breakpoint on the last message block — Anthropic-only.
+        if self.is_native_anthropic() {
+            if let Some(msgs_arr) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                if let Some(last_msg) = msgs_arr.last_mut() {
+                    if let Some(content) =
+                        last_msg.get_mut("content").and_then(|v| v.as_array_mut())
+                    {
+                        if let Some(last_block) = content.last_mut() {
+                            let mut merged = last_block.clone();
+                            if let Some(obj) = merged.as_object_mut() {
+                                obj.insert(
+                                    "cache_control".to_string(),
+                                    serde_json::json!({ "type": "ephemeral" }),
+                                );
+                            } else {
+                                merged = serde_json::json!({
+                                    "type": "text",
+                                    "text": "",
+                                    "cache_control": { "type": "ephemeral" }
+                                });
+                            }
+                            *last_block = merged;
                         }
-                        *last_block = merged;
                     }
                 }
             }
@@ -429,7 +482,7 @@ impl AnthropicClient {
 
         let mut req = self
             .http
-            .post("https://api.anthropic.com/v1/messages")
+            .post(self.messages_endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
@@ -477,6 +530,7 @@ impl AnthropicClient {
                     let input = block
                         .get("input")
                         .cloned()
+                        .map(normalize_tool_input)
                         .unwrap_or(serde_json::Value::Null);
                     tool_calls.push(ToolCall {
                         id,
@@ -561,7 +615,7 @@ impl AnthropicClient {
 
         let mut req = self
             .http
-            .post("https://api.anthropic.com/v1/messages")
+            .post(self.messages_endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
@@ -769,14 +823,10 @@ impl Iterator for AnthropicStreamIter {
                     let tcs = self
                         .tool_accum
                         .drain()
-                        .map(|(_, (id, name, args))| {
-                            let parsed: Value =
-                                serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
-                            ToolCall {
-                                id,
-                                name,
-                                arguments: parsed,
-                            }
+                        .map(|(_, (id, name, args))| ToolCall {
+                            id,
+                            name,
+                            arguments: parse_tool_arguments(&args),
                         })
                         .collect();
                     return Some(StreamEvent::Turn {
@@ -848,6 +898,6 @@ impl crate::router::Provider for AnthropicClient {
     }
 
     fn name(&self) -> &str {
-        "anthropic"
+        &self.vendor
     }
 }

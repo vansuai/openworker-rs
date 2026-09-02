@@ -75,9 +75,13 @@ const EXAMPLE = `{
 // surfaces can't drift. Settings-only extras: per-card "used Nh ago", a "Remove
 // key…" affordance, the global composer-picker card (gallery view), and the
 // per-provider ModelChecklist / read-only model preview (form view).
-export function ModelsTab() {
+export function ModelsTab({ onSettingsChanged }: { onSettingsChanged?: () => void }) {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
-  const refreshSettings = () => getSettings().then(setSettings).catch(() => setSettings(null));
+  const refreshSettings = () =>
+    getSettings()
+      .then(setSettings)
+      .catch(() => setSettings(null))
+      .finally(() => onSettingsChanged?.());
   const ps = useProviderSetup({ onSaved: refreshSettings });
   useEffect(() => {
     refreshSettings();
@@ -138,7 +142,10 @@ export function ModelsTab() {
             curated={settings.models}
             defaultModel={settings.model}
             labels={settings.model_labels}
-            onChanged={(next) => setSettings((s) => (s ? { ...s, models: next.models, model: next.model } : s))}
+            onChanged={(next) => {
+              setSettings((s) => (s ? { ...s, models: next.models, model: next.model } : s));
+              onSettingsChanged?.();
+            }}
           />
         </div>
       ) : (

@@ -62,13 +62,34 @@ impl ProviderDescriptor {
 // Known providers
 // ---------------------------------------------------------------------------
 
-/// OpenAI base URL (or any OpenAI-compatible server).
-pub fn openai_base_url(profile: &ProviderConfig) -> String {
+/// MiniMax subscription (Token Plan) keys use the Anthropic-compatible API.
+pub fn minimax_uses_anthropic_protocol(api_key: &str) -> bool {
+    api_key.starts_with("sk-cp-")
+}
+
+/// Anthropic-protocol base URL for MiniMax (subscription keys).
+pub fn minimax_anthropic_base_url(profile: &ProviderConfig) -> String {
+    if let Some(url) = profile.get("base_url").and_then(|v| v.as_str()) {
+        let u = url.trim().trim_end_matches('/');
+        if u.contains("/anthropic") {
+            return u.to_string();
+        }
+        if u.contains("minimax.cn") {
+            return "https://api.minimax.cn/anthropic".to_string();
+        }
+    }
+    "https://api.minimax.io/anthropic".to_string()
+}
+
+/// OpenAI-compatible base URL: profile override, then vendor default, then OpenAI.
+pub fn openai_base_url(provider: &str, profile: &ProviderConfig) -> String {
     profile
         .get("base_url")
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
+        .or_else(|| default_base_url_for(provider))
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
 }
 
@@ -90,19 +111,21 @@ pub fn resolve_api_key<'a>(
 }
 
 /// Returns the default base URL for a known OpenAI-compatible provider, or None.
-#[allow(dead_code)]
 pub fn default_base_url_for(name: &str) -> Option<String> {
     match name {
         "deepseek" => Some("https://api.deepseek.com/v1".to_string()),
-        "kimi" => Some("https://api.moonshot.cn/v1".to_string()),
-        "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        "kimi" => Some("https://api.moonshot.ai/v1".to_string()),
+        "minimax" => Some("https://api.minimax.io/v1".to_string()),
+        "qwen" => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string()),
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "together" => Some("https://api.together.xyz/v1".to_string()),
         "fireworks" => Some("https://api.fireworks.ai/inference/v1".to_string()),
         "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
-        "zai" => Some("https://api.zettablock.com/v1".to_string()),
+        "zai" => Some("https://api.z.ai/api/paas/v4".to_string()),
+        "meta" => Some("https://api.meta.ai/v1".to_string()),
         "ollama" => Some("http://localhost:11434/v1".to_string()),
+        "openai" => Some("https://api.openai.com/v1".to_string()),
         _ => None,
     }
 }
@@ -266,7 +289,7 @@ pub fn all_descriptors() -> Vec<ProviderDescriptor> {
             needs_key: true,
             fields: vec![
                 ProviderField { key: "api_key".into(), label: "MiniMax API key".into(), secret: true, placeholder: "…".into(), ..Default::default() },
-                ProviderField { key: "base_url".into(), label: "Custom endpoint".into(), required: false, placeholder: "https://…/openai/v1".into(), ..Default::default() },
+                ProviderField { key: "base_url".into(), label: "Custom endpoint".into(), required: false, placeholder: "https://…/openai/v1".into(), endpoint_help: "Pay-as-you-go (sk-api-…): https://api.minimax.io/v1 (intl) or https://api.minimax.cn/v1 (China). Subscription (sk-cp-…): auto-routes to the Anthropic API — set https://api.minimax.cn/anthropic for China.".into(), ..Default::default() },
             ],
             recommended_model: Some("MiniMax-M2.5".into()),
             env_key: Some("MINIMAX_API_KEY".into()),
@@ -402,5 +425,60 @@ impl Default for ProviderField {
             choices: Vec::new(),
             endpoint_help: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Map;
+
+    #[test]
+    fn minimax_default_base_url_not_openai() {
+        let profile = Map::new();
+        assert_eq!(
+            openai_base_url("minimax", &profile),
+            "https://api.minimax.io/v1"
+        );
+    }
+
+    #[test]
+    fn profile_base_url_overrides_vendor_default() {
+        let mut profile = Map::new();
+        profile.insert(
+            "base_url".into(),
+            Value::String("https://custom.example/v1".into()),
+        );
+        assert_eq!(
+            openai_base_url("minimax", &profile),
+            "https://custom.example/v1"
+        );
+    }
+
+    #[test]
+    fn minimax_subscription_key_uses_anthropic_protocol() {
+        assert!(minimax_uses_anthropic_protocol("sk-cp-abc"));
+        assert!(!minimax_uses_anthropic_protocol("sk-api-abc"));
+    }
+
+    #[test]
+    fn minimax_anthropic_base_url_defaults_international() {
+        assert_eq!(
+            minimax_anthropic_base_url(&Map::new()),
+            "https://api.minimax.io/anthropic"
+        );
+    }
+
+    #[test]
+    fn minimax_anthropic_base_url_china_from_profile_host() {
+        let mut profile = Map::new();
+        profile.insert(
+            "base_url".into(),
+            Value::String("https://api.minimax.cn/v1".into()),
+        );
+        assert_eq!(
+            minimax_anthropic_base_url(&profile),
+            "https://api.minimax.cn/anthropic"
+        );
     }
 }

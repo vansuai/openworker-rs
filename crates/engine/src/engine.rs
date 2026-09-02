@@ -5,7 +5,7 @@ use crate::permissions::{Mode, PermissionEngine};
 use crate::tool_registry::ToolRegistry;
 use crate::tool_types::{Error as ToolError, ToolResult};
 use crate::types::{Message, ToolCall};
-use ocw_provider::{AssistantTurn, Error as ProviderError, Provider, StreamEvent};
+use ocw_provider::{friendly_model_error, AssistantTurn, Error as ProviderError, Provider, StreamEvent};
 use serde_json::{Map, Value};
 use std::future::Future;
 use std::pin::Pin;
@@ -22,6 +22,11 @@ pub enum Error {
     Tool(#[from] ToolError),
     #[error("cannot retry: no error at tail")]
     CannotRetry,
+}
+
+fn provider_error_message(model: &str, e: &ProviderError) -> String {
+    let raw = e.to_string();
+    friendly_model_error(model, &raw).unwrap_or(raw)
 }
 
 /// What an approval callback returns.
@@ -550,10 +555,11 @@ impl TurnEngine {
                             break;
                         }
                         Some(Err(e)) => {
+                            let msg = provider_error_message(&model, &e);
                             push(
                                 &mut events_out,
                                 &live_tx2,
-                                Event::error(e.to_string(), "ProviderError".into()),
+                                Event::error(msg, "ProviderError".into()),
                             );
                             return StreamResult::Err {
                                 error: e,
@@ -649,12 +655,15 @@ impl TurnEngine {
                     }
                     self.push_msg(Message::notice(
                         "error",
-                        Some(e.to_string()),
+                        Some(provider_error_message(&self.model, &e)),
                         now_ts(),
                     ));
                     self.emit(
                         &mut events,
-                        Event::error(e.to_string(), "ProviderError".into()),
+                        Event::error(
+                            provider_error_message(&self.model, &e),
+                            "ProviderError".into(),
+                        ),
                     );
                     break;
                 }

@@ -129,6 +129,9 @@ pub struct TaskRun {
     pub trigger: String, // "schedule" | "manual" | "catchup"
     #[serde(default)]
     pub session_id: String,
+    /// Model used for this run (resolved from task.model or server default).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_status() -> String {
@@ -867,6 +870,11 @@ pub async fn handler_run(
     let session_id = format!("__run__{}", run_id);
     let now = now_epoch();
 
+    let effective_model = task
+        .model
+        .clone()
+        .unwrap_or_else(|| state.default_model_or_configured());
+
     let run = TaskRun {
         run_id: run_id.clone(),
         task_id: task.id.clone(),
@@ -878,6 +886,7 @@ pub async fn handler_run(
         error: None,
         trigger: "manual".to_string(),
         session_id: session_id.clone(),
+        model: Some(effective_model.clone()),
     };
 
     {
@@ -887,7 +896,12 @@ pub async fn handler_run(
 
     // Create the __run__ session so GET /v1/sessions/{id}/messages returns messages
     // (this matches Python server's get_engine() lazily creating sessions at WS connect time).
-    state.get_or_create_session(&session_id, &task.agent, Some(&task.workspace));
+    state.get_or_create_session(
+        &session_id,
+        &task.agent,
+        Some(&task.workspace),
+        Some(&effective_model),
+    );
 
     let prompt = format!(
         "⏰ Running automation '{}' now. Carry out these instructions immediately and produce the result.\n\n{}",
@@ -901,6 +915,7 @@ pub async fn handler_run(
         "session_id": session_id,
         "workspace": task.workspace,
         "agent": task.agent,
+        "model": effective_model,
         "prompt": prompt,
     })))
 }
@@ -1374,6 +1389,7 @@ mod tests {
             error: None,
             trigger: "manual".to_string(),
             session_id: session_id.to_string(),
+            model: None,
         }
     }
 

@@ -27,13 +27,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // When Config::default_model is empty, fall back to "anthropic" so the
     // Router always has a non-empty default (the effective model will be
     // resolved dynamically at session-creation time).
-    let default_provider = config
-        .default_model
-        .split(':')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("anthropic");
-    let provider: Arc<dyn ocw_provider::Provider> = Arc::new(Router::new(default_provider));
+    let default_provider = if !config.default_model.is_empty() {
+        let prefix = config.default_model.split(':').next().unwrap_or("");
+        if ocw_provider::get_descriptor(prefix).is_some() {
+            prefix.to_string()
+        } else {
+            // Bare model ids (e.g. gpt-5.6-sol) route through OpenAI — mirror Python.
+            "openai".to_string()
+        }
+    } else {
+        "anthropic".to_string()
+    };
+    let provider: Arc<dyn ocw_provider::Provider> = Arc::new(Router::new(&default_provider));
     let mut config = config;
     config.host = args.host;
     config.port = args.port;

@@ -355,6 +355,13 @@ fn load_dotenv(path: &Path) -> HashMap<String, String> {
 // SettingsManager
 // ---------------------------------------------------------------------------
 
+/// Result of a non-blocking prefs read for `default_model`.
+enum PrefsDefaultRead {
+    Value(String),
+    /// `try_read()` failed — caller should fall back to the cached effective default.
+    Contended,
+}
+
 #[derive(Clone)]
 pub struct SettingsManager {
     prefs_path: PathBuf,
@@ -362,6 +369,30 @@ pub struct SettingsManager {
     secrets_path: PathBuf,
     dotenv_path: PathBuf,
     secrets: Arc<tokio::sync::RwLock<SecretsStore>>,
+    /// Last resolved default model — used when prefs lock is contended so scheduler
+    /// paths don't silently fall back to the first configured provider (DeepSeek).
+    effective_default_model: Arc<StdRwLock<String>>,
+}
+
+/// Whether a provider has a usable API key (env var or secrets store).
+fn provider_has_configured_key(provider: &str, secrets: &SecretsStore) -> bool {
+    if provider == "ollama" {
+        return true;
+    }
+    let env_ok = ocw_provider::get_descriptor(provider)
+        .and_then(|d| d.env_key.as_ref())
+        .map(|k| std::env::var(k).is_ok())
+        .unwrap_or(false);
+    if env_ok {
+        return true;
+    }
+    secrets
+        .providers
+        .get(&format!("provider:{provider}"))
+        .and_then(|v| v.get("api_key"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 impl SettingsManager {
@@ -376,27 +407,13 @@ impl SettingsManager {
         // so get_settings() will fall back to the first configured provider.
         if !prefs.default_model.is_empty() {
             let provider: &str = prefs.default_model.split(':').next().unwrap_or("");
-            if provider != "ollama" {
-                let env_ok = match provider {
-                    "openai" => std::env::var("OPENAI_API_KEY").is_ok(),
-                    "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
-                    "gemini" => std::env::var("GEMINI_API_KEY").is_ok(),
-                    "deepseek" => std::env::var("DEEPSEEK_API_KEY").is_ok(),
-                    _ => false,
-                };
-                let store_ok = secrets
-                    .providers
-                    .get(&format!("provider:{provider}"))
-                    .and_then(|v| v.get("api_key"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                if !env_ok && !store_ok {
-                    prefs.default_model = String::new();
-                    prefs.save(&prefs_path);
-                }
+            if !provider_has_configured_key(provider, &secrets) {
+                prefs.default_model = String::new();
+                prefs.save(&prefs_path);
             }
         }
+
+        let effective_default_model = Arc::new(StdRwLock::new(prefs.default_model.clone()));
 
         Self {
             prefs_path,
@@ -404,6 +421,7 @@ impl SettingsManager {
             secrets_path,
             dotenv_path,
             secrets: Arc::new(tokio::sync::RwLock::new(secrets)),
+            effective_default_model,
         }
     }
 
@@ -420,10 +438,32 @@ impl SettingsManager {
         self.prefs.read().await.default_model.clone()
     }
 
+    /// Non-blocking read of prefs.default_model for hot paths.
+    fn read_default_model_prefs(&self) -> PrefsDefaultRead {
+        match self.prefs.try_read() {
+            Ok(p) => PrefsDefaultRead::Value(p.default_model.clone()),
+            Err(_) => PrefsDefaultRead::Contended,
+        }
+    }
+
+    pub fn effective_default_model_cached(&self) -> String {
+        self.effective_default_model
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_effective_default_model_cache(&self, model: &str) {
+        if let Ok(mut guard) = self.effective_default_model.write() {
+            *guard = model.to_string();
+        }
+    }
+
     pub async fn set_default_model(&self, model: String) {
         let mut p = self.prefs.write().await;
         p.default_model = model.clone();
         p.save(&self.prefs_path);
+        self.set_effective_default_model_cache(&model);
     }
 
     pub async fn is_onboarded(&self) -> bool {
@@ -1312,7 +1352,7 @@ impl AppState {
 
         let (event_broadcast, _) = broadcast::channel(256);
 
-        Self {
+        let state = Self {
             config,
             provider,
             memory_store: Arc::new(MemoryStore::new()),
@@ -1361,7 +1401,11 @@ impl AppState {
             browser: Arc::new(BrowserController::new()),
             autotitle_attempts: Arc::new(StdRwLock::new(HashMap::new())),
             autotitle_inflight: Arc::new(StdRwLock::new(HashSet::new())),
+        };
+        if state.settings.effective_default_model_cached().is_empty() {
+            let _ = state.default_model_or_configured();
         }
+        state
     }
 
     /// Get or create a per-workspace shell executor and register its tools.
@@ -1559,13 +1603,36 @@ impl AppState {
         )
     }
 
-    /// Returns config.default_model if set, otherwise finds the first
-    /// provider with a configured API key (env var or secret store) and uses
-    /// its recommended model.
+    /// Effective default model — mirrors `get_settings()` priority:
+    /// 1. prefs.default_model (GUI settings)
+    /// 2. config.default_model (config.toml / COWORKER_MODEL)
+    /// 3. first configured provider's recommended model
     pub(crate) fn default_model_or_configured(&self) -> String {
-        if !self.config.default_model.is_empty() {
-            return self.config.default_model.clone();
+        match self.settings.read_default_model_prefs() {
+            PrefsDefaultRead::Value(ref m) if !m.is_empty() => {
+                self.settings.set_effective_default_model_cache(m);
+                return m.clone();
+            }
+            PrefsDefaultRead::Contended => {
+                let cached = self.settings.effective_default_model_cached();
+                if !cached.is_empty() {
+                    return cached;
+                }
+            }
+            PrefsDefaultRead::Value(_) => {}
         }
+        if !self.config.default_model.is_empty() {
+            let m = self.config.default_model.clone();
+            self.settings.set_effective_default_model_cache(&m);
+            return m;
+        }
+        let m = self.first_configured_provider_model();
+        self.settings.set_effective_default_model_cache(&m);
+        m
+    }
+
+    /// First provider with a usable API key and its recommended model id.
+    fn first_configured_provider_model(&self) -> String {
         let secrets = self.settings.secrets_providers();
         ocw_provider::all_descriptors()
             .iter()
@@ -1585,9 +1652,13 @@ impl AppState {
             })
             .and_then(|d| {
                 let rec = d.recommended_model.clone()?;
-                Some(if d.name == "openai" { rec } else { format!("{}:{}", d.name, rec) })
+                Some(if d.name == "openai" {
+                    rec
+                } else {
+                    format!("{}:{}", d.name, rec)
+                })
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| "gpt-5.6-sol".into())
     }
 
     pub async fn create_session(&self, workspace: Option<&str>, agent: &str) -> SessionMeta {
@@ -1865,11 +1936,14 @@ impl AppState {
 
     /// Get an existing session or create a new one with a specific id.
     /// Used by automation `__run__` sessions that need an explicit ID.
+    /// When `model` is set it is used for new sessions (automation runs pin the
+    /// resolved model at creation time); otherwise `default_model_or_configured()`.
     pub fn get_or_create_session(
         &self,
         session_id: &str,
         agent: &str,
         workspace: Option<&str>,
+        model: Option<&str>,
     ) -> SessionMeta {
         // Normalize "/" (a polluted legacy workspace value persisted by older sessions) to
         // None everywhere, so it never lands in a new SessionMeta and the legacy-adoption
@@ -1902,7 +1976,10 @@ impl AppState {
                 return s;
             }
         }
-        let model = self.default_model_or_configured();
+        let model = model
+            .filter(|m| !m.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| self.default_model_or_configured());
         let meta = SessionMeta::new(
             session_id.to_string(),
             workspace.map(String::from),
@@ -2987,6 +3064,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_model_or_configured_prefers_prefs_over_config() {
+        let dir = temp_data_dir("prefs-default-model");
+        let state = make_state_with(
+            dir,
+            Arc::new(ocw_provider::Router::new("anthropic")),
+            "deepseek:deepseek-v4-flash",
+        );
+        state
+            .settings
+            .set_default_model("anthropic:claude-sonnet-4-6".into())
+            .await;
+        assert_eq!(
+            state.default_model_or_configured(),
+            "anthropic:claude-sonnet-4-6"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_minimax_default_when_key_in_secrets() {
+        let dir = temp_data_dir("minimax-default-persist");
+        std::fs::write(
+            dir.join("prefs.json"),
+            r#"{"default_model":"minimax:MiniMax-M2.5"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("secrets.json"),
+            r#"{"provider:minimax":{"api_key":"test-key"}}"#,
+        )
+        .unwrap();
+        let settings = SettingsManager::open_for_tests(dir);
+        assert_eq!(
+            settings.get_default_model().await,
+            "minimax:MiniMax-M2.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_create_session_pins_explicit_model() {
+        let dir = temp_data_dir("session-explicit-model");
+        let state = make_state(dir);
+        state
+            .settings
+            .set_default_model("deepseek:deepseek-v4-flash".into())
+            .await;
+        let meta = state.get_or_create_session(
+            "run-explicit-model",
+            "cowork",
+            None,
+            Some("minimax:MiniMax-M2.5"),
+        );
+        assert_eq!(meta.model, "minimax:MiniMax-M2.5");
+    }
+
+    #[tokio::test]
+    async fn set_default_model_updates_effective_cache() {
+        let dir = temp_data_dir("default-model-cache");
+        let state = make_state(dir);
+        state
+            .settings
+            .set_default_model("minimax:MiniMax-M2.5".into())
+            .await;
+        assert_eq!(
+            state.default_model_or_configured(),
+            "minimax:MiniMax-M2.5"
+        );
+        assert_eq!(
+            state.settings.effective_default_model_cached(),
+            "minimax:MiniMax-M2.5"
+        );
+    }
+
+    #[tokio::test]
     async fn add_root_persists_and_restores_extra_roots() {
         let dir = temp_data_dir("roots");
         let state = make_state(dir.clone());
@@ -3283,7 +3433,7 @@ mod tests {
     async fn get_or_create_session_persists_to_sqlite() {
         let dir = temp_data_dir("get-or-create-persist");
         let state = make_state(dir.clone());
-        let _ = state.get_or_create_session("abc-123", "code", None);
+        let _ = state.get_or_create_session("abc-123", "code", None, None);
 
         // Fresh AppState simulates a restart: session_messages is empty and
         // `self.sessions` is rebuilt from SQLite via conversation_store.list.
@@ -3402,7 +3552,7 @@ mod tests {
         std::fs::write(dir.join("output").join("skip.bin"), "bin").unwrap();
 
         let sid = "artifacts-sub-session".to_string();
-        state.get_or_create_session(&sid, "cowork", Some(&dir.to_string_lossy()));
+        state.get_or_create_session(&sid, "cowork", Some(&dir.to_string_lossy()), None);
 
         let artifacts = state.list_artifacts(&sid);
         let paths: Vec<String> = artifacts
@@ -3442,7 +3592,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
 
         // Legacy row: session exists with an empty workspace (as created pre-fix).
-        let _ = state.get_or_create_session("run-legacy-1", "cowork", None);
+        let _ = state.get_or_create_session("run-legacy-1", "cowork", None, None);
         // Simulate the restart rebuild path where the empty workspace became None.
         {
             let mut sessions = state.sessions.write().unwrap();
@@ -3453,6 +3603,7 @@ mod tests {
             "run-legacy-1",
             "cowork",
             Some(&ws.to_string_lossy()),
+            None,
         );
         assert_eq!(meta.workspace.as_deref(), Some(ws.to_str().unwrap()));
 
@@ -3476,7 +3627,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
 
         // Fresh create with "/" → treated as no workspace.
-        let meta = state.get_or_create_session("run-slash-1", "cowork", Some("/"));
+        let meta = state.get_or_create_session("run-slash-1", "cowork", Some("/"), None);
         assert_eq!(meta.workspace.as_deref(), None);
 
         // Legacy row persisted with workspace "/" → adopted with the caller's workspace.
@@ -3488,6 +3639,7 @@ mod tests {
             "run-slash-1",
             "cowork",
             Some(&ws.to_string_lossy()),
+            None,
         );
         assert_eq!(meta.workspace.as_deref(), Some(ws.to_str().unwrap()));
 

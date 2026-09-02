@@ -47,6 +47,11 @@ async fn run_task(state: &Arc<AppState>, task: ScheduledTask, trigger: &str) {
     // artifacts) land in a real directory (shared with the manual-run path).
     let task = crate::automations::ensure_task_workspace(state, task).await;
 
+    let effective_model = task
+        .model
+        .clone()
+        .unwrap_or_else(|| state.default_model_or_configured());
+
     let run = TaskRun {
         run_id: run_id.clone(),
         task_id: task.id.clone(),
@@ -58,6 +63,7 @@ async fn run_task(state: &Arc<AppState>, task: ScheduledTask, trigger: &str) {
         error: None,
         trigger: trigger.to_string(),
         session_id: session_id.clone(),
+        model: Some(effective_model.clone()),
     };
 
     // Persist run as "running" so frontend can see it immediately
@@ -67,7 +73,12 @@ async fn run_task(state: &Arc<AppState>, task: ScheduledTask, trigger: &str) {
     }
 
     // Create the __run__ session so GET /v1/sessions/{id}/messages works
-    state.get_or_create_session(&session_id, &task.agent, Some(&task.workspace));
+    state.get_or_create_session(
+        &session_id,
+        &task.agent,
+        Some(&task.workspace),
+        Some(&effective_model),
+    );
 
     // Broadcast automation_run_started (matches Python SessionManager._run_scheduled_task)
     let event = json!({
@@ -140,6 +151,10 @@ async fn run_task_inner(
     let permissions = Arc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
         state.config.data_dir.join("permissions.json"),
     )));
+
+    let fresh_system = state
+        .build_system_messages(&task.agent, &task.workspace, &model)
+        .await;
 
     // Seed task standing rules into the permission engine (mirrors Python's
     // `_seed_task_permissions`). Target-bound entries feed task_rules; name-only
@@ -326,7 +341,7 @@ async fn run_task_inner(
         model,
         12,
         serde_json::Map::new(),
-        vec![],
+        fresh_system,
     )
     .with_approver(approver)
     .with_audit_sink(audit_sink)

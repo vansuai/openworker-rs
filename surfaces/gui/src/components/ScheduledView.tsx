@@ -492,6 +492,7 @@ function TaskDetail({
                   <span className="run-new-pill" data-testid="run-new">new</span>
                 )}
                 {fmt(r.started_at)} · <span className={"run-" + r.status}>{r.status}</span> · {r.trigger}
+                {r.model && <span className="dim"> · {r.model.includes(":") ? r.model.split(":").slice(1).join(":") : r.model}</span>}
                 {r.artifacts.length > 0 && <span className="dim"> · {r.artifacts.length} file(s)</span>}
               </span>
               <span className="sched-run-go" aria-hidden>

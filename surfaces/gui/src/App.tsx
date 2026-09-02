@@ -66,6 +66,7 @@ import { ApprovalCard } from "./components/ApprovalCard";
 import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
+import { coerceTodoArray } from "./todoUtils";
 
 const newId = () =>
   (crypto as any).randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14);
@@ -82,9 +83,9 @@ const FILE_WRITE_TOOLS = new Set(["write_file", "apply_patch", "apply_unified_di
 // Models sometimes pass todo items as bare strings instead of {content, status} objects (the
 // backend tool normalizes them the same way; the GUI reads the raw proposal args, so mirror it).
 function normalizeTodos(raw: unknown): TodoItem[] {
-  if (!Array.isArray(raw)) return [];
+  const arr = coerceTodoArray(raw);
   const statuses = new Set(["pending", "in_progress", "done"]);
-  return raw.map((entry: any) => {
+  return arr.map((entry: any) => {
     if (entry && typeof entry === "object") {
       const status = entry.status === "completed" ? "done" : entry.status; // common model alias
       return {
@@ -375,6 +376,7 @@ export function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // A prompt to auto-send once the next session connects (used by "Run now").
   const pendingPromptRef = useRef<string | null>(null);
+  const pendingModelRef = useRef<string | null>(null);
   // The in-flight manual run to finalize after its first turn ({taskId, runId, sessionId}).
   const activeRunRef = useRef<{ taskId: string; runId: string; sessionId: string } | null>(null);
 
@@ -512,6 +514,9 @@ export function App() {
       setModelReady(s.model_ready);
       setModelsLoadError(false);
       if (s.surfaces) setSurfaces(s.surfaces);
+      // Authoritative default from prefs — overrides `/health` which used to
+      // ignore GUI settings and pick the first configured provider (DeepSeek).
+      if (s.model) setModel(s.model);
     } catch {
       setModelsLoadError(true);
     }
@@ -813,8 +818,10 @@ export function App() {
         const p = pendingPromptRef.current;
         if (p) {
           pendingPromptRef.current = null;
+          const runModel = pendingModelRef.current;
+          pendingModelRef.current = null;
           setItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
-          sessionRef.current?.userMessage(p);
+          sessionRef.current?.userMessage(p, undefined, runModel || model);
         }
       },
       onClose: () => setConnected(false),
@@ -1194,6 +1201,7 @@ export function App() {
     const r = await runAutomation(taskId);
     if (!r || !r.ok) return;
     pendingPromptRef.current = r.prompt;
+    if (r.model) pendingModelRef.current = r.model;
     activeRunRef.current = { taskId, runId: r.run_id, sessionId: r.session_id };
     openRunSession(r.session_id, r.workspace, r.agent, { id: taskId, title: title || "" });
   };
@@ -1345,8 +1353,7 @@ export function App() {
         <Onboarding
           onDone={(next) => {
             setOnboarding(false);
-            getHealth().then((h) => setModel(h.model)).catch(() => {});
-            loadSettings(); // pick up a model connected during setup (clears the composer chip)
+            loadSettings(); // pick up default model + connected providers
             if (next === "gallery") {
               // The specialists tip: land on Settings ▸ Personas, where the Gallery link lives.
               openSettings("personas");
@@ -1420,6 +1427,7 @@ export function App() {
           key={settingsTab}
           initialTab={settingsTab}
           onOpenPersona={(id) => openPersona(id, "settings")}
+          onSettingsChanged={loadSettings}
         />
       ) : surface === "audit" ? (
         <AuditView />

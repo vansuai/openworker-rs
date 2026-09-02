@@ -919,7 +919,7 @@ async fn handle_socket(ws: WebSocket, state: AppState, ctx: SessionCtx) {
 
     // Lazily create sessions at WS connect time (matches Python server behavior).
     let session =
-        state.get_or_create_session(&ctx.session_id, &ctx.agent, ctx.workspace.as_deref());
+        state.get_or_create_session(&ctx.session_id, &ctx.agent, ctx.workspace.as_deref(), None);
     send_ws(
         &mut ws,
         "ready",
@@ -1284,6 +1284,13 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
     if run.engine.read().is_none() {
         let model = msg
             .model
+            .filter(|m| !m.is_empty())
+            .or_else(|| {
+                state
+                    .get_session_sync(&session_id)
+                    .map(|s| s.model)
+                    .filter(|m| !m.is_empty())
+            })
             .unwrap_or_else(|| state.default_model_or_configured());
         let provider = StdArc::clone(&state.provider);
         let workspace = state
@@ -1762,6 +1769,7 @@ mod tests {
                 error: None,
                 trigger: "manual".to_string(),
                 session_id: session_id.clone(),
+                model: None,
             });
         }
 

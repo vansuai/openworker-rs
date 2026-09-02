@@ -1416,6 +1416,7 @@ export interface AutomationRun {
   artifacts: string[];
   error: string | null;
   trigger: string;
+  model?: string | null;
 }
 
 export async function getAutomations(): Promise<Automation[]> {
@@ -1511,6 +1512,7 @@ export interface PreparedRun {
   session_id: string;
   workspace: string;
   agent: string;
+  model?: string;
   prompt: string;
 }
 

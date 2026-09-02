@@ -101,48 +101,60 @@ impl Router {
     }
 
     pub fn get_or_build(&self, name: &str, profile: &ProviderConfig) -> Arc<dyn Provider> {
+        let env_key = registry::get_descriptor(name)
+            .and_then(|d| d.env_key.as_ref())
+            .and_then(|k| std::env::var(k).ok());
+        let api_key = registry::resolve_api_key(None, env_key.as_deref(), profile)
+            .unwrap_or("placeholder")
+            .to_string();
+
+        let cache_key = if name == "minimax" && registry::minimax_uses_anthropic_protocol(&api_key) {
+            "minimax:anthropic".to_string()
+        } else {
+            name.to_string()
+        };
+
         {
             let clients = self.clients.lock().unwrap();
-            if let Some(c) = clients.get(name) {
+            if let Some(c) = clients.get(&cache_key) {
                 return Arc::clone(c);
             }
         }
 
-        let client: Arc<dyn Provider> = match name {
-            "openai" | "ollama" | "openrouter" | "deepseek" | "gemini" | "kimi" | "minimax"
-            | "xai" | "mistral" | "together" | "fireworks" | "zai" | "qwen" | "meta" => {
-                let base_url = registry::openai_base_url(profile);
-                let api_key =
-                    registry::resolve_api_key(None, None, profile).unwrap_or("placeholder");
-                Arc::new(OpenAiClient::new(
-                    base_url,
-                    api_key.to_string(),
-                    name.to_string(),
-                ))
-            }
-            "anthropic" => {
-                let api_key = registry::resolve_api_key(None, None, profile)
-                    .unwrap_or("")
-                    .to_string();
-                Arc::new(AnthropicClient::new(
+        let client: Arc<dyn Provider> =
+            if name == "minimax" && registry::minimax_uses_anthropic_protocol(&api_key) {
+                let base = registry::minimax_anthropic_base_url(profile);
+                Arc::new(AnthropicClient::with_base_url(
                     api_key,
-                    "claude-sonnet-4-6".into(),
-                    8192,
+                    "MiniMax-M2.5".into(),
+                    0,
+                    base,
+                    "minimax".into(),
                 ))
-            }
-            "bedrock" => Arc::new(BedrockClient::new(profile)),
-            "vertex" => Arc::new(VertexClient::new(profile)),
-            _ => {
-                let base_url = registry::openai_base_url(profile);
-                let api_key = registry::resolve_api_key(None, None, profile)
-                    .unwrap_or("placeholder")
-                    .to_string();
-                Arc::new(OpenAiClient::new(base_url, api_key, name.to_string()))
-            }
-        };
+            } else {
+                match name {
+                    "openai" | "ollama" | "openrouter" | "deepseek" | "gemini" | "kimi"
+                    | "minimax" | "xai" | "mistral" | "together" | "fireworks" | "zai" | "qwen"
+                    | "meta" => {
+                        let base_url = registry::openai_base_url(name, profile);
+                        Arc::new(OpenAiClient::new(base_url, api_key, name.to_string()))
+                    }
+                    "anthropic" => Arc::new(AnthropicClient::new(
+                        api_key,
+                        "claude-sonnet-4-6".into(),
+                        8192,
+                    )),
+                    "bedrock" => Arc::new(BedrockClient::new(profile)),
+                    "vertex" => Arc::new(VertexClient::new(profile)),
+                    _ => {
+                        let base_url = registry::openai_base_url(name, profile);
+                        Arc::new(OpenAiClient::new(base_url, api_key, name.to_string()))
+                    }
+                }
+            };
 
         let mut clients = self.clients.lock().unwrap();
-        clients.insert(name.to_string(), Arc::clone(&client));
+        clients.insert(cache_key, Arc::clone(&client));
         client
     }
 
@@ -151,6 +163,9 @@ impl Router {
         match name {
             Some(n) => {
                 clients.remove(n);
+                if n == "minimax" {
+                    clients.remove("minimax:anthropic");
+                }
             }
             None => {
                 clients.clear();
