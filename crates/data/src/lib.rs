@@ -25,7 +25,10 @@ pub use inbox_routing::{
     reply_intent, resolve_from_reply, InboxBinding, InboxRouting, DEFAULT_INBOX,
 };
 pub use journal::{JournalStore, GENESIS, JOURNAL_BODY_LIMIT, JOURNAL_KINDS};
-pub use memory::{format_memories, MemoryStore, SQLiteMemoryStore};
+pub use memory::{
+    format_memories, format_memory_index, render_memory_block, MemoryBackend, MemoryStore,
+    SQLiteMemoryStore, INDEX_THRESHOLD_CHARS,
+};
 pub use overrides::RiskOverrideStore;
 pub use team_registry::{Team, TeamRegistry, TeamWorker};
 pub use teams::{

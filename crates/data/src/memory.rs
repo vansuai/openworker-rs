@@ -7,6 +7,49 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Below this rendered size, every memory is injected in full; above it, the block
+/// flips to index mode (newest few in full, one-line summaries for the rest).
+pub const INDEX_THRESHOLD_CHARS: usize = 8_000;
+
+/// In index mode the newest N stay in full.
+const INDEX_FULL_NEWEST: usize = 10;
+
+const INDEX_NOTE: &str = "(Some memories above show only a one-line summary. Call memory_read with the \
+[#id]s before acting on anything a summary hints at.)";
+
+/// Unified memory store interface.
+pub trait MemoryBackend: Send + Sync {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error>;
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error>;
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error>;
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error>;
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error>;
+
+    fn delete_all(&self) -> Result<usize, Error>;
+}
+
 fn memory_item_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
     let scope_str: String = row.get(1)?;
     let scope = Scope::try_from(scope_str).unwrap_or(Scope::Workspace);
@@ -125,6 +168,52 @@ impl MemoryStore {
 impl Default for MemoryStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MemoryBackend for MemoryStore {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error> {
+        Ok(MemoryStore::add(
+            self, content, scope, key, summary, workspace, session_id,
+        ))
+    }
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error> {
+        Ok(MemoryStore::get(self, item_id))
+    }
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error> {
+        Ok(MemoryStore::list(self, scope, workspace, session_id))
+    }
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error> {
+        Ok(MemoryStore::update(self, item_id, content, summary))
+    }
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error> {
+        Ok(MemoryStore::delete(self, item_id))
+    }
+
+    fn delete_all(&self) -> Result<usize, Error> {
+        Ok(MemoryStore::delete_all(self))
     }
 }
 
@@ -291,6 +380,100 @@ impl SQLiteMemoryStore {
     }
 }
 
+impl MemoryBackend for SQLiteMemoryStore {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error> {
+        SQLiteMemoryStore::add(self, content, scope, key, summary, workspace, session_id)
+    }
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error> {
+        SQLiteMemoryStore::get(self, item_id)
+    }
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error> {
+        SQLiteMemoryStore::list(self, scope, workspace, session_id)
+    }
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error> {
+        SQLiteMemoryStore::update(self, item_id, content, summary)
+    }
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error> {
+        SQLiteMemoryStore::delete(self, item_id)
+    }
+
+    fn delete_all(&self) -> Result<usize, Error> {
+        SQLiteMemoryStore::delete_all(self)
+    }
+}
+
+fn index_line(item: &MemoryItem) -> String {
+    let mut text = item.summary.as_deref().unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        text = item
+            .content
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if text.chars().count() > 80 {
+            text = format!("{}...", text.chars().take(77).collect::<String>());
+        }
+    }
+    format!("- [#{}] {text}", item.id)
+}
+
+/// Index rendering: newest `full_newest` in full, one-line summaries for the rest.
+pub fn format_memory_index(items: &[MemoryItem]) -> String {
+    format_memory_index_with(items, INDEX_FULL_NEWEST)
+}
+
+fn format_memory_index_with(items: &[MemoryItem], full_newest: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&MemoryItem> = items.iter().collect();
+    sorted.sort_by_key(|i| i.id);
+    let newest: HashSet<i64> = sorted
+        .iter()
+        .rev()
+        .take(full_newest)
+        .map(|i| i.id)
+        .collect();
+    let lines: Vec<String> = items
+        .iter()
+        .map(|item| {
+            if newest.contains(&item.id) {
+                format!("- [#{id}] {content}", id = item.id, content = item.content)
+            } else {
+                index_line(item)
+            }
+        })
+        .collect();
+    format!(
+        "Known memories (from earlier sessions):\n{}\n{INDEX_NOTE}",
+        lines.join("\n")
+    )
+}
+
 /// Render memories for injection into the system prompt.
 pub fn format_memories(items: &[MemoryItem]) -> String {
     if items.is_empty() {
@@ -304,6 +487,15 @@ pub fn format_memories(items: &[MemoryItem]) -> String {
         "Known memories (from earlier sessions):\n{}",
         lines.join("\n")
     )
+}
+
+/// The injected memories block. Full mode while affordable; index mode when over threshold.
+pub fn render_memory_block(items: &[MemoryItem]) -> String {
+    let full = format_memories(items);
+    if full.len() <= INDEX_THRESHOLD_CHARS {
+        return full;
+    }
+    format_memory_index(items)
 }
 
 #[cfg(test)]
@@ -368,5 +560,41 @@ mod tests {
         let text = super::format_memories(&[a, b]);
         assert!(text.contains("#1] a"));
         assert!(text.contains("#2] b"));
+    }
+
+    #[test]
+    fn render_memory_block_full_mode_under_threshold() {
+        let items = vec![MemoryItem {
+            id: 1,
+            scope: Scope::Global,
+            content: "likes tea".into(),
+            key: None,
+            summary: None,
+            workspace: None,
+            session_id: None,
+            created_at: None,
+        }];
+        let block = render_memory_block(&items);
+        assert!(block.contains("[#1] likes tea"));
+        assert!(!block.contains("memory_read"));
+    }
+
+    #[test]
+    fn render_memory_block_index_mode_over_threshold() {
+        let items: Vec<_> = (1..=40)
+            .map(|id| MemoryItem {
+                id,
+                scope: Scope::Global,
+                content: "x".repeat(300),
+                key: None,
+                summary: Some(format!("sum {id}")),
+                workspace: None,
+                session_id: None,
+                created_at: None,
+            })
+            .collect();
+        let block = render_memory_block(&items);
+        assert!(block.contains("memory_read"));
+        assert!(block.contains("sum 1") || block.contains("[#1]"));
     }
 }
