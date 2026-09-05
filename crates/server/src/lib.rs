@@ -26,4 +26,5 @@ pub mod settings;
 pub mod state;
 pub mod stores;
 pub mod subsystems;
+pub mod teams;
 pub mod ws;

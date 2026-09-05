@@ -139,6 +139,14 @@ fn record_to_dict(record: &RustSessionRecord, py: Python<'_>) -> PyResult<Py<PyD
         "grants",
         serde_json::to_string(&record.grants).unwrap_or_default(),
     )?;
+    d.set_item(
+        "compaction",
+        record
+            .compaction
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_else(|| "{}".into()),
+    )?;
     d.set_item("pinned", record.pinned)?;
     d.set_item("archived", record.archived)?;
     d.set_item("origin", &record.origin)?;

@@ -35,6 +35,7 @@ export type IconName =
   | "archive"
   | "trash"
   | "shield"
+  | "warning"
   | "file"
   | "fileCode"
   | "image"
@@ -115,6 +116,15 @@ export function Icon({
         <svg {...s}>
           <path d="M12 3.2l7 2.8v5.1c0 4.3-2.9 7.4-7 9.7-4.1-2.3-7-5.4-7-9.7V6l7-2.8z" />
           <path d="M9.3 12.1l1.9 1.9 3.5-3.6" />
+        </svg>
+      );
+    case "warning":
+      // Caution triangle: marks bypass-approvals / provenance notices.
+      return (
+        <svg {...s}>
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+          <path d="M12 9v4" />
+          <path d="M12 17h.01" />
         </svg>
       );
     case "file":

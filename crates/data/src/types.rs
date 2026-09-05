@@ -80,6 +80,9 @@ pub struct SessionRecord {
     pub extra_roots: Vec<serde_json::Value>,
     #[serde(default)]
     pub grants: serde_json::Value,
+    /// Auto-compaction state (OPE-27): CompactionState as JSON, absent when never compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<serde_json::Value>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -114,6 +117,7 @@ impl Default for SessionRecord {
             updated_at: None,
             extra_roots: Vec::new(),
             grants: serde_json::json!({}),
+            compaction: None,
             pinned: false,
             archived: false,
             origin: None,

@@ -3,6 +3,7 @@ import type { ApprovalDecision, Item } from "../types";
 import { shortArgs } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
 import { Markdown } from "./Markdown";
+import { BoardWakeCard } from "./BoardWakeCard";
 import { ConnectorMessageCard } from "./ConnectorMessageCard";
 import { Icon } from "./Icon";
 
@@ -402,7 +403,11 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
         const { item } = block;
         switch (item.kind) {
           case "connector":
-            return <ConnectorMessageCard source={item.source} key={bi} />;
+            return item.source.connector === "board" ? (
+              <BoardWakeCard source={item.source} key={bi} />
+            ) : (
+              <ConnectorMessageCard source={item.source} key={bi} />
+            );
           case "user":
             return (
               <div className="group self-end max-w-[78%] flex flex-col items-end" key={bi}>

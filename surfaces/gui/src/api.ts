@@ -131,6 +131,286 @@ export interface MessageSource {
   sender_name: string; // resolved; may equal the id
   ts: number; // epoch seconds
   text: string; // the RAW message (what the card shows)
+  // Board wakes only (connector === "board"): digest rows for BoardWakeCard.
+  board?: { rows: BoardWakeRow[] };
+}
+
+/** One digest event on a board wake (UI-clamped hand-off excerpt in `note`). */
+export interface BoardWakeRow {
+  kind: "assigned" | "claimed" | "moved" | "filed" | "comment" | "chat" | string;
+  item?: number | null;
+  title?: string;
+  actor?: string;
+  to?: string;
+  note?: string;
+}
+
+// -- Agent teams board ---------------------------------------------------------
+// Session-scoped `/v1/sessions/{id}/board*` (sidecar auth) is the GUI product path.
+// Token-authenticated `/v1/board/*` remains for the open BoardView browser.
+
+const BOARD_TOKEN_KEY = "ocw.board.token";
+const BOARD_SPACE_KEY = "ocw.board.space";
+
+export function getStoredBoardToken(): string {
+  try {
+    return localStorage.getItem(BOARD_TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredBoardToken(token: string): void {
+  try {
+    if (token) localStorage.setItem(BOARD_TOKEN_KEY, token);
+    else localStorage.removeItem(BOARD_TOKEN_KEY);
+  } catch {
+    /* best effort */
+  }
+}
+
+export function getStoredBoardSpace(): string {
+  try {
+    return localStorage.getItem(BOARD_SPACE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredBoardSpace(space: string): void {
+  try {
+    if (space) localStorage.setItem(BOARD_SPACE_KEY, space);
+    else localStorage.removeItem(BOARD_SPACE_KEY);
+  } catch {
+    /* best effort */
+  }
+}
+
+function boardAuthHeaders(token?: string): HeadersInit {
+  const t = (token ?? getStoredBoardToken()).trim();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (t) headers.Authorization = `Bearer ${t}`;
+  return headers;
+}
+
+export interface BoardItem {
+  id: number;
+  title: string;
+  description: string;
+  criteria: string;
+  state: "open" | "in_progress" | "blocked" | "review" | "done" | "canceled" | string;
+  assignee: string;
+  creator: string;
+  refs: string[];
+  links: { kind: string; item: number }[];
+  blocker?: string;
+  space?: string;
+  comments?: unknown[];
+}
+
+export interface Board {
+  space: string | null;
+  name: string;
+  items: BoardItem[];
+}
+
+export interface BoardTimelineEvent {
+  seq: number;
+  ts: string;
+  actor: string;
+  kind: "created" | "assigned" | "claimed" | "moved" | "comment" | string;
+  to?: string;
+  assignee?: string;
+  body?: string;
+  refs?: string[];
+}
+
+export type BoardItemDetail = BoardItem & { timeline?: BoardTimelineEvent[] };
+
+export async function boardWhoami(
+  token?: string,
+): Promise<{ actor: string; role: string } | { error: string }> {
+  const res = await fetch(`${httpBase()}/v1/board/whoami`, {
+    headers: boardAuthHeaders(token),
+  });
+  return res.json();
+}
+
+export async function listBoardItems(
+  space: string,
+  opts: { state?: string; assignee?: string; token?: string } = {},
+): Promise<{ items: BoardItem[] } | { error: string }> {
+  const q = new URLSearchParams({ space });
+  if (opts.state) q.set("state", opts.state);
+  if (opts.assignee) q.set("assignee", opts.assignee);
+  const res = await fetch(`${httpBase()}/v1/board/items?${q.toString()}`, {
+    headers: boardAuthHeaders(opts.token),
+  });
+  return res.json();
+}
+
+/** Load a Board via token API (BoardView / open board surface). */
+export async function getTokenBoard(space: string, token?: string): Promise<Board> {
+  const res = await listBoardItems(space, { token });
+  if ("error" in res && res.error) {
+    return { space, name: space, items: [] };
+  }
+  return { space, name: space, items: (res as { items: BoardItem[] }).items ?? [] };
+}
+
+/** Session-scoped board (RightRail / overlay) — sidecar auth, no board token. */
+export async function getBoard(sessionId: string): Promise<Board> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/board`,
+  );
+  return res.json();
+}
+
+export async function getTokenBoardItem(
+  space: string,
+  id: number,
+  token?: string,
+): Promise<BoardItemDetail | { error: string }> {
+  const q = new URLSearchParams({ space, id: String(id) });
+  const res = await fetch(`${httpBase()}/v1/board/item?${q.toString()}`, {
+    headers: boardAuthHeaders(token),
+  });
+  const body = await res.json();
+  if (body?.error) return body;
+  const item = body as BoardItemDetail;
+  if (!item.timeline) item.timeline = [];
+  return item;
+}
+
+export async function getBoardItem(
+  sessionId: string,
+  id: number,
+): Promise<BoardItemDetail | { error: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/board/item?id=${id}`,
+  );
+  return res.json();
+}
+
+export async function createBoardItem(
+  body: {
+    space: string;
+    title: string;
+    criteria?: string;
+    description?: string;
+    parent?: number | null;
+    case?: string | null;
+  },
+  token?: string,
+): Promise<BoardItem | { error: string }> {
+  const res = await fetch(`${httpBase()}/v1/board/items`, {
+    method: "POST",
+    headers: boardAuthHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+/** Attachment via token board API. */
+export async function fetchTokenBoardAttachment(
+  space: string,
+  stored: string,
+  token?: string,
+): Promise<string | null> {
+  const q = new URLSearchParams({ space, name: stored });
+  const res = await fetch(`${httpBase()}/v1/board/attachment?${q.toString()}`, {
+    headers: boardAuthHeaders(token),
+  });
+  if (!res.ok) return null;
+  return URL.createObjectURL(await res.blob());
+}
+
+export async function fetchBoardAttachment(
+  sessionId: string,
+  stored: string,
+): Promise<string | null> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/board/attachment?name=${encodeURIComponent(stored)}`,
+  );
+  if (!res.ok) return null;
+  return URL.createObjectURL(await res.blob());
+}
+
+export async function boardComment(
+  sessionId: string,
+  item: number,
+  body: string,
+): Promise<{ ok?: boolean; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/board/comment`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item, body }),
+    },
+  );
+  return res.json();
+}
+
+export async function boardTransition(
+  sessionId: string,
+  item: number,
+  to: string,
+  comment = "",
+): Promise<BoardItem | { error: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/board/transition`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item, to, comment }),
+    },
+  );
+  return res.json();
+}
+
+export interface ChatMessage {
+  seq: number;
+  ts: string;
+  author: string;
+  author_role: "user" | "lead" | "worker" | string;
+  text: string;
+  mentions: string[];
+}
+
+export interface TeamChat {
+  enabled: boolean;
+  team_id?: string;
+  members: { name: string; persona: string; role: string }[];
+  messages: ChatMessage[];
+}
+
+export async function getTeamChat(teamId: string): Promise<TeamChat> {
+  const res = await fetch(`${httpBase()}/v1/teams/${encodeURIComponent(teamId)}/chat`);
+  return res.json();
+}
+
+export async function postTeamChat(
+  teamId: string,
+  text: string,
+): Promise<ChatMessage | { error: string }> {
+  const res = await fetch(`${httpBase()}/v1/teams/${encodeURIComponent(teamId)}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  return res.json();
+}
+
+export interface JournalCase {
+  case: string;
+  entries: number;
+  last_ts: string;
+}
+
+export async function getJournalCases(): Promise<JournalCase[]> {
+  const res = await fetch(`${httpBase()}/v1/teams/journal`);
+  return (await res.json()).cases ?? [];
 }
 
 // A transcript message from GET /v1/sessions/{id}/messages. Kept permissive (open shape) because
@@ -282,6 +562,10 @@ export interface McpServer {
   // "needs_auth" (no tokens yet) | "authorizing" (browser sign-in in flight)
   status: string;
   auth?: "oauth" | null;
+  // http server whose anonymous connect hit a 401/403 — offer OAuth sign-in.
+  auth_hint?: boolean;
+  // Epoch seconds of the last successful explicit Test (persisted server-side).
+  last_test_at?: number | null;
   last_error?: string | null;
   tool_count: number | null;
   config: Record<string, any>;
@@ -319,6 +603,40 @@ export async function getMcpTools(
   name: string,
 ): Promise<{ ok: boolean; error?: string; tools: { name: string; description: string }[] }> {
   const res = await fetch(`${httpBase()}/v1/mcp/${encodeURIComponent(name)}/tools`);
+  return res.json();
+}
+
+// OPE-136 §4/§5: the server's standing trust — which tools carry a durable "don't ask"
+// rule, plus whether the legacy server-wide requires_approval:false is still present.
+export async function getMcpTrust(
+  name: string,
+): Promise<{ ok: boolean; tools: string[]; legacy_dont_ask: boolean }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/${encodeURIComponent(name)}/trust`);
+  return res.json();
+}
+
+export async function revokeMcpTrust(name: string, tool: string) {
+  const res = await fetch(
+    `${httpBase()}/v1/mcp/${encodeURIComponent(name)}/trust/${encodeURIComponent(tool)}`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}
+
+/** Migrate the legacy server-wide don't-ask flag to named per-tool trust rules. */
+export async function convertMcpTrust(
+  name: string,
+): Promise<{ ok: boolean; error?: string; trusted?: string[] }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/${encodeURIComponent(name)}/trust/convert`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
+/** Reveal the global mcp.json in the OS file manager — the ONE file every custom
+ * server lives in (the per-server Configuration mirror was removed in its favor). */
+export async function revealMcpConfig(): Promise<{ ok: boolean; error?: string; path?: string }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/config/reveal`, { method: "POST" });
   return res.json();
 }
 
@@ -1075,11 +1393,19 @@ export interface InboxItem {
   resolved_at: string | null;
   visibility?: "inline" | "inbox";
   // Question metadata (ask_user): quick-reply choices + a free-text escape.
-  options?: string[];
+  options?: import("./types").QuestionOption[];
   allow_text?: boolean;
   multi?: boolean;
   /** Short chip label from ask_user `header` (e.g. "城市"). */
   header?: string;
+  /** Grouped ask_user form (stepper); resolution is a JSON object string. */
+  questions?: {
+    header?: string;
+    question: string;
+    options?: import("./types").QuestionOption[];
+    allow_text?: boolean;
+    multi?: boolean;
+  }[];
   // Kind-specific payload (directory: {path, writable}; …).
   data?: Record<string, any>;
   // Originating-session context (server-joined) so the Inbox is self-contained.

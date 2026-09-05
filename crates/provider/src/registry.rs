@@ -110,6 +110,38 @@ pub fn resolve_api_key<'a>(
         })
 }
 
+/// Resolve a Codex / ChatGPT-subscription bearer from the provider profile.
+///
+/// Prefers `tokens.access_token` (OAuth store), then `oauth.access_token`, then
+/// top-level `access_token`, then `api_key`.
+pub fn resolve_codex_token(profile: &ProviderConfig) -> Option<String> {
+    profile
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            profile
+                .get("oauth")
+                .and_then(|t| t.get("access_token"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            profile
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            profile
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
 /// Returns the default base URL for a known OpenAI-compatible provider, or None.
 pub fn default_base_url_for(name: &str) -> Option<String> {
     match name {
@@ -126,6 +158,7 @@ pub fn default_base_url_for(name: &str) -> Option<String> {
         "meta" => Some("https://api.meta.ai/v1".to_string()),
         "ollama" => Some("http://localhost:11434/v1".to_string()),
         "openai" => Some("https://api.openai.com/v1".to_string()),
+        "openai-codex" => Some("https://chatgpt.com/backend-api/codex".to_string()),
         _ => None,
     }
 }
@@ -212,6 +245,15 @@ pub fn all_descriptors() -> Vec<ProviderDescriptor> {
             recommended_model: Some("gpt-5.6-sol".into()),
             env_key: Some("OPENAI_API_KEY".into()),
             blurb: "OpenAI's official API".into(),
+        },
+        ProviderDescriptor {
+            name: "openai-codex".into(),
+            title: "ChatGPT subscription".into(),
+            needs_key: false,
+            fields: vec![],
+            recommended_model: Some("gpt-5.6-sol".into()),
+            env_key: None,
+            blurb: "Sign in with your ChatGPT plan and run OpenAI models through your subscription — no API key. Tokens stay on this machine.".into(),
         },
         ProviderDescriptor {
             name: "anthropic".into(),

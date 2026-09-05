@@ -469,6 +469,10 @@ impl AnthropicClient {
     }
 
     /// Perform one blocking completion.
+    ///
+    /// Internally uses the streaming Messages API and accumulates to a final
+    /// `AssistantTurn` — Anthropic refuses non-streaming requests whose
+    /// `max_tokens` could exceed ~10 minutes (mirrors Python OPE fix).
     pub fn complete(
         &self,
         model: &str,
@@ -478,6 +482,8 @@ impl AnthropicClient {
     ) -> Result<AssistantTurn, Error> {
         let tools_ref = tools.as_deref();
         let body = self.build_request(model, &messages, tools_ref, &settings);
+        let mut obj = body.as_object().cloned().unwrap_or_default();
+        obj.insert("stream".to_string(), serde_json::json!(true));
         let beta = needs_refusal_fallback(model);
 
         let mut req = self
@@ -490,111 +496,26 @@ impl AnthropicClient {
             req = req.header("anthropic-beta", FALLBACK_BETA);
         }
 
-        let resp = req.json(&body).send()?;
+        let resp = req.json(&Value::Object(obj)).send()?;
         let status = resp.status().as_u16();
-        let text = resp.text()?;
         if status != 200 {
-            return Err(Error::from_response(status, &text, "anthropic"));
+            let body = resp.text()?;
+            return Err(Error::from_response(status, &body, "anthropic"));
         }
 
-        let json: Value = serde_json::from_str(&text)?;
-
-        let mut text_parts: Vec<String> = Vec::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut thinking_blocks: Vec<Value> = Vec::new();
-
-        for block in json
-            .get("content")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match kind {
-                "text" => {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        text_parts.push(t.to_string());
-                    }
-                }
-                "tool_use" => {
-                    let id = block
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = block
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let input = block
-                        .get("input")
-                        .cloned()
-                        .map(normalize_tool_input)
-                        .unwrap_or(serde_json::Value::Null);
-                    tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: input,
-                    });
-                }
-                "thinking" => {
-                    thinking_blocks.push(serde_json::json!({
-                        "type": "thinking",
-                        "thinking": block.get("thinking").and_then(|v| v.as_str()).unwrap_or(""),
-                        "signature": block.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
-                    }));
-                }
-                "redacted_thinking" => {
-                    thinking_blocks.push(serde_json::json!({
-                        "type": "redacted_thinking",
-                        "data": block.get("data").and_then(|v| v.as_str()).unwrap_or(""),
-                    }));
-                }
-                _ => {}
+        let body = resp.text()?;
+        let mut iter = AnthropicStreamIter::new(&body);
+        let mut final_turn: Option<AssistantTurn> = None;
+        while let Some(ev) = iter.next() {
+            if let StreamEvent::Turn { turn } = ev {
+                final_turn = Some(turn);
             }
         }
-
-        let stop_reason = json
-            .get("stop_reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stop");
-        let usage = json.get("usage").map(|u| TokenUsage {
-            input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            cache_read: u
-                .get("cache_read_input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize,
-            cache_write: u
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize,
-        });
-
-        let reasoning = {
-            let parts: Vec<&str> = thinking_blocks
-                .iter()
-                .filter(|b| b.get("type") == Some(&serde_json::json!("thinking")))
-                .filter_map(|b| b.get("thinking").and_then(|v| v.as_str()))
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join(""))
-            }
-        };
-
-        Ok(AssistantTurn {
-            text: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join(""))
-            },
-            tool_calls,
-            finish_reason: Some(stop_reason_map(stop_reason).to_string()),
-            reasoning,
-            usage,
+        final_turn.ok_or_else(|| {
+            Error::Other(
+                "anthropic stream completed without a final turn (empty or truncated SSE)"
+                    .to_string(),
+            )
         })
     }
 

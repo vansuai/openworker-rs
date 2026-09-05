@@ -376,8 +376,8 @@ impl SkillStore {
         }
 
         let root = roots.into_iter().next().unwrap();
-        let token = uuid::Uuid::new_v4().to_string();
-        let staged = self.staging_dir.join(&token);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let staged = self.staged_path(&token)?;
         std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
 
         for name in &names {
@@ -443,8 +443,8 @@ impl SkillStore {
         }
         let text = std::str::from_utf8(data)
             .map_err(|_| "Not a valid skill file — upload a .zip or a .md.".to_string())?;
-        let token = uuid::Uuid::new_v4().to_string();
-        let staged = self.staging_dir.join(&token);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let staged = self.staged_path(&token)?;
         std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
         let md_path = staged.join("SKILL.md");
         std::fs::write(&md_path, text).map_err(|e| e.to_string())?;
@@ -474,7 +474,7 @@ impl SkillStore {
         scope: &str,
         workspace: Option<&Path>,
     ) -> Result<SkillCreated, String> {
-        let staged = self.staging_dir.join(token);
+        let staged = self.staged_path(token)?;
         if !staged.join("SKILL.md").is_file() {
             return Err("Unknown or expired upload.".to_string());
         }
@@ -512,9 +512,42 @@ impl SkillStore {
     }
 
     pub fn discard_upload(&self, token: &str) {
-        let staged = self.staging_dir.join(token);
-        let _ = std::fs::remove_dir_all(staged);
+        if let Ok(staged) = self.staged_path(token) {
+            let _ = std::fs::remove_dir_all(staged);
+        }
     }
+
+    /// Confine staged upload tokens under `staging_dir` (mirrors session-id chokepoint).
+    fn staged_path(&self, token: &str) -> Result<PathBuf, String> {
+        if !is_safe_upload_token(token) {
+            return Err("Unknown or expired upload.".to_string());
+        }
+        let staged = self.staging_dir.join(token);
+        let staging_canon = self
+            .staging_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.staging_dir.clone());
+        // Parent of the staged dir is staging_dir (even before create).
+        let parent = staged
+            .parent()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+            .unwrap_or_else(|| staging_canon.clone());
+        if parent != staging_canon && !parent.starts_with(&staging_canon) {
+            return Err("Unknown or expired upload.".to_string());
+        }
+        Ok(staged)
+    }
+}
+
+fn is_safe_upload_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && !token.contains("..")
+        && !token.contains('/')
+        && !token.contains('\\')
+        && token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 // ---------------------------------------------------------------------------

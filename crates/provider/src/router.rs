@@ -4,8 +4,10 @@
 
 use crate::anthropic::AnthropicClient;
 use crate::bedrock::BedrockClient;
+use crate::codex;
 use crate::error::Error;
 use crate::openai::OpenAiClient;
+use crate::openai_responses::{is_stock_openai_base, OpenAiResponsesClient};
 use crate::registry::{self, ProviderConfig};
 use crate::types::{AssistantTurn, ModelCapabilities, StreamEvent};
 use crate::vertex::VertexClient;
@@ -104,12 +106,25 @@ impl Router {
         let env_key = registry::get_descriptor(name)
             .and_then(|d| d.env_key.as_ref())
             .and_then(|k| std::env::var(k).ok());
-        let api_key = registry::resolve_api_key(None, env_key.as_deref(), profile)
-            .unwrap_or("placeholder")
-            .to_string();
+        let api_key = if name == "openai-codex" {
+            registry::resolve_codex_token(profile)
+                .unwrap_or_else(|| "placeholder".to_string())
+        } else {
+            registry::resolve_api_key(None, env_key.as_deref(), profile)
+                .unwrap_or("placeholder")
+                .to_string()
+        };
 
         let cache_key = if name == "minimax" && registry::minimax_uses_anthropic_protocol(&api_key) {
             "minimax:anthropic".to_string()
+        } else if name == "openai" {
+            // Stock OpenAI → Responses; custom endpoint → Chat Completions.
+            let base = profile.get("base_url").and_then(|v| v.as_str());
+            if is_stock_openai_base(base) {
+                "openai:responses".to_string()
+            } else {
+                "openai:chat".to_string()
+            }
         } else {
             name.to_string()
         };
@@ -133,9 +148,30 @@ impl Router {
                 ))
             } else {
                 match name {
-                    "openai" | "ollama" | "openrouter" | "deepseek" | "gemini" | "kimi"
-                    | "minimax" | "xai" | "mistral" | "together" | "fireworks" | "zai" | "qwen"
-                    | "meta" => {
+                    "openai" => {
+                        let base = profile.get("base_url").and_then(|v| v.as_str());
+                        if is_stock_openai_base(base) {
+                            let base_url = registry::openai_base_url(name, profile);
+                            Arc::new(OpenAiResponsesClient::new(
+                                base_url,
+                                api_key,
+                                name.to_string(),
+                            ))
+                        } else {
+                            let base_url = registry::openai_base_url(name, profile);
+                            Arc::new(OpenAiClient::new(base_url, api_key, name.to_string()))
+                        }
+                    }
+                    "openai-codex" => {
+                        let base = profile
+                            .get("base_url")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().trim_end_matches('/').to_string())
+                            .filter(|s| !s.is_empty());
+                        Arc::new(codex::new_client(base, api_key, "gpt-5.6-sol".into()))
+                    }
+                    "ollama" | "openrouter" | "deepseek" | "gemini" | "kimi" | "minimax" | "xai"
+                    | "mistral" | "together" | "fireworks" | "zai" | "qwen" | "meta" => {
                         let base_url = registry::openai_base_url(name, profile);
                         Arc::new(OpenAiClient::new(base_url, api_key, name.to_string()))
                     }
@@ -165,6 +201,10 @@ impl Router {
                 clients.remove(n);
                 if n == "minimax" {
                     clients.remove("minimax:anthropic");
+                }
+                if n == "openai" {
+                    clients.remove("openai:responses");
+                    clients.remove("openai:chat");
                 }
             }
             None => {
@@ -214,6 +254,7 @@ impl Provider for Router {
             "anthropic" => crate::anthropic::capabilities_for(&bare),
             "bedrock" => crate::bedrock::capabilities_for(&bare),
             "vertex" => crate::vertex::capabilities_for(&bare),
+            "openai-codex" => crate::openai_responses::capabilities_for(&bare),
             _ => openai::capabilities_for(&bare),
         }
     }

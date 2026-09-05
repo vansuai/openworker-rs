@@ -1,13 +1,26 @@
 //! TurnEngine — the owned agent loop.
 
+use crate::compaction::{
+    apply_to_outbound, build_state_with_summary, estimate_tokens, is_context_overflow,
+    keep_tokens_for_trigger, should_compact, summarizer_messages, trim_state_default,
+    trigger_tokens, CompactionState, DEFAULT_CAP_TOKENS, DEFAULT_THRESHOLD_PCT,
+    SUMMARY_MAX_TOKENS,
+};
 use crate::events::Event;
 use crate::permissions::{Mode, PermissionEngine};
+use crate::provenance::{ApprovalOrigin, SessionFiles};
+use crate::reviewer::{
+    ReviewerDecision, Verdict as ReviewerVerdict, AGENT_DENY_MESSAGE, REVIEWER_PAUSED_TEXT,
+    REVIEWER_TRIP,
+};
 use crate::tool_registry::ToolRegistry;
 use crate::tool_types::{Error as ToolError, ToolResult};
 use crate::types::{Message, ToolCall};
 use ocw_provider::{friendly_model_error, AssistantTurn, Error as ProviderError, Provider, StreamEvent};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -29,12 +42,31 @@ fn provider_error_message(model: &str, e: &ProviderError) -> String {
     friendly_model_error(model, &raw).unwrap_or(raw)
 }
 
+/// Display/aggregation sidecar for assistant messages and `assistant_message` events.
+/// Mirrors Python's `{"model": self.model, **turn.usage.as_dict()}` — snake_case keys
+/// so the GUI can key per-model rollups. Do not serde `TokenUsage` directly (camelCase,
+/// no model field).
+fn usage_sidecar(model: &str, usage: &ocw_provider::TokenUsage) -> Value {
+    serde_json::json!({
+        "model": model,
+        "input": usage.input,
+        "output": usage.output,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+    })
+}
 /// What an approval callback returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Once,
     AlwaysTool,
     AlwaysCommand,
+    AlwaysDomain,
+    ReadonlySession,
+    /// OPE-136 durable per-tool MCP trust.
+    AlwaysTrust,
+    /// OPE-136 run-scoped grant ("Allow for this request").
+    ThisRun,
     Deny,
 }
 
@@ -108,6 +140,28 @@ pub type PlanApprover = Arc<
 /// Audit sink — called for every tool lifecycle event (proposed / started /
 /// finished / interrupted / filtered). Mirrors Python's `audit_sink` callback.
 pub type AuditSink = Arc<dyn Fn(serde_json::Map<String, Value>) + Send + Sync>;
+
+/// Auto-Approve reviewer callback — judges one proposed action.
+/// `(tool_name, arguments, user_messages, provenance_note) -> ReviewerDecision`.
+#[allow(clippy::type_complexity)]
+pub type ReviewerFn = Arc<
+    dyn Fn(
+            String,
+            Value,
+            Vec<String>,
+            String,
+        ) -> Pin<Box<dyn Future<Output = ReviewerDecision> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Pending approval-origin chip for a tool call id (applied when the tool message is recorded).
+#[derive(Debug, Clone)]
+struct ApprovalOriginNote {
+    origin: ApprovalOrigin,
+    note: Option<String>,
+    grant: Option<String>,
+}
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -220,6 +274,24 @@ pub struct TurnEngine {
     /// Called before parking on an Inbox wait (ask_user / etc.) so the pending
     /// tool call survives a crash — mirrors Python's `manager.persist_session`.
     park_hook: Option<Arc<dyn Fn(&[Message]) + Send + Sync>>,
+    /// Auto-compaction state (OPE-27). Persisted by the surface/server.
+    pub compaction_state: Option<CompactionState>,
+    /// Live getter for compaction settings (enabled, context_window, …).
+    compaction_settings: Option<Arc<dyn Fn() -> Map<String, Value> + Send + Sync>>,
+    /// Last observed context-token signal (provider usage or estimate).
+    last_context_tokens: Option<i64>,
+    /// Agent-authored file provenance for this session (OPE-114).
+    pub agent_files: SessionFiles,
+    /// Monotonic step counter for provenance `steps_ago`.
+    agent_step: i64,
+    /// Auto-Approve reviewer (spec Part 8). None ⇒ no live consult.
+    reviewer: Option<ReviewerFn>,
+    /// Consecutive reviewer denials this turn (reset in [`Self::run`]).
+    reviewer_denials: u32,
+    /// Attended-session probe — Auto-Approve is attended-only (§1.5).
+    is_attended: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Per-call approval origin awaiting attach onto the tool message `_display`.
+    approval_origins: HashMap<String, ApprovalOriginNote>,
 }
 
 impl TurnEngine {
@@ -277,6 +349,15 @@ impl TurnEngine {
             audit_context: Map::new(),
             message_mirror: None,
             park_hook: None,
+            compaction_state: None,
+            compaction_settings: None,
+            last_context_tokens: None,
+            agent_files: SessionFiles::new(""),
+            agent_step: 0,
+            reviewer: None,
+            reviewer_denials: 0,
+            is_attended: None,
+            approval_origins: HashMap::new(),
         }
     }
 
@@ -315,6 +396,49 @@ impl TurnEngine {
     /// Python's `manager.persist_session(session_id)` inside the question asker.
     pub fn with_park_hook(mut self, hook: Arc<dyn Fn(&[Message]) + Send + Sync>) -> Self {
         self.park_hook = Some(hook);
+        self
+    }
+
+    /// Restore compaction state from a session record (OPE-27).
+    pub fn with_compaction_state(mut self, state: Option<CompactionState>) -> Self {
+        self.compaction_state = state;
+        self
+    }
+
+    pub fn set_compaction_state(&mut self, state: Option<CompactionState>) {
+        self.compaction_state = state;
+    }
+
+    pub fn compaction_state(&self) -> Option<&CompactionState> {
+        self.compaction_state.as_ref()
+    }
+
+    /// Live compaction settings getter (`enabled`, `context_window`, `threshold_pct`, …).
+    pub fn with_compaction_settings(
+        mut self,
+        f: impl Fn() -> Map<String, Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.compaction_settings = Some(Arc::new(f));
+        self
+    }
+
+    pub fn set_workspace_root(&mut self, root: impl Into<PathBuf>) {
+        self.agent_files.set_workspace(root);
+    }
+
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_files.set_workspace(root);
+        self
+    }
+
+    pub fn with_reviewer(mut self, reviewer: ReviewerFn) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
+    /// Attended probe for Auto-Approve (§1.5). Unset ⇒ not attended ⇒ no live reviewer.
+    pub fn with_is_attended(mut self, f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.is_attended = Some(Arc::new(f));
         self
     }
 
@@ -430,6 +554,8 @@ impl TurnEngine {
 
     /// Push a new user message and run the turn.
     pub async fn run(&mut self, user_input: Value, source: Option<Value>) -> EngineEvents {
+        // §8.4 retry guard resets per user turn.
+        self.reviewer_denials = 0;
         let msg = Message::User {
             content: user_input,
             ts: Some(now_ts()),
@@ -486,6 +612,15 @@ impl TurnEngine {
                 break;
             }
             iterations += 1;
+
+            // Auto-compaction checkpoint (OPE-27): before each provider call.
+            if self.compaction_due() {
+                self.emit(&mut events, Event::compacting());
+                if let Some(notice) = self.compact_now(false).await {
+                    self.push_msg(Message::notice("compacted", Some(notice.clone()), now_ts()));
+                    self.emit(&mut events, Event::compacted(notice));
+                }
+            }
 
             let model = self.model.clone();
             let messages = self.outbound_messages();
@@ -615,7 +750,7 @@ impl TurnEngine {
                         turn.text.clone(),
                         turn.tool_calls.iter().map(|tc| tc.name.clone()).collect(),
                         turn.reasoning.clone(),
-                        turn.usage.as_ref().map(|u| serde_json::json!(u)),
+                        turn.usage.as_ref().map(|u| usage_sidecar(&model, u)),
                     ),
                 );
 
@@ -637,6 +772,21 @@ impl TurnEngine {
                     streamed_text,
                     streamed_reasoning,
                 } => {
+                    // Context overflow → force compact and retry (mirrors Python).
+                    let err_text = e.to_string();
+                    let cancelled = cancel.lock().map(|g| *g).unwrap_or(false);
+                    if is_context_overflow(&err_text) && !cancelled {
+                        self.emit(&mut events, Event::compacting());
+                        if let Some(notice) = self.compact_now(true).await {
+                            self.push_msg(Message::notice(
+                                "compacted",
+                                Some(notice.clone()),
+                                now_ts(),
+                            ));
+                            self.emit(&mut events, Event::compacted(notice));
+                            continue;
+                        }
+                    }
                     // Persist the partial assistant message the user watched arrive
                     // (mirrors Python engine.py:334-335), then append an error notice
                     // so retry() can find it (mirrors Python engine.py:343).
@@ -710,7 +860,10 @@ impl TurnEngine {
                     let tool_calls_vec = turn.tool_calls;
                     let turn_text = turn.text.unwrap_or_default();
                     let turn_reasoning = turn.reasoning;
-                    let turn_usage = turn.usage.as_ref().map(|u| serde_json::json!(u));
+                    if let Some(u) = &turn.usage {
+                        self.last_context_tokens = Some(u.input as i64);
+                    }
+                    let turn_usage = turn.usage.as_ref().map(|u| usage_sidecar(&self.model, u));
                     let tool_calls_for_message: Vec<_> = tool_calls_vec
                         .iter()
                         .map(|tc| ToolCall {
@@ -768,6 +921,143 @@ impl TurnEngine {
     }
 
     // ---------------------------------------------------------------------------
+    // Auto-compaction (OPE-27)
+    // ---------------------------------------------------------------------------
+
+    fn compaction_config(&self) -> Map<String, Value> {
+        let mut cfg = self
+            .compaction_settings
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default();
+        if !cfg.contains_key("threshold_pct") {
+            cfg.insert("threshold_pct".into(), json!(DEFAULT_THRESHOLD_PCT));
+        }
+        if !cfg.contains_key("cap_tokens") {
+            cfg.insert("cap_tokens".into(), json!(DEFAULT_CAP_TOKENS));
+        }
+        cfg
+    }
+
+    fn compaction_due(&self) -> bool {
+        let cfg = self.compaction_config();
+        if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            return false;
+        }
+        let signal = self
+            .last_context_tokens
+            .unwrap_or_else(|| estimate_tokens(&self.outbound_messages()));
+        let window = cfg.get("context_window").and_then(|v| v.as_i64());
+        let pct = cfg
+            .get("threshold_pct")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(DEFAULT_THRESHOLD_PCT);
+        let cap = cfg
+            .get("cap_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_CAP_TOKENS);
+        should_compact(signal, window, pct, cap)
+    }
+
+    /// Run the compaction policy. Returns a user-facing notice when the outbound view changed.
+    async fn compact_now(&mut self, force: bool) -> Option<String> {
+        let cfg = self.compaction_config();
+        let pct = cfg
+            .get("threshold_pct")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(DEFAULT_THRESHOLD_PCT);
+        let cap = cfg
+            .get("cap_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_CAP_TOKENS);
+        let window = cfg.get("context_window").and_then(|v| v.as_i64());
+        let keep = keep_tokens_for_trigger(trigger_tokens(window, pct, cap));
+        let model = cfg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.model)
+            .to_string();
+
+        let canonical: Vec<Value> = self
+            .messages
+            .iter()
+            .filter(|m| !m.is_display_only())
+            .map(|m| m.to_wire())
+            .collect();
+        let prior = self.compaction_state.clone();
+        let prior_summary = prior
+            .as_ref()
+            .map(|p| p.summary_text.clone())
+            .unwrap_or_default();
+        let span_start = prior.as_ref().map(|p| p.boundary_index).unwrap_or(0);
+        let keep_for_boundary = keep;
+
+        let mut state: Option<CompactionState> = None;
+        let mut failed = false;
+        for _attempt in 0..2 {
+            let msgs_for_boundary = canonical.clone();
+            let boundary = crate::compaction::pick_boundary(&msgs_for_boundary, keep_for_boundary);
+            let Some(boundary) = boundary else {
+                failed = true;
+                break;
+            };
+            if let Some(p) = &prior {
+                if boundary <= p.boundary_index {
+                    failed = true;
+                    break;
+                }
+            }
+            let span = msgs_for_boundary[span_start.min(boundary)..boundary].to_vec();
+            let sum_msgs = summarizer_messages(&span, &prior_summary);
+            let provider = Arc::clone(&self.provider);
+            let model_c = model.clone();
+            let settings = json!({ "max_tokens": SUMMARY_MAX_TOKENS });
+            let summary_result = tokio::task::spawn_blocking(move || {
+                provider.complete(&model_c, sum_msgs, None, settings)
+            })
+            .await;
+            match summary_result {
+                Ok(Ok(turn)) => {
+                    let summary = turn.text.unwrap_or_default();
+                    if summary.trim().is_empty() {
+                        failed = true;
+                        continue;
+                    }
+                    state = build_state_with_summary(
+                        &canonical,
+                        summary,
+                        &model,
+                        keep,
+                        prior.as_ref(),
+                    );
+                    failed = state.is_none();
+                    if state.is_some() {
+                        break;
+                    }
+                }
+                _ => {
+                    failed = true;
+                }
+            }
+        }
+
+        if let Some(s) = state {
+            self.compaction_state = Some(s);
+            self.last_context_tokens = None;
+            return Some("Context compacted — earlier turns were summarized".into());
+        }
+        if failed || force {
+            if let Some(trimmed) = trim_state_default(&canonical, prior.as_ref()) {
+                self.compaction_state = Some(trimmed);
+                self.last_context_tokens = None;
+                return Some("Context trimmed — oldest turns dropped (summary unavailable)".into());
+            }
+        }
+        None
+    }
+
+    // ---------------------------------------------------------------------------
     // Audit
     // ---------------------------------------------------------------------------
 
@@ -796,6 +1086,62 @@ impl TurnEngine {
         }));
     }
 
+    fn remember_approval(
+        &mut self,
+        tool_call_id: &str,
+        origin: ApprovalOrigin,
+        note: Option<String>,
+        grant: Option<String>,
+    ) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        self.approval_origins.insert(
+            tool_call_id.to_string(),
+            ApprovalOriginNote {
+                origin,
+                note,
+                grant,
+            },
+        );
+    }
+
+    fn provenance_note(&self, tool_call: &ocw_provider::ToolCall) -> String {
+        self.agent_files
+            .match_call(&tool_call.name, &tool_call.arguments, self.agent_step + 1)
+            .map(|m| m.render())
+            .unwrap_or_default()
+    }
+
+    fn user_message_texts(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => match content {
+                    Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn reviewer_active(&self) -> bool {
+        if self.reviewer.is_none() || self.reviewer_denials >= REVIEWER_TRIP {
+            return false;
+        }
+        let attended = self
+            .is_attended
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or(false);
+        if !attended {
+            return false;
+        }
+        let mode = self.permissions.lock().await.mode();
+        matches!(mode, Mode::AutoApprove)
+    }
+
     // ---------------------------------------------------------------------------
     // Tool call handling
     // ---------------------------------------------------------------------------
@@ -822,6 +1168,30 @@ impl TurnEngine {
         drop(permissions);
 
         if decision.allowed {
+            if let Some(origin) = ApprovalOrigin::from_decision_reason(&decision.reason) {
+                self.remember_approval(&tool_call.id, origin, None, None);
+                let mut extra = Map::new();
+                extra.insert("stage".into(), json!("auto_allowed"));
+                extra.insert("status".into(), json!("allowed"));
+                extra.insert("reason".into(), json!(decision.reason.clone()));
+                if let Value::Object(fields) = origin.audit_fields(None, None) {
+                    for (k, v) in fields {
+                        extra.insert(k, v);
+                    }
+                }
+                self.audit(tool_call, extra);
+            } else if !decision.rule.is_empty() {
+                self.standing_notes
+                    .lock()
+                    .await
+                    .insert(tool_call.id.clone(), decision.rule.clone());
+                self.remember_approval(
+                    &tool_call.id,
+                    ApprovalOrigin::AutoApproved,
+                    Some(decision.rule.clone()),
+                    None,
+                );
+            }
             return true;
         }
 
@@ -830,18 +1200,109 @@ impl TurnEngine {
             return false;
         }
 
-        // Permission required — emit event and await user response. The event
-        // goes through `self.emit` so the live pump fans it out immediately
-        // (previously it was only pushed onto the local vec, meaning the
-        // `permission_required` arrived at the GUI AFTER the matching
-        // `tool_finished: denied` — the GUI then never cleared the card).
-        let reason = decision.reason.clone();
         let category = spec.map(|s| s.category).unwrap_or("");
         let tool_call_id = if tool_call.id.is_empty() {
             None
         } else {
             Some(tool_call.id.clone())
         };
+
+        // Live Auto-Approve reviewer — may turn needs_user into allow/deny.
+        if self.reviewer_active().await {
+            let user_msgs = self.user_message_texts();
+            let prov = self.provenance_note(tool_call);
+            let reviewer = self.reviewer.clone().expect("checked active");
+            let verdict = reviewer(
+                tool_call.name.clone(),
+                tool_call.arguments.clone(),
+                user_msgs,
+                prov,
+            )
+            .await;
+
+            {
+                let mut extra = Map::new();
+                extra.insert("stage".into(), json!("reviewer_verdict"));
+                extra.insert(
+                    "status".into(),
+                    json!(match verdict.verdict {
+                        ReviewerVerdict::Allow => "allow",
+                        ReviewerVerdict::Deny => "deny",
+                        ReviewerVerdict::Unsure => "unsure",
+                    }),
+                );
+                extra.insert("reason".into(), json!(verdict.reason.clone()));
+                self.audit(tool_call, extra);
+            }
+
+            match verdict.verdict {
+                ReviewerVerdict::Allow => {
+                    self.reviewer_denials = 0;
+                    self.remember_approval(
+                        &tool_call.id,
+                        ApprovalOrigin::Reviewer,
+                        Some(verdict.reason.clone()),
+                        None,
+                    );
+                    return true;
+                }
+                ReviewerVerdict::Deny => {
+                    self.reviewer_denials += 1;
+                    let tripped = self.reviewer_denials == REVIEWER_TRIP;
+                    if tripped {
+                        self.push_msg(Message::notice(
+                            "reviewer_paused",
+                            Some(REVIEWER_PAUSED_TEXT.to_string()),
+                            now_ts(),
+                        ));
+                    }
+                    let deny_display = Value::Object(
+                        ApprovalOrigin::ReviewerDenied
+                            .display_sidecar(Some(&verdict.reason), None),
+                    );
+                    self.push_msg(Message::tool_error_with_display(
+                        tool_call.id.clone(),
+                        AGENT_DENY_MESSAGE,
+                        now_ts(),
+                        Some(deny_display),
+                    ));
+                    self.audit(tool_call, {
+                        let mut m = Map::new();
+                        m.insert("stage".into(), json!("finished"));
+                        m.insert("status".into(), json!("denied"));
+                        m.insert(
+                            "reason".into(),
+                            json!(format!("denied by reviewer: {}", verdict.reason)),
+                        );
+                        m
+                    });
+                    self.emit(
+                        events,
+                        Event::tool_finished_for(
+                            tool_call.name.clone(),
+                            "denied".into(),
+                            Some("blocked by the safety reviewer".into()),
+                            Some(verdict.reason.clone()),
+                            Some(json!({
+                                "approval_origin": "reviewer_denied",
+                                "approval_note": verdict.reason,
+                                "allow_anyway": true,
+                            })),
+                            None,
+                            tool_call_id.clone(),
+                        ),
+                    );
+                    return false;
+                }
+                ReviewerVerdict::Unsure => {
+                    self.reviewer_denials = 0;
+                    // Fall through to the human card.
+                }
+            }
+        }
+
+        // Permission required — emit event and await user response.
+        let reason = decision.reason.clone();
         self.emit(
             events,
             Event::permission_required_for(
@@ -853,9 +1314,6 @@ impl TurnEngine {
             ),
         );
 
-        // Call the approver callback directly (Inbox-backed in server mode).
-        // Mirrors Python: the callback creates an Inbox item, broadcasts it to
-        // WS clients, and suspends on inbox.wait() until a surface resolves it.
         let request = PermissionRequest {
             tool_name: tool_call.name.clone(),
             arguments: tool_call.arguments.as_object().cloned().unwrap_or_default(),
@@ -872,18 +1330,45 @@ impl TurnEngine {
             Ok(Ok(outcome)) => match outcome {
                 ApprovalOutcome::Once
                 | ApprovalOutcome::AlwaysTool
-                | ApprovalOutcome::AlwaysCommand => {
+                | ApprovalOutcome::AlwaysCommand
+                | ApprovalOutcome::AlwaysDomain
+                | ApprovalOutcome::ReadonlySession
+                | ApprovalOutcome::AlwaysTrust
+                | ApprovalOutcome::ThisRun => {
                     if matches!(outcome, ApprovalOutcome::AlwaysTool) {
                         let mut perms = self.permissions.lock().await;
                         perms.allow_tool_for_session(tool_call.name.clone());
                     }
                     if matches!(outcome, ApprovalOutcome::AlwaysCommand) {
                         let mut perms = self.permissions.lock().await;
-                        perms.allow_tool_for_session(tool_call.name.clone());
+                        if let Some(cmd) = tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                        {
+                            perms.allow_command_for_session(cmd.to_string());
+                        }
                     }
+                    if matches!(outcome, ApprovalOutcome::AlwaysTrust) {
+                        let mut perms = self.permissions.lock().await;
+                        perms.trust_tool(tool_call.name.clone());
+                    }
+                    if matches!(outcome, ApprovalOutcome::ThisRun) {
+                        let mut perms = self.permissions.lock().await;
+                        perms.allow_tool_for_run(tool_call.name.clone());
+                    }
+                    let (origin, grant) = match outcome {
+                        ApprovalOutcome::AlwaysTrust => (ApprovalOrigin::TrustedRule, None),
+                        ApprovalOutcome::ThisRun => (ApprovalOrigin::RunGrant, None),
+                        _ => (ApprovalOrigin::UserApproved, None),
+                    };
+                    self.remember_approval(&tool_call.id, origin, None, grant);
                     return true;
                 }
-                ApprovalOutcome::Deny => return false,
+                ApprovalOutcome::Deny => {
+                    self.remember_approval(&tool_call.id, ApprovalOrigin::Denied, None, None);
+                    return false;
+                }
             },
             Ok(Err(_)) | Err(_) => {
                 // Timeout or approver panicked — deny the tool.
@@ -1019,15 +1504,11 @@ impl TurnEngine {
                     let registry = Arc::clone(&self.registry);
                     let name = tc.name.clone();
                     let id = tc.id.clone();
-                    let args = tc
-                        .arguments
-                        .clone()
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default();
+                    let args_raw = tc.arguments.clone();
+                    let args = args_raw.as_object().cloned().unwrap_or_default();
                     tokio::task::spawn_blocking(move || {
                         let result = registry.execute(&name, args);
-                        (name, id, result)
+                        (name, id, args_raw, result)
                     })
                 })
                 .collect();
@@ -1036,11 +1517,11 @@ impl TurnEngine {
                 if *cancel.lock().unwrap() {
                     break;
                 }
-                if let Ok((name, id, result)) = handle.await {
+                if let Ok((name, id, arguments, result)) = handle.await {
                     let tc = ocw_provider::ToolCall {
                         id,
                         name,
-                        arguments: serde_json::Value::Object(Default::default()),
+                        arguments,
                     };
                     events.push(self.record_result(&tc, result).await);
                 }
@@ -1115,26 +1596,63 @@ impl TurnEngine {
         tool_call: &ocw_provider::ToolCall,
         result: Result<ToolResult, ToolError>,
     ) -> Event {
-        let display_val = result
+        let mut display_val = result
             .as_ref()
             .ok()
             .and_then(|r| r.display.clone())
             .map(|d| serde_json::json!(d));
-        let (value, status): (Value, String) = match result {
-            Ok(r) => (r.value, "ok".to_string()),
+        let (value, status): (Value, String) = match &result {
+            Ok(r) => (r.value.clone(), "ok".to_string()),
             Err(e) => (
                 serde_json::json!({ "error": e.to_string() }),
                 "error".to_string(),
             ),
         };
 
-        self.push_msg(Message::tool_result(
+        self.agent_step += 1;
+        if status == "ok" {
+            self.agent_files.record(
+                &tool_call.name,
+                &tool_call.arguments,
+                Some(&value),
+                self.agent_step,
+            );
+        }
+
+        // Merge approval-origin chip into `_display` (mirrors Python `_record_result`).
+        if let Some(origin) = self.approval_origins.remove(&tool_call.id) {
+            let mut disp = match display_val.take() {
+                Some(Value::Object(m)) => m,
+                _ => Map::new(),
+            };
+            for (k, v) in origin.origin.display_sidecar(origin.note.as_deref(), origin.grant.as_deref())
+            {
+                disp.insert(k, v);
+            }
+            display_val = Some(Value::Object(disp));
+            // Also fold into audit
+            if let Value::Object(fields) =
+                origin
+                    .origin
+                    .audit_fields(origin.note.as_deref(), origin.grant.as_deref())
+            {
+                let mut extra = Map::new();
+                extra.insert("stage".into(), json!("approval_origin"));
+                for (k, v) in fields {
+                    extra.insert(k, v);
+                }
+                self.audit(tool_call, extra);
+            }
+        }
+
+        self.push_msg(Message::tool_result_with_display(
             tool_call.id.clone(),
             match &value {
                 Value::String(s) => s.clone(),
                 _ => serde_json::to_string(&value).unwrap_or_default(),
             },
             now_ts(),
+            display_val.clone(),
         ));
 
         let rule = self.standing_notes.lock().await.remove(&tool_call.id);
@@ -1402,22 +1920,19 @@ impl TurnEngine {
     // ---------------------------------------------------------------------------
 
     fn outbound_messages(&self) -> Vec<Value> {
-        let mut out: Vec<Value> = self
+        let wire: Vec<Value> = self
             .messages
             .iter()
             .filter(|m| !m.is_display_only())
             .map(|m| m.to_wire())
             .collect();
+        let mut out = apply_to_outbound(&wire, self.compaction_state.as_ref());
 
         // Per-turn context injection — mirrors Python's `_outbound_messages`.
-        // The `<system-context>` block is appended to the last user message so
-        // the model sees fresh per-turn data (date, plan reminders, etc.) without
-        // polluting the persisted history.
         if let Some(ctx_fn) = &self.context_provider {
             let ctx = ctx_fn();
             if !ctx.is_empty() {
                 let block = format!("\n\n<system-context>\n{ctx}\n</system-context>");
-                // Append to the LAST user message
                 if let Some(last_user) = out.iter_mut().rev().find(|v| {
                     v.get("role").and_then(|r| r.as_str()) == Some("user")
                 }) {
@@ -1495,7 +2010,9 @@ mod tests {
     use crate::events::{EventData, EventType};
     use crate::permissions::{Mode, PermissionEngine};
     use crate::tool_registry::ToolRegistry;
+    use crate::tool_types::ToolResult;
     use ocw_provider::{AssistantTurn, Provider, TokenUsage};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc as StdArc;
 
     /// A provider that returns a single canned `AssistantTurn` (text + tool calls)
@@ -1821,5 +2338,137 @@ mod tests {
 
         // Under the limit: returned untouched.
         assert_eq!(preview(&serde_json::json!("短文本"), 300), "短文本");
+    }
+
+    #[test]
+    fn outbound_applies_compaction_boundary() {
+        let (mut eng, _rx) = make_engine(vec![]);
+        eng.push_msg(Message::user("first"));
+        eng.push_msg(Message::assistant("a1".into(), vec![], None, None, 1.0));
+        eng.push_msg(Message::user("second"));
+        eng.push_msg(Message::assistant("a2".into(), vec![], None, None, 2.0));
+        eng.push_msg(Message::user("third"));
+
+        eng.compaction_state = Some(CompactionState {
+            boundary_index: 2,
+            summary_text: "SUMMARY_MARKER".into(),
+            working_state: String::new(),
+            user_messages: vec![],
+            user_messages_dropped: 0,
+            created_at: 0.0,
+            model_used: "test".into(),
+            trimmed: false,
+        });
+
+        let out = eng.outbound_messages();
+        assert!(
+            out.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("SUMMARY_MARKER") && s.contains("<compacted-history>"))
+            }),
+            "outbound must include compacted block: {out:?}"
+        );
+        // Tail after boundary is kept verbatim.
+        assert!(out.iter().any(|m| {
+            m.get("content").and_then(|c| c.as_str()) == Some("second")
+                || m.get("content").and_then(|c| c.as_str()) == Some("third")
+        }));
+        // Canonical history untouched.
+        assert_eq!(eng.messages().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn reviewer_allow_skips_approver() {
+        let provider: Arc<dyn Provider> = Arc::new(CannedProvider::new(
+            "ok",
+            vec![ocw_provider::ToolCall {
+                id: "call_w1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "out.txt", "content": "hi"}),
+            }],
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            "write_file",
+            Arc::new(|_args| ToolResult::ok(json!({"ok": true}))),
+            crate::tool_types::ToolSpec {
+                risk_level: "write",
+                category: "files",
+                parallel_safe: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "ocw-engine-reviewer-{}.json",
+            std::process::id()
+        ));
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionEngine::new(tmp)));
+        permissions.lock().await.set_mode(Mode::AutoApprove);
+        let approver_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = Arc::clone(&approver_hits);
+        let mut eng = TurnEngine::new(
+            provider,
+            Arc::new(registry),
+            permissions,
+            "test-model".into(),
+            4,
+            Map::new(),
+            Vec::new(),
+        )
+        .with_is_attended(|| true)
+        .with_reviewer(Arc::new(|_tool, _args, _msgs, _prov| {
+            Box::pin(async {
+                ReviewerDecision {
+                    verdict: ReviewerVerdict::Allow,
+                    reason: "matches request".into(),
+                }
+            })
+        }))
+        .with_approver(Arc::new(move |_req| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ApprovalOutcome::Deny) })
+        }));
+
+        eng.push_msg(Message::user("please write out.txt"));
+        let events = eng.run_loop().await;
+
+        assert_eq!(
+            approver_hits.load(Ordering::SeqCst),
+            0,
+            "reviewer allow must not call the human approver"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e.event_type, EventType::ToolFinished)
+                && matches!(&e.data, EventData::ToolFinished { status, .. } if status == "ok")),
+            "write should complete after reviewer allow: {events:?}"
+        );
+        let tool_msg = eng.messages().iter().find(|m| matches!(m, Message::Tool { .. }));
+        match tool_msg {
+            Some(Message::Tool { display: Some(d), .. }) => {
+                assert_eq!(d["approval_origin"], "reviewer");
+            }
+            other => panic!("expected tool message with display, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provenance_records_after_write_file() {
+        let (mut eng, _rx) = make_engine(vec![]);
+        eng.set_workspace_root("/tmp/ocw-prov-test");
+        eng.agent_step = 0;
+        eng.agent_files.record(
+            "write_file",
+            &json!({"path": "script.py", "content": "print(1)"}),
+            Some(&json!({"ok": true})),
+            1,
+        );
+        let m = eng
+            .agent_files
+            .match_call("run_shell", &json!({"command": "python script.py"}), 2)
+            .expect("written script should match");
+        assert!(m.render().contains("script.py"));
+        assert!(!m.downloaded());
     }
 }

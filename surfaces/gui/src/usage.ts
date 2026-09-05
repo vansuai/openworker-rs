@@ -16,11 +16,20 @@ const num = (v: any): number => {
   return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
-/** Fold one turn's usage sidecar into the session accumulation. */
-export function addTurnUsage(prev: SessionUsage, raw: any): SessionUsage {
+/** Fold one turn's usage sidecar into the session accumulation.
+ *  `fallbackModel` covers older servers that omit `usage.model` — use the session's
+ *  current model instead of bucketing under "unknown". */
+export function addTurnUsage(
+  prev: SessionUsage,
+  raw: any,
+  fallbackModel?: string | null,
+): SessionUsage {
   if (!raw || typeof raw !== "object") return prev;
+  const fromSidecar = typeof raw.model === "string" && raw.model ? raw.model : null;
+  const fromFallback =
+    typeof fallbackModel === "string" && fallbackModel ? fallbackModel : null;
   const turn: TurnUsage = {
-    model: typeof raw.model === "string" && raw.model ? raw.model : null,
+    model: fromSidecar || fromFallback,
     input: num(raw.input),
     output: num(raw.output),
     cache_read: num(raw.cache_read),
@@ -46,10 +55,13 @@ export function addTurnUsage(prev: SessionUsage, raw: any): SessionUsage {
 }
 
 /** Rebuild the accumulation from a replayed transcript (session load/switch). */
-export function usageFromMessages(messages: ConversationMessage[]): SessionUsage {
+export function usageFromMessages(
+  messages: ConversationMessage[],
+  fallbackModel?: string | null,
+): SessionUsage {
   let acc = emptyUsage();
   for (const m of messages || []) {
-    if (m.role === "assistant" && m.usage) acc = addTurnUsage(acc, m.usage);
+    if (m.role === "assistant" && m.usage) acc = addTurnUsage(acc, m.usage, fallbackModel);
   }
   return acc;
 }

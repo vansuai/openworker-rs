@@ -9,7 +9,6 @@ use futures_util::FutureExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::time::interval;
 
 use crate::automations::{compute_next_run, AutomationStore, ScheduledTask, TaskRun};
 use crate::state::AppState;
@@ -512,13 +511,15 @@ async fn run_tick(state: &Arc<AppState>, trigger: String) {
 }
 
 pub async fn start_scheduler(state: Arc<AppState>) {
-    // Catch-up tick: fire anything that was missed while the server was down
+    // Catch-up tick: fire anything that was missed while the server was down.
+    // Mirrors Python's `_loop`: sleep *before* the first regular tick — tokio's
+    // `interval` fires immediately on the first `.tick().await`, which would
+    // re-dispatch the same due set right after catchup (and race with
+    // still-parked approval runs once RUNNING_IDS clears).
     run_tick(&state, "catchup".to_string()).await;
 
-    // Regular 30-second tick loop
-    let mut ticker = interval(Duration::from_secs(30));
     loop {
-        ticker.tick().await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
         run_tick(&state, "schedule".to_string()).await;
     }
 }

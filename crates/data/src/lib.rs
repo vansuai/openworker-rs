@@ -6,6 +6,8 @@ mod error;
 mod inbox;
 mod inbox_routing;
 mod memory;
+mod overrides;
+mod teams;
 mod types;
 
 pub use automation::{Schedule, ScheduledTask, TaskRun, TaskStore};
@@ -15,8 +17,15 @@ pub use inbox::{
     args_preview, InboxItem, InboxStore, KIND_APPROVAL, KIND_DIRECTORY, KIND_NOTIFICATION,
     KIND_PLAN, KIND_QUESTION, STATE_PENDING, STATE_RESOLVED, VIS_INBOX, VIS_INLINE,
 };
-pub use inbox_routing::{InboxBinding, InboxRouting, DEFAULT_INBOX};
+pub use inbox_routing::{
+    reply_intent, resolve_from_reply, InboxBinding, InboxRouting, DEFAULT_INBOX,
+};
 pub use memory::{format_memories, MemoryStore, SQLiteMemoryStore};
+pub use overrides::RiskOverrideStore;
+pub use teams::{
+    space_for_workspace, stored_name, validate_stored_name, Actor, AttachmentStore, BoardError,
+    BoardItem, Role, TeamStore,
+};
 pub use types::{MemoryItem, Scope, SessionRecord, SessionSummary};
 
 /// Truncate `s` to at most `max_chars` characters (not bytes). Never splits a

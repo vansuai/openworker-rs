@@ -66,6 +66,7 @@ import { ApprovalCard } from "./components/ApprovalCard";
 import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
+import { BoardView } from "./components/BoardView";
 import { coerceTodoArray } from "./todoUtils";
 
 const newId = () =>
@@ -162,6 +163,10 @@ export function App() {
     useState<WorkspaceCommandTrust | null>(null);
   const [agent, setAgent] = useState("cowork");
   const [model, setModel] = useState("gpt-5.6-sol");
+  // Ref mirror: the WS handler closes once per socket and can't read fresh `model`
+  // after a mid-session switch — usage fallback needs the live id.
+  const modelRef = useRef(model);
+  modelRef.current = model;
   const [models, setModels] = useState<string[]>([]);
   const [modelLabels, setModelLabels] = useState<Record<string, string>>({});
   // {full model id → context window in tokens} from the curated matrix (verified only);
@@ -221,7 +226,7 @@ export function App() {
   // a "Could not reach server" chip with a retry action instead of the perpetual "Loading models…".
   const [modelsLoadError, setModelsLoadError] = useState(false);
   const [surface, setSurface] = useState<
-    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings"
+    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings" | "board"
   >("session");
   // Force remount of ScheduledView when navigating to it via the sidebar button,
   // so it always lands on the list even if already on a detail page.
@@ -418,7 +423,7 @@ export function App() {
         try {
           const messages = await getSessionMessages(last.session_id);
           setItems(itemsFromMessages(messages));
-          setUsage(usageFromMessages(messages));
+          setUsage(usageFromMessages(messages, modelRef.current));
         } catch {
           setItems([]);
           setUsage(emptyUsage());
@@ -637,7 +642,7 @@ export function App() {
           setReasoningStream(reasoningRef.current + (d.text || ""));
           break;
         case "assistant_message": {
-          if (d.usage) setUsage((u) => addTurnUsage(u, d.usage));
+          if (d.usage) setUsage((u) => addTurnUsage(u, d.usage, modelRef.current));
           // The event's reasoning is authoritative (covers background-delivered turns);
           // the local buffer is the fallback for older servers.
           const reasoning = d.reasoning || reasoningRef.current;
@@ -1045,7 +1050,7 @@ export function App() {
     try {
       const messages = await getSessionMessages(id);
       setItems(itemsFromMessages(messages));
-      setUsage(usageFromMessages(messages));
+      setUsage(usageFromMessages(messages, modelRef.current));
     } catch (e) {
       // Only a definitive "session is gone" (404) clears the view. Any other
       // failure (server restarting, network blip) keeps the transcript on
@@ -1098,7 +1103,7 @@ export function App() {
       try {
         const messages = await getSessionMessages(target.sessionId);
         setItems(itemsFromMessages(messages));
-        setUsage(usageFromMessages(messages));
+        setUsage(usageFromMessages(messages, modelRef.current));
       } catch {
         setItems([]);
         setUsage(emptyUsage());
@@ -1401,10 +1406,12 @@ export function App() {
         onOpenIntegrations={() => setSurface("integrations")}
         onOpenAudit={() => setSurface("audit")}
         onOpenInbox={() => setSurface("inbox")}
+        onOpenBoard={() => setSurface("board")}
         scheduledActive={surface === "scheduled"}
         integrationsActive={surface === "integrations"}
         auditActive={surface === "audit"}
         inboxActive={surface === "inbox"}
+        boardActive={surface === "board"}
         collapsed={navCollapsed}
         onCollapse={toggleNav}
         onPeekLeave={() => setNavPeek(false)}
@@ -1422,6 +1429,8 @@ export function App() {
         />
       ) : surface === "integrations" ? (
         <IntegrationsView />
+      ) : surface === "board" ? (
+        <BoardView />
       ) : surface === "settings" ? (
         <SettingsView
           key={settingsTab}

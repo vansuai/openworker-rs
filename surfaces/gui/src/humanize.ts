@@ -4,7 +4,6 @@
 // model-written intent and is preferred when present. Fallback: "Used <tool> — <short args>".
 
 import { shortArgs } from "./components/ApprovalCard";
-import { coerceTodoArray } from "./todoUtils";
 
 // A one-line sentence in three segments so the UI can emphasize the object:
 // "Read " + <b>runbook.md</b> + " from the shared folder".
@@ -59,8 +58,7 @@ export function humanizeTool(name: string, args: any): HumanLine {
     case "todo_write": {
       // `todos` is current; `items` renders histories from before the rename (the old
       // key breaks Together's GLM-5.2 chat template — see coworker/tools/todo.py).
-      const fromTodos = coerceTodoArray(a.todos);
-      const items = fromTodos.length ? fromTodos : coerceTodoArray(a.items);
+      const items = Array.isArray(a.todos) ? a.todos : Array.isArray(a.items) ? a.items : [];
       if (items.length === 1) {
         const it = items[0] || {};
         const status = String(it.status || "").replace(/_/g, " ");
@@ -90,6 +88,10 @@ export function humanizeTool(name: string, args: any): HumanLine {
     }
     case "explore":
       return { pre: "Sent a sub-agent to explore — ", obj: `“${trunc(String(a.task ?? a.prompt ?? ""), 60)}”` };
+    case "load_skill":
+      // SKILLS-SPEC §4.1 #4 — the trust line: the transcript always shows the moment a
+      // skill's instructions were picked up, model-invoked or forced via /skill.
+      return { pre: "Used skill: ", obj: String(a.name ?? "") };
     case "ask_user":
       return { pre: "Asked you a question" };
     case "propose_plan":
@@ -133,6 +135,24 @@ export function humanizeApprovalTitle(name: string, args: any): HumanLine {
       return a.title
         ? { pre: "Create the automation ", obj: `“${trunc(String(a.title), 60)}”` }
         : { pre: "Create an automation" };
+    case "save_skill":
+      // SKILLS-SPEC §5.2/§7: "Add", never "install"; destination is "your skills".
+      return a.name
+        ? { pre: "Add skill ", obj: String(a.name), post: " to your skills" }
+        : { pre: "Add a skill to your skills" };
+    // Egress cards (OPE-136 finding 5): name the destination in the headline; the full
+    // URL/query renders in the card's expandable preview.
+    case "web_fetch": {
+      let host = "";
+      try {
+        host = new URL(String(a.url ?? "")).host;
+      } catch {
+        /* unparseable url → generic title; the preview still shows the raw string */
+      }
+      return host ? { pre: "Fetch from ", obj: host } : { pre: "Fetch a web page" };
+    }
+    case "web_search":
+      return { pre: "Search the web" };
     default:
       return { pre: `Use ${name}` };
   }

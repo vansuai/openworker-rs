@@ -22,6 +22,10 @@ pub enum EventType {
     TurnEnd,
     Error,
     Interrupted,
+    /// Compaction started — surfaces show a transient progress signal.
+    Compacting,
+    /// Outbound history was compacted (summary or trim).
+    Compacted,
 }
 
 /// One event emitted by the engine.
@@ -242,6 +246,20 @@ impl Event {
             data: EventData::Interrupted { iterations },
         }
     }
+
+    pub fn compacting() -> Self {
+        Self {
+            event_type: EventType::Compacting,
+            data: EventData::Compacting {},
+        }
+    }
+
+    pub fn compacted(text: String) -> Self {
+        Self {
+            event_type: EventType::Compacted,
+            data: EventData::Compacted { text },
+        }
+    }
 }
 
 /// Payload variants for each event type.
@@ -332,5 +350,9 @@ pub enum EventData {
     },
     Interrupted {
         iterations: usize,
+    },
+    Compacting {},
+    Compacted {
+        text: String,
     },
 }

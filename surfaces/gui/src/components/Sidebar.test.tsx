@@ -59,15 +59,38 @@ const baseProps = {
   onOpenIntegrations: vi.fn(),
   onOpenAudit: vi.fn(),
   onOpenInbox: vi.fn(),
+  onOpenBoard: vi.fn(),
   scheduledActive: false,
   integrationsActive: false,
   auditActive: false,
   inboxActive: false,
+  boardActive: false,
 };
 
 afterEach(() => {
   cleanup();
+  // Only unstub fetch — `vi.unstubAllGlobals()` can break jsdom's localStorage.
   vi.unstubAllGlobals();
+  // Re-install durable localStorage after unstub (see test-setup.ts).
+  const map = new Map<string, string>();
+  Object.defineProperty(globalThis, "localStorage", {
+    value: {
+      get length() {
+        return map.size;
+      },
+      clear: () => map.clear(),
+      getItem: (k: string) => (map.has(k) ? map.get(k)! : null),
+      key: (i: number) => [...map.keys()][i] ?? null,
+      removeItem: (k: string) => {
+        map.delete(k);
+      },
+      setItem: (k: string, v: string) => {
+        map.set(k, String(v));
+      },
+    } satisfies Storage,
+    configurable: true,
+    writable: true,
+  });
   vi.clearAllMocks();
 });
 

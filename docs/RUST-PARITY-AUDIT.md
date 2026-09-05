@@ -4,8 +4,9 @@
 - **Python 角色**：`coworker/` **仅作迁移对照参考**（行为/契约/测试的真相源），不再作为产品后端长期维护
 - **GUI 契约**：`surfaces/gui` REST/WS 仍以与 Python 基线 1:1 等价为验收口径
 - **口径**：HTTP/WS 路由、JSON 字段、事件、权限、SQLite/JSONL、桌面 sidecar
-- **修订**：2026-08-07（替换 2026-08-05 过时结论；明确 Python = 参考、Rust = 产品；同日源码级复核见 [parity-report-2026-08-07.md](parity-report-2026-08-07.md)，本文 P0/P1 清单多处被修正）
-- **总判定**：**路由壳与数据存储层高保真，执行语义层多处断链。** 阻断生产的不再是「缺路由」，而是权限管道断裂（写路径根传错、会话 mode 不生效）、provider 四家请求构造/流式错误、inbox durable resume 缺失、入站 Gateway 未挂载，以及新发现的 HTTP 鉴权归零 + CORS 全开的安全回归（详见详细报告 §5）。
+- **修订**：2026-09-05（相对上游 `andrewyng/openworker` `main` @ `5bc10d9` 全量同步后更新；此前 2026-08-07 源码级复核见 [parity-report-2026-08-07.md](parity-report-2026-08-07.md)）
+- **上游基线**：Python 参考已覆盖至 `5bc10d9`（含 OPE-136 MCP 权限、compaction/reviewer/provenance/teams、security personas）
+- **总判定**：**Python 参考与核心安全契约已对齐上游；Rust 产品路径完成 Egress/MCP floor、审批 grant、conversation 健壮性、Anthropic stream-complete、skills staging、inbox 句首 intent、board API 骨架与 GUI 审批卡/i18n/MCP trust。** 仍有深度接线缺口（见 §7）。
 
 ## 0. 相对 2026-08-05 审计：已推进
 
@@ -148,3 +149,48 @@
 | **MCP OAuth** | stdio/HTTP tools/list 已接线；managed OAuth 对照 Python 后续补齐。 |
 | **打包** | 默认 `ocw-server`；Python sidecar 仅临时对照/应急。 |
 | **CI** | `cargo check/test --workspace` + `scripts/rust_route_parity.py`；pytest 为参考回归。 |
+
+## 7. 相对 upstream `5bc10d9`（2026-09-05）
+
+### 7.1 已同步
+
+| 区域 | 状态 |
+| --- | --- |
+| Python `coworker/` + `tests/` + `pyproject.toml` + `SECURITY.md` | 按上游覆盖；`pytest` ~1911 passed（排除本机 DNS 噪声的 URL guard） |
+| Risk / MCP floor / `RiskClass::Egress` | [`permissions.rs`](../crates/engine/src/permissions.rs)；override 只可收紧 |
+| 审批 grant（once / this-run / always-trust / deny） | engine + WS resolution 词汇对齐 |
+| Conversation 健壮性 | 坏行跳过、原子 shrink、拒绝路径穿越 session id、trailing pending 不填假 result |
+| Anthropic `complete()` | 内部 stream 再累积 |
+| Skills upload staging 路径约束 | [`skills/store.rs`](../crates/skills/src/store.rs) |
+| Inbox reply 句首 intent | [`inbox_routing.rs`](../crates/data/src/inbox_routing.rs) |
+| MCP trust / revoke / convert API | server routes + GUI `CustomMcp` / `ToolReview` |
+| GUI OPE-136 审批卡 + i18n en/zh | cherry-pick；保留 Tauri/`ocw-server` 接线 |
+| Compaction / reviewer / provenance | **已挂入 TurnEngine**（due→summarize、overflow 重试、`apply_to_outbound`、SessionFiles、`_display` origin、AutoApprove 评审） |
+| Teams/Board HTTP | `/v1/board/*`（token 鉴权）+ GUI Board 面板 / Sidebar 入口 |
+| Codex / OpenAI Responses | **已实现并接入 router**（stock OpenAI → Responses；`openai-codex` 描述符） |
+| Security personas | Python builtin 资源已随覆盖带入 |
+| Scheduler #379 | claim-at-dispatch + catchup 后 `sleep(30)` 再 schedule（对齐 Python，避免 interval 立即双跑） |
+
+### 7.2 仍存缺口（相对上游行为契约）
+
+| 缺口 | 说明 |
+| --- | --- |
+| Session-scoped board 路由 | **已补** `/v1/sessions/{id}/board*` + transition/comment；GUI `getBoard(sessionId)` 等已对齐；token `/v1/board/*` 仍供 BoardView |
+| `ocw` CLI / board MCP | 可后置 |
+| RightRail 内 BoardSection 深度集成 | 组件已有；App session 右栏挂载可继续打磨 |
+| Team chat / journal | HTTP stub（`enabled:false` / `cases:[]`） |
+
+> 2026-09-05 补丁：TurnEngine 已挂 compaction/reviewer/provenance；WS 交互会话注入 attended + session-model reviewer，并在 turn 结束写回 compaction；stock OpenAI / `openai-codex` 走 Responses；scheduler catchup 后 sleep 再 tick。
+
+### 7.3 验收命令（2026-09-05）
+
+```text
+.venv/bin/python -m pytest tests -q --ignore=tests/test_url_address_guard.py
+# → ~1911 passed
+
+cd crates && cargo test --workspace --lib
+# → 各 crate ok（engine 38、provider 含 Responses 单测、ocw-server 等）
+
+cd surfaces/gui && npx tsc --noEmit && npx vitest run
+# → tsc 0；143 tests passed
+```

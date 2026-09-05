@@ -9,6 +9,7 @@ pub enum Error {
     Json(String),
     Io(String),
     NotFound(String),
+    Invalid(String),
 }
 
 impl fmt::Display for Error {
@@ -18,6 +19,7 @@ impl fmt::Display for Error {
             Error::Json(s) => write!(f, "JSON error: {s}"),
             Error::Io(s) => write!(f, "I/O error: {s}"),
             Error::NotFound(s) => write!(f, "Not found: {s}"),
+            Error::Invalid(s) => write!(f, "Invalid: {s}"),
         }
     }
 }

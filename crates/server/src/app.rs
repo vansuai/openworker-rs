@@ -22,6 +22,7 @@ use crate::error::Error;
 use crate::settings;
 use crate::state::AppState;
 use crate::subsystems;
+use crate::teams;
 use crate::ws::ws_session_handler;
 
 // ---------------------------------------------------------------------------
@@ -286,6 +287,40 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/attachments/inspect-pdf",
             post(subsystems::handler_attachments_inspect_pdf),
         )
+        // Agent teams board (token-authenticated `/v1/board` — matches Python paths)
+        .route("/v1/board/whoami", get(teams::handler_whoami))
+        .route("/v1/board/items", get(teams::handler_list_items))
+        .route("/v1/board/items", post(teams::handler_create_item))
+        .route("/v1/board/item", get(teams::handler_get_item))
+        .route("/v1/board/attachment", get(teams::handler_attachment))
+        // Session-scoped board (sidecar session auth — no board bearer)
+        .route(
+            "/v1/sessions/{session_id}/board",
+            get(teams::handler_session_board),
+        )
+        .route(
+            "/v1/sessions/{session_id}/board/item",
+            get(teams::handler_session_board_item),
+        )
+        .route(
+            "/v1/sessions/{session_id}/board/attachment",
+            get(teams::handler_session_board_attachment),
+        )
+        .route(
+            "/v1/sessions/{session_id}/board/comment",
+            post(teams::handler_session_board_comment),
+        )
+        .route(
+            "/v1/sessions/{session_id}/board/transition",
+            post(teams::handler_session_board_transition),
+        )
+        // Team chat / journal stubs
+        .route("/v1/teams/{team_id}/chat", get(teams::handler_team_chat_get))
+        .route(
+            "/v1/teams/{team_id}/chat",
+            post(teams::handler_team_chat_post),
+        )
+        .route("/v1/teams/journal", get(teams::handler_teams_journal))
         // Auth / OAuth
         .route("/auth/callback", get(subsystems::handler_auth_callback))
         .route("/oauth/callback", post(subsystems::handler_oauth_callback))
@@ -299,6 +334,22 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/mcp/{name}", patch(subsystems::handler_mcp_update))
         .route("/v1/mcp/{name}", delete(subsystems::handler_mcp_delete))
         .route("/v1/mcp/{name}/tools", get(subsystems::handler_mcp_tools))
+        .route(
+            "/v1/mcp/{name}/trust",
+            get(subsystems::handler_mcp_trust_list),
+        )
+        .route(
+            "/v1/mcp/{name}/trust/{tool}",
+            delete(subsystems::handler_mcp_trust_revoke),
+        )
+        .route(
+            "/v1/mcp/{name}/trust/convert",
+            post(subsystems::handler_mcp_trust_convert),
+        )
+        .route(
+            "/v1/mcp/config/reveal",
+            post(subsystems::handler_mcp_config_reveal),
+        )
         .route(
             "/v1/mcp/{name}/connect",
             post(subsystems::handler_mcp_connect),

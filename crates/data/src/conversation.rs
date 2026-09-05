@@ -81,6 +81,7 @@ impl ConversationStore {
             "ALTER TABLE sessions ADD COLUMN auto_title TEXT",
             "ALTER TABLE sessions ADD COLUMN renamed INTEGER DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN grants TEXT",
+            "ALTER TABLE sessions ADD COLUMN compaction TEXT",
         ];
         for ddl in &migrations {
             let _ = conn.execute(ddl, []);
@@ -93,15 +94,35 @@ impl ConversationStore {
         })
     }
 
-    /// Path to the JSONL file for a session.
-    fn jsonl_path(&self, session_id: &str) -> PathBuf {
-        self.conv_dir.join(format!("{session_id}.jsonl"))
+    /// Path to the JSONL file for a session — single chokepoint that rejects
+    /// path-traversal session ids (mirrors Python `_file` / `is_safe_session_id`).
+    fn jsonl_path(&self, session_id: &str) -> Result<PathBuf, Error> {
+        if !is_safe_session_id(session_id) {
+            return Err(Error::Invalid(format!("unsafe session id: {session_id:?}")));
+        }
+        let path = self.conv_dir.join(format!("{session_id}.jsonl"));
+        let canon_dir = self
+            .conv_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.conv_dir.clone());
+        // Before the file exists, join + normalize without requiring canonicalize of the file.
+        let parent = path
+            .parent()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+            .unwrap_or_else(|| canon_dir.clone());
+        if parent != canon_dir {
+            return Err(Error::Invalid(format!("unsafe session id: {session_id:?}")));
+        }
+        Ok(path)
     }
 
     /// Read all messages from a session's JSONL file (public so the server layer can fall back
     /// to disk when its in-memory cache is empty after a restart).
     pub fn read_jsonl(&self, session_id: &str) -> Vec<serde_json::Value> {
-        let path = self.jsonl_path(session_id);
+        let path = match self.jsonl_path(session_id) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
         if !path.exists() {
             return Vec::new();
         }
@@ -126,7 +147,10 @@ impl ConversationStore {
     /// Count lines in a session's JSONL file (public so the server layer can diff
     /// engine messages against disk for incremental persistence).
     pub fn count_jsonl(&self, session_id: &str) -> usize {
-        let path = self.jsonl_path(session_id);
+        let path = match self.jsonl_path(session_id) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
         if !path.exists() {
             return 0;
         }
@@ -147,7 +171,7 @@ impl ConversationStore {
         session_id: &str,
         messages: &[serde_json::Value],
     ) -> Result<(), Error> {
-        let path = self.jsonl_path(session_id);
+        let path = self.jsonl_path(session_id)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -159,17 +183,24 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Rewrite the JSONL file with the given messages (used on rare truncation, or
-    /// when a legacy file is missing the leading system message).
+    /// Atomically rewrite the JSONL file (tmp + rename) so a mid-write crash
+    /// cannot leave a truncated history (mirrors Python `_rewrite`).
     pub fn rewrite_jsonl(&self, session_id: &str, messages: &[serde_json::Value]) -> Result<(), Error> {
-        let path = self.jsonl_path(session_id);
-        let file = fs::File::create(&path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        for msg in messages {
-            let line = serde_json::to_string(msg).map_err(|e| Error::Json(e.to_string()))?;
-            writeln!(writer, "{}", line)?;
+        let path = self.jsonl_path(session_id)?;
+        let tmp = path.with_extension("jsonl.tmp");
+        {
+            let file = fs::File::create(&tmp)?;
+            let mut writer = std::io::BufWriter::new(file);
+            for msg in messages {
+                let line = serde_json::to_string(msg).map_err(|e| Error::Json(e.to_string()))?;
+                writeln!(writer, "{}", line)?;
+            }
+            writer.flush()?;
         }
-        writer.flush()?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            Error::Io(e.to_string())
+        })?;
         Ok(())
     }
 
@@ -192,7 +223,7 @@ impl ConversationStore {
     /// Save a session record. Append-only for messages; updates metadata in SQLite.
     pub fn save(&self, record: &SessionRecord) -> Result<(), Error> {
         // Lazily migrate legacy inline blob into .jsonl
-        let jsonl_path = self.jsonl_path(&record.session_id);
+        let jsonl_path = self.jsonl_path(&record.session_id)?;
         if !jsonl_path.exists() {
             let messages_json: Option<String> = {
                 let conn = self.conn.lock();
@@ -256,7 +287,7 @@ impl ConversationStore {
             .unwrap_or_else(|| Self::title_from_messages(&record.messages));
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, workspace, model, mode, title, agent, n_msgs, extra_roots, grants, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
+            "INSERT OR REPLACE INTO sessions (session_id, workspace, model, mode, title, agent, n_msgs, extra_roots, grants, compaction, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
             params![
                 record.session_id,
                 record.workspace,
@@ -267,6 +298,11 @@ impl ConversationStore {
                 new_count,
                 serde_json::to_string(&record.extra_roots).unwrap_or_default(),
                 serde_json::to_string(&record.grants).unwrap_or_default(),
+                record
+                    .compaction
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+                    .unwrap_or_else(|| "{}".into()),
             ],
         )
         .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -302,6 +338,7 @@ impl ConversationStore {
                         renamed: row.get::<_, Option<i64>>("renamed")?.unwrap_or(0) != 0,
                         updated_at: row.get("updated_at")?,
                         grants: row.get("grants")?,
+                        compaction: row.get("compaction").ok().flatten(),
                     })
                 },
             )
@@ -313,11 +350,19 @@ impl ConversationStore {
             return Ok(None);
         };
 
-        let messages = self.read_jsonl(session_id);
+        let messages = repair_tool_pairing(self.read_jsonl(session_id));
         let (extra_roots, grants) = (
             parse_json_opt(&row.extra_roots).unwrap_or_default(),
             parse_json_opt(&row.grants).unwrap_or(serde_json::json!({})),
         );
+        let compaction = parse_json_opt::<serde_json::Value>(&row.compaction).and_then(|v| {
+            // Treat empty object / null as "never compacted" → None
+            match &v {
+                serde_json::Value::Object(m) if m.is_empty() => None,
+                serde_json::Value::Null => None,
+                other => Some(other.clone()),
+            }
+        });
 
         let display_title = if row.renamed {
             row.title.clone()
@@ -341,6 +386,7 @@ impl ConversationStore {
             updated_at: row.updated_at,
             extra_roots,
             grants,
+            compaction,
             pinned: row.pinned,
             archived: row.archived,
             origin: row.origin,
@@ -420,6 +466,7 @@ impl ConversationStore {
             renamed: row.get::<_, Option<i64>>("renamed")?.unwrap_or(0) != 0,
             updated_at: row.get("updated_at")?,
             grants: row.get("grants")?,
+            compaction: row.get("compaction").unwrap_or(None),
         })
     }
 
@@ -530,6 +577,22 @@ impl ConversationStore {
         Ok(n > 0)
     }
 
+    /// Persist auto-compaction state (OPE-27). `None` clears the column.
+    pub fn update_compaction(
+        &self,
+        session_id: &str,
+        compaction: Option<&serde_json::Value>,
+    ) -> Result<bool, Error> {
+        let conn = self.conn.lock();
+        let blob = compaction
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let n = conn.execute(
+            "UPDATE sessions SET compaction = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            params![blob, session_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Rename a session (sets renamed=1 so auto-titleing skips it).
     pub fn rename(&self, session_id: &str, title: &str) -> Result<bool, Error> {
         // Collapse whitespace but keep single spaces — mirror of Python's `" ".join(split())`.
@@ -604,9 +667,10 @@ impl ConversationStore {
         let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM sessions WHERE session_id = ?", [session_id])?;
         drop(conn);
-        let path = self.jsonl_path(session_id);
-        if path.exists() {
-            fs::remove_file(path).map_err(|e| Error::Io(e.to_string()))?;
+        if let Ok(path) = self.jsonl_path(session_id) {
+            if path.exists() {
+                fs::remove_file(path).map_err(|e| Error::Io(e.to_string()))?;
+            }
         }
         Ok(n > 0)
     }
@@ -659,6 +723,7 @@ struct SessionRow {
     renamed: bool,
     updated_at: Option<String>,
     grants: Option<String>,
+    compaction: Option<String>,
 }
 
 fn parse_json_opt<T: for<'de> serde::Deserialize<'de>>(raw: &Option<String>) -> Option<T> {
@@ -667,6 +732,114 @@ fn parse_json_opt<T: for<'de> serde::Deserialize<'de>>(raw: &Option<String>) -> 
         return None;
     }
     serde_json::from_str(s).ok()
+}
+
+/// Session ids must be a single safe path component — reject traversal (`../`, `/`, `\`).
+pub fn is_safe_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid.len() <= 128
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Reorder messages so every tool result immediately follows its call.
+/// Trailing pending tool_calls (assistant is last message) are left alone for durable resume.
+pub fn repair_tool_pairing(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if messages.is_empty() {
+        return messages;
+    }
+
+    let mut pending_calls: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, m) in messages.iter().enumerate() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        pending_calls.insert(id.to_string(), i);
+                    }
+                }
+            }
+        }
+    }
+    if pending_calls.is_empty() {
+        return messages;
+    }
+
+    let mut found_results: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, m) in messages.iter().enumerate() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
+            if pending_calls.contains_key(id) {
+                found_results.entry(id.to_string()).or_insert(i);
+            }
+        }
+    }
+
+    let last_msg_idx = messages.len() - 1;
+    let trailing_calls: std::collections::HashSet<String> = pending_calls
+        .iter()
+        .filter(|(_, &idx)| idx == last_msg_idx)
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    let mut needs_repair = false;
+    for (call_id, &call_idx) in &pending_calls {
+        if trailing_calls.contains(call_id) && !found_results.contains_key(call_id) {
+            continue;
+        }
+        match found_results.get(call_id) {
+            Some(&result_idx) if result_idx == call_idx + 1 => {}
+            _ => {
+                needs_repair = true;
+                break;
+            }
+        }
+    }
+    if !needs_repair {
+        return messages;
+    }
+
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut repaired: Vec<serde_json::Value> = Vec::new();
+
+    for (i, m) in messages.iter().enumerate() {
+        if m.get("role").and_then(|v| v.as_str()) == Some("assistant")
+            && m.get("tool_calls").and_then(|v| v.as_array()).is_some()
+        {
+            repaired.push(m.clone());
+            if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if let Some(&result_idx) = found_results.get(call_id) {
+                        if consumed.insert(result_idx) {
+                            repaired.push(messages[result_idx].clone());
+                        }
+                    } else if !trailing_calls.contains(call_id) {
+                        repaired.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": "{\"error\": \"tool result was lost during an interrupted turn\"}",
+                        }));
+                    }
+                }
+            }
+        } else if consumed.contains(&i) {
+            continue;
+        } else {
+            repaired.push(m.clone());
+        }
+    }
+    repaired
 }
 
 /// Extract plain text from an OpenAI message content value.
@@ -745,5 +918,56 @@ mod tests {
             "Hello"
         );
         assert_eq!(ConversationStore::title_from_messages(&[]), "New session");
+    }
+
+    #[test]
+    fn rejects_path_traversal_session_id() {
+        assert!(!is_safe_session_id("../evil"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id(""));
+        assert!(is_safe_session_id("abc-123_XYZ"));
+        let dir = tempdir().unwrap();
+        let store = ConversationStore::open(dir.path()).unwrap();
+        let record = SessionRecord {
+            session_id: "../evil".to_string(),
+            workspace: dir.path().to_str().unwrap().to_string(),
+            model: "gpt-5".to_string(),
+            mode: "interactive".to_string(),
+            messages: vec![serde_json::json!({"role": "user", "content": "x"})],
+            ..Default::default()
+        };
+        assert!(store.save(&record).is_err());
+    }
+
+    #[test]
+    fn repair_moves_result_and_skips_trailing_pending() {
+        // Out-of-order: user between assistant tool_calls and tool result.
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "go"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "user", "content": "interrupt"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        let fixed = repair_tool_pairing(msgs);
+        assert_eq!(fixed[1]["role"], "assistant");
+        assert_eq!(fixed[2]["role"], "tool");
+        assert_eq!(fixed[2]["tool_call_id"], "c1");
+        assert_eq!(fixed[3]["role"], "user");
+
+        // Trailing pending — leave alone (durable resume).
+        let pending = vec![
+            serde_json::json!({"role": "user", "content": "go"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{"id": "p1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]
+            }),
+        ];
+        let same = repair_tool_pairing(pending.clone());
+        assert_eq!(same.len(), 2);
+        assert_eq!(same[1]["tool_calls"][0]["id"], "p1");
     }
 }

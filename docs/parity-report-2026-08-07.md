@@ -1,8 +1,9 @@
 # OpenWorker Rust 还原度详细核验报告（源码对照）
 
-- 日期：2026-08-07
+- 日期：2026-08-07（正文仍为当日源码对照；**缺口表请以 [RUST-PARITY-AUDIT.md §7](RUST-PARITY-AUDIT.md) 2026-09-05 上游 `5bc10d9` 同步为准**）
 - 方法：逐子系统源码对照（Python `coworker/` 参考实现 vs Rust `crates/`），不依赖动态差分
-- 基线：`cargo test --workspace` 116/116 通过；`pytest tests -q`（Python 3.12）**947 passed / 1 skipped / 0 failed**
+- 基线（2026-08-07）：`cargo test --workspace` 116/116 通过；`pytest tests -q`（Python 3.12）**947 passed / 1 skipped / 0 failed**
+- 基线（2026-09-05 同步后）：Python 参考已覆盖上游 `5bc10d9`；`pytest` ~1911 passed；`cargo test --workspace --lib` 全绿；GUI `vitest` 142 passed
 - 配套：本报告细化并修正 [RUST-PARITY-AUDIT.md](RUST-PARITY-AUDIT.md) 的结论
 
 ---

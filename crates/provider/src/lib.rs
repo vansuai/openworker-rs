@@ -17,6 +17,7 @@
 
 mod anthropic;
 mod bedrock;
+mod codex;
 mod error;
 mod friendly_error;
 #[allow(dead_code)]
@@ -26,15 +27,20 @@ mod matrix;
 #[allow(dead_code)]
 #[allow(clippy::double_ended_iterator_last, clippy::while_let_on_iterator)]
 mod openai;
+mod openai_responses;
 mod registry;
 mod router;
 mod tool_args;
 mod types;
 mod vertex;
 
+pub use codex::{new_client as new_codex_client, CodexClient, CODEX_BASE_URL};
 pub use error::Error;
 pub use friendly_error::friendly_model_error;
 pub use matrix::{entry_for, model_context_windows, model_labels, models_for_provider, MATRIX};
+pub use openai_responses::{
+    convert_messages, convert_tools, is_stock_openai_base, parse_response, OpenAiResponsesClient,
+};
 pub use registry::{
     all_descriptors, get_descriptor, ProviderConfig, ProviderDescriptor, ProviderField,
 };

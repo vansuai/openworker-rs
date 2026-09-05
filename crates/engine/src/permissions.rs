@@ -13,8 +13,10 @@ pub enum Mode {
     /// Ask for approval on writes/shell (default).
     #[default]
     Interactive,
-    /// Full access.
+    /// Full access (bypass approvals; legacy spelling `"auto"`).
     Auto,
+    /// Interactive, but an LLM reviewer may turn `needs_user` into allow first.
+    AutoApprove,
     /// Interactive + auto-allow the configured auto_allow tools.
     Custom,
 }
@@ -26,7 +28,8 @@ impl Mode {
             "discuss" => Mode::Discuss,
             "plan" => Mode::Plan,
             "interactive" => Mode::Interactive,
-            "auto" => Mode::Auto,
+            "auto" | "bypass-approvals" => Mode::Auto,
+            "auto-approve" => Mode::AutoApprove,
             "custom" => Mode::Custom,
             _ => Mode::Interactive,
         }
@@ -38,6 +41,7 @@ impl Mode {
             Mode::Plan => "plan",
             Mode::Interactive => "interactive",
             Mode::Auto => "auto",
+            Mode::AutoApprove => "auto-approve",
             Mode::Custom => "custom",
         }
     }
@@ -48,9 +52,11 @@ impl Mode {
 pub enum RiskClass {
     /// Reads — always allowed.
     Read,
+    /// Network egress — request itself can carry data off-machine (OPE-111).
+    Egress,
     /// Write to local filesystem.
     WriteLocal,
-    /// External side effects (network calls, email, etc.).
+    /// External side effects (connectors, MCP, messaging).
     External,
     /// Shell / exec.
     Exec,
@@ -59,6 +65,17 @@ pub enum RiskClass {
 impl RiskClass {
     pub fn is_consequential(&self) -> bool {
         !matches!(self, RiskClass::Read)
+    }
+
+    /// Strictness rank for override-tightening (OPE-136): higher = stricter.
+    /// Overrides may only tighten (or match) a floored base class.
+    pub fn strictness(self) -> u8 {
+        match self {
+            RiskClass::Read => 0,
+            RiskClass::Egress => 1,
+            RiskClass::External => 2,
+            RiskClass::WriteLocal | RiskClass::Exec => 3,
+        }
     }
 }
 
@@ -105,27 +122,95 @@ impl Decision {
     }
 }
 
-/// Classify a tool call's risk by name (the lightweight fallback — full metadata
-/// classification lives in Python's `risk.py`).
+const WRITE_TOOLS: &[&str] = &[
+    "write_file",
+    "replace_in_file",
+    "apply_patch",
+    "apply_unified_diff",
+    "edit_file",
+    "create_directory",
+    "move_file",
+    "delete_file",
+    "delete_directory",
+];
+
+const EGRESS_TOOLS: &[&str] = &[
+    "web_fetch",
+    "web_search",
+    "browser_open_url",
+    "apollo_enrich_person",
+    "apollo_enrich_company",
+    "apollo_search_people",
+    "hunter_domain_search",
+    "hunter_find_email",
+    "hunter_verify_email",
+];
+
+/// Classify a tool call's risk by name + optional metadata (mirrors Python `risk.classify`).
+///
+/// OPE-136: third-party MCP tools (`category == "mcp"`, or bare `mcp__*` with no metadata)
+/// are floored to EXTERNAL; overrides may only tighten, never loosen a floored base.
 pub fn classify_risk(tool_name: &str) -> RiskClass {
-    match tool_name {
-        "shell" | "bash" | "zsh" => RiskClass::Exec,
-        "read_file"
-        | "read_multiple_files"
-        | "glob"
-        | "grep"
-        | "search_files"
-        | "web_search"
-        | "web_fetch"
-        | "read" => RiskClass::Read,
-        "write_file" | "edit_file" | "create_directory" | "move_file" | "delete_file"
-        | "delete_directory" => RiskClass::WriteLocal,
-        // Default to Read — mirrors Python's `classify()` which returns
-        // RiskClass.READ for any tool not explicitly listed as high-risk
-        // and not flagged `requires_approval` in its metadata. Unknown
-        // tools are treated as safe reads rather than blocked.
-        _ => RiskClass::Read,
+    classify_risk_with(tool_name, None, None)
+}
+
+/// Full classification with metadata + optional override resolver.
+pub fn classify_risk_with(
+    tool_name: &str,
+    metadata: Option<&serde_json::Value>,
+    overrides: Option<&dyn Fn(&str) -> Option<RiskClass>>,
+) -> RiskClass {
+    let base = base_risk(tool_name).or_else(|| mcp_floor(tool_name, metadata));
+
+    if let Some(resolver) = overrides {
+        if let Some(ov) = resolver(tool_name) {
+            match base {
+                None => return ov,
+                Some(b) if ov.strictness() >= b.strictness() => return ov,
+                Some(_) => {} // Loosening override on a floored tool is ignored.
+            }
+        }
     }
+    if let Some(b) = base {
+        return b;
+    }
+    let requires_approval = metadata
+        .and_then(|m| m.get("requires_approval"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if requires_approval {
+        return RiskClass::External;
+    }
+    RiskClass::Read
+}
+
+fn base_risk(tool_name: &str) -> Option<RiskClass> {
+    if matches!(tool_name, "run_shell" | "shell" | "bash" | "zsh") {
+        return Some(RiskClass::Exec);
+    }
+    if WRITE_TOOLS.contains(&tool_name) {
+        return Some(RiskClass::WriteLocal);
+    }
+    if EGRESS_TOOLS.contains(&tool_name) {
+        return Some(RiskClass::Egress);
+    }
+    None
+}
+
+/// OPE-136 MCP floor: third-party MCP tools are always EXTERNAL.
+fn mcp_floor(tool_name: &str, metadata: Option<&serde_json::Value>) -> Option<RiskClass> {
+    let category = metadata
+        .and_then(|m| m.get("category"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if category == "mcp" {
+        return Some(RiskClass::External);
+    }
+    // Bare name without registration sticker fails closed.
+    if metadata.is_none() && tool_name.starts_with("mcp__") {
+        return Some(RiskClass::External);
+    }
+    None
 }
 
 const READ_ONLY_MODES: [Mode; 2] = [Mode::Discuss, Mode::Plan];
@@ -157,6 +242,10 @@ pub struct PermissionEngine {
     auto_allow_tools: HashSet<String>,
     session_allow_tools: HashSet<String>,
     session_allow_commands: HashSet<String>,
+    /// OPE-136 run grants ("Allow for this request"): in-memory, cleared at run boundary.
+    run_allow_tools: HashSet<String>,
+    /// Durable MCP trust rules (tool name → trusted). Waives card only, not the class.
+    trust_tools: HashSet<String>,
     task_rules: TaskRules,
     roots: Vec<ResolvedRoot>,
 }
@@ -181,6 +270,8 @@ impl PermissionEngine {
             auto_allow_tools: HashSet::new(),
             session_allow_tools: HashSet::new(),
             session_allow_commands: HashSet::new(),
+            run_allow_tools: HashSet::new(),
+            trust_tools: HashSet::new(),
             task_rules: HashMap::new(),
             roots,
         }
@@ -222,6 +313,25 @@ impl PermissionEngine {
         self.session_allow_tools.insert(tool_name);
     }
 
+    /// OPE-136: allow a tool for the remainder of the current run only.
+    pub fn allow_tool_for_run(&mut self, tool_name: String) {
+        self.run_allow_tools.insert(tool_name);
+    }
+
+    /// Clear run-scoped grants (call at run start/end).
+    pub fn clear_run_grants(&mut self) {
+        self.run_allow_tools.clear();
+    }
+
+    /// OPE-136 durable trust: mark an MCP tool as "don't ask" (card waiver only).
+    pub fn trust_tool(&mut self, tool_name: String) {
+        self.trust_tools.insert(tool_name);
+    }
+
+    pub fn set_trust_tools(&mut self, tools: HashSet<String>) {
+        self.trust_tools = tools;
+    }
+
     /// Allow a command for this session.
     pub fn allow_command_for_session(&mut self, command: String) {
         if !command.is_empty() {
@@ -251,27 +361,14 @@ impl PermissionEngine {
         let args_map: &serde_json::Map<String, serde_json::Value> =
             arguments.as_object().unwrap_or(&empty);
 
-        // Extract metadata fields
-        let risk_level = metadata
-            .and_then(|m| m.get("risk_level"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         let category = metadata
             .and_then(|m| m.get("category"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let is_connector = category == "connector";
+        let is_mcp = category == "mcp";
 
-        let risk = if !risk_level.is_empty() {
-            match risk_level {
-                "low" => RiskClass::Read,
-                "write" => RiskClass::WriteLocal,
-                "exec" => RiskClass::Exec,
-                _ => classify_risk(tool_name),
-            }
-        } else {
-            classify_risk(tool_name)
-        };
+        let risk = classify_risk_with(tool_name, metadata, None);
 
         let is_write = risk == RiskClass::WriteLocal;
         let is_shell = risk == RiskClass::Exec;
@@ -316,6 +413,25 @@ impl PermissionEngine {
 
         if !is_connector && self.session_allow_tools.contains(tool_name) {
             return Decision::allow("tool allowed for session");
+        }
+
+        // OPE-136 run grant — covers EXTERNAL/MCP retries within this run.
+        if self.run_allow_tools.contains(tool_name) {
+            return Decision::allow("tool allowed for this request");
+        }
+
+        // OPE-136: MCP trust waives the card only (class stays EXTERNAL).
+        if is_mcp {
+            if self.trust_tools.contains(tool_name) {
+                return Decision::allow("trusted MCP tool (user trust rule)");
+            }
+            let requires_approval = metadata
+                .and_then(|m| m.get("requires_approval"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !requires_approval {
+                return Decision::allow("trusted MCP tool (server marked don't-ask)");
+            }
         }
 
         if let Some(targets) = self.task_rules.get(tool_name) {
@@ -441,12 +557,17 @@ pub fn standing_target_candidate(
     tool_name: &str,
     args: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    // Mirror Python's `classify(...) is not RiskClass.EXTERNAL → None`: write-local
-    // and exec tools never mint standing rules.
-    if matches!(
-        classify_risk(tool_name),
-        RiskClass::WriteLocal | RiskClass::Exec
-    ) {
+    standing_target_candidate_with(tool_name, args, None)
+}
+
+/// Like [`standing_target_candidate`], but with tool metadata so `send_message`
+/// (requires_approval) and MCP tools classify as EXTERNAL correctly.
+pub fn standing_target_candidate_with(
+    tool_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    if classify_risk_with(tool_name, metadata, None) != RiskClass::External {
         return None;
     }
     let arg = target_arg_for(tool_name)?;
@@ -531,20 +652,16 @@ mod tests {
 
     #[test]
     fn standing_target_candidate_rules() {
-        // Target-arg tools with a non-empty target → Some.
-        assert_eq!(
-            standing_target_candidate("send_message", &args(&[("target", "alice")])),
-            Some("alice".to_string())
-        );
-        assert_eq!(
-            standing_target_candidate("connector__slack", &args(&[("target", "#general")])),
-            Some("#general".to_string())
-        );
+        // MCP tools are floored EXTERNAL → eligible when they name a target.
         assert_eq!(
             standing_target_candidate("mcp__x", &args(&[("target", "t")])),
             Some("t".to_string())
         );
-        // Write-local / exec tools never mint standing rules.
+        assert_eq!(
+            standing_target_candidate("connector__slack", &args(&[("target", "#general")])),
+            None // connector__* without metadata is READ, not EXTERNAL
+        );
+        // Write-local / exec / egress never mint standing rules.
         assert_eq!(
             standing_target_candidate("write_file", &args(&[("path", "/tmp/a")])),
             None
@@ -553,33 +670,84 @@ mod tests {
             standing_target_candidate("shell", &args(&[("command", "ls")])),
             None
         );
-        // web_search has no target arg → None.
         assert_eq!(
             standing_target_candidate("web_search", &args(&[("query", "x")])),
             None
         );
-        // Empty / missing target → None.
+        // Bare send_message without EXTERNAL metadata → not eligible.
         assert_eq!(
-            standing_target_candidate("send_message", &args(&[("target", "  ")])),
-            None
-        );
-        assert_eq!(
-            standing_target_candidate("send_message", &serde_json::Map::new()),
+            standing_target_candidate("send_message", &args(&[("target", "alice")])),
             None
         );
     }
 
     #[test]
+    fn mcp_floor_and_egress_classification() {
+        assert_eq!(classify_risk("web_fetch"), RiskClass::Egress);
+        assert_eq!(classify_risk("web_search"), RiskClass::Egress);
+        assert_eq!(classify_risk("run_shell"), RiskClass::Exec);
+        assert_eq!(classify_risk("write_file"), RiskClass::WriteLocal);
+        // Bare mcp__* fails closed to EXTERNAL.
+        assert_eq!(classify_risk("mcp__notion__get_page"), RiskClass::External);
+        // category=mcp floors even with requires_approval:false.
+        let meta = json!({"category": "mcp", "requires_approval": false});
+        assert_eq!(
+            classify_risk_with("mcp__custom__read", Some(&meta), None),
+            RiskClass::External
+        );
+        // category=connector is NOT floored by MCP rule (catalog knowledge).
+        let connector = json!({"category": "connector", "requires_approval": false});
+        assert_eq!(
+            classify_risk_with("mcp__jira__getJiraIssue", Some(&connector), None),
+            RiskClass::Read
+        );
+    }
+
+    #[test]
+    fn override_cannot_loosen_mcp_floor() {
+        let meta = json!({"category": "mcp"});
+        let loosen = |_name: &str| Some(RiskClass::Read);
+        assert_eq!(
+            classify_risk_with("mcp__x__y", Some(&meta), Some(&loosen)),
+            RiskClass::External
+        );
+        let tighten = |_name: &str| Some(RiskClass::Exec);
+        assert_eq!(
+            classify_risk_with("mcp__x__y", Some(&meta), Some(&tighten)),
+            RiskClass::Exec
+        );
+    }
+
+    #[test]
+    fn run_grant_and_trust_auto_allow() {
+        let mut engine = PermissionEngine::new(std::path::PathBuf::from("/tmp"));
+        let meta = json!({"category": "mcp", "requires_approval": true});
+        let d = engine.evaluate("mcp__x__y", &json!({"a": 1}), Some(&meta));
+        assert!(!d.allowed && d.needs_user);
+
+        engine.allow_tool_for_run("mcp__x__y".to_string());
+        let d = engine.evaluate("mcp__x__y", &json!({"a": 1}), Some(&meta));
+        assert!(d.allowed, "run grant should allow: {d:?}");
+
+        engine.clear_run_grants();
+        engine.trust_tool("mcp__x__y".to_string());
+        let d = engine.evaluate("mcp__x__y", &json!({"a": 1}), Some(&meta));
+        assert!(d.allowed, "trust should waive card: {d:?}");
+    }
+
+    #[test]
     fn add_task_rule_auto_allows_next_call() {
         let mut engine = PermissionEngine::new(std::path::PathBuf::from("/tmp"));
-        engine.add_task_rule("send_message".to_string(), "alice".to_string());
-        let meta = json!({"risk_level": "write"});
-        // Same tool + target → allowed by the minted rule.
-        let d = engine.evaluate("send_message", &json!({"target": "alice"}), Some(&meta));
+        engine.add_task_rule("mcp__svc__act".to_string(), "alice".to_string());
+        let meta = json!({"category": "mcp"});
+        let d = engine.evaluate(
+            "mcp__svc__act",
+            &json!({"target": "alice"}),
+            Some(&meta),
+        );
         assert!(d.allowed, "expected rule hit, got {d:?}");
-        assert_eq!(d.rule, "send_message → alice");
-        // A different target still asks.
-        let d = engine.evaluate("send_message", &json!({"target": "bob"}), Some(&meta));
+        assert_eq!(d.rule, "mcp__svc__act → alice");
+        let d = engine.evaluate("mcp__svc__act", &json!({"target": "bob"}), Some(&meta));
         assert!(!d.allowed && d.needs_user, "expected ask, got {d:?}");
     }
 }

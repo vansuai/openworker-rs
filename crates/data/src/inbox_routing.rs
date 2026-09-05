@@ -184,6 +184,72 @@ impl InboxRouting {
     }
 }
 
+// Decision keywords for a channel reply — matched against the LEADING word/emoji only
+// (mirrors Python `_reply_intent`). Substring matching inverted "disallow"/"cannot approve".
+const ALLOW_WORDS: &[&str] = &["approve", "approved", "allow", "allowed", "yes"];
+const DENY_WORDS: &[&str] = &["deny", "denied", "reject", "rejected", "no"];
+const ALLOW_EMOJI: &[&str] = &["👍", "✅"];
+const DENY_EMOJI: &[&str] = &["👎", "❌"];
+const TOKEN_TRIM: &[char] = &['.', ',', '!', '?', ':', ';', '\'', '"', '(', ')'];
+
+/// Allow/deny intent from the first word (or emoji) of a reply, else None.
+pub fn reply_intent(text: &str) -> Option<&'static str> {
+    let first = text.split_whitespace().next().unwrap_or("");
+    if ALLOW_EMOJI.iter().any(|e| first.starts_with(e)) {
+        return Some("allow");
+    }
+    if DENY_EMOJI.iter().any(|e| first.starts_with(e)) {
+        return Some("deny");
+    }
+    let word = first.trim_matches(TOKEN_TRIM).to_ascii_lowercase();
+    if ALLOW_WORDS.contains(&word.as_str()) {
+        return Some("allow");
+    }
+    if DENY_WORDS.contains(&word.as_str()) {
+        return Some("deny");
+    }
+    None
+}
+
+/// Correlate an inbound channel reply to its item (by the embedded `[ow:<id>]` /
+/// legacy `[ocw:…]` token) and resolve it. Returns the resolve() result, or None
+/// if no item id was found.
+pub fn resolve_from_reply<F>(reply: &str, mut resolve: F) -> Option<bool>
+where
+    F: FnMut(&str, &str) -> bool,
+{
+    let (item_id, text) = extract_ow_token(reply)?;
+    let resolution = reply_intent(&text).unwrap_or(text.as_str());
+    Some(resolve(&item_id, resolution))
+}
+
+fn extract_ow_token(reply: &str) -> Option<(String, String)> {
+    // Match `[ow:<hex>]` or legacy `[ocw:<hex>]` with ≥6 hex digits.
+    let bytes = reply.as_bytes();
+    let mut i = 0;
+    while i + 5 < bytes.len() {
+        if bytes[i] == b'['
+            && (reply[i..].starts_with("[ow:") || reply[i..].starts_with("[ocw:"))
+        {
+            let prefix_len = if reply[i..].starts_with("[ocw:") { 5 } else { 4 };
+            let start = i + prefix_len;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end - start >= 6 && end < bytes.len() && bytes[end] == b']' {
+                let id = reply[start..end].to_string();
+                let text = format!("{}{}", &reply[..i], &reply[end + 1..])
+                    .trim()
+                    .to_string();
+                return Some((id, text));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +277,26 @@ mod tests {
         let b = r.binding_for("work");
         assert_eq!(b.channel.as_deref(), Some("slack"));
         assert_eq!(b.target, "C123");
+    }
+
+    #[test]
+    fn reply_intent_leading_word_only() {
+        assert_eq!(reply_intent("yes please"), Some("allow"));
+        assert_eq!(reply_intent("👍 go"), Some("allow"));
+        assert_eq!(reply_intent("No."), Some("deny"));
+        assert_eq!(reply_intent("disallow this"), None); // not leading allow-word
+        assert_eq!(reply_intent("I cannot approve this yet"), None);
+        assert_eq!(reply_intent("approve"), Some("allow"));
+    }
+
+    #[test]
+    fn resolve_from_reply_extracts_token() {
+        let mut seen = None;
+        let ok = resolve_from_reply("approve [ow:abcdef]", |id, res| {
+            seen = Some((id.to_string(), res.to_string()));
+            true
+        });
+        assert_eq!(ok, Some(true));
+        assert_eq!(seen, Some(("abcdef".to_string(), "allow".to_string())));
     }
 }

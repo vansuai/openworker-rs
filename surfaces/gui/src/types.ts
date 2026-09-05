@@ -39,7 +39,15 @@ export type ApprovalDecision =
   | "deny"
   | "always_tool"
   | "always_command"
+  | "always_domain"
   | "always_task"
+  // OPE-136 §4: durable per-MCP-tool trust — writes a rule to the user-local
+  // override store; survives sessions; revocable on the server's detail page.
+  | "always_trust"
+  // OPE-136 run grant: covers the exact tool for the remainder of the current
+  // answer only; in-memory, cleared at the run boundary. EXTERNAL family only.
+  | "this_run"
+  | "readonly_session"
   | "stale";
 
 export interface TodoItem {
@@ -122,12 +130,20 @@ export type Item =
       // The exact target a standing rule could pin (server-computed) — with a run
       // context, the card offers "Allow every time" (§25).
       standingTarget?: string;
+      // web_search only (§1.9): the LIVE configured provider name.
+      searchProvider?: string;
+      // OPE-114 §1: file the agent itself created/downloaded this session.
+      provenance?: string;
+      // Auto-Approve reviewer answered `unsure` and raised this card.
+      reviewerUnsure?: string;
+      // Server-classified: this shell command only reads locally.
+      readonlyOk?: boolean;
+      // OPE-136: where an MCP call goes ({transport, host}).
+      mcpDestination?: { transport: string; host?: string };
       resolved?: ApprovalDecision;
-      // Server-supplied Inbox id (attended WS broadcast + unattended mirror). The
-      // approval reply round-trips this id so a reconnect or second device converges
-      // to the same resolution.
+      // Server-supplied Inbox id (attended WS broadcast + unattended mirror).
       itemId?: string;
-      // Server-supplied OpenAI tool_call_id (the engine-side correlation handle).
+      // Server-supplied OpenAI tool_call_id.
       toolCallId?: string;
     }
   | {
@@ -143,13 +159,30 @@ export type Item =
       resolved?: "approved" | "rejected";
     }
   | {
+      // Decomposition gate (agent teams): lead proposes work items; approval creates them on the board.
+      kind: "itemsreq";
+      items: { title: string; criteria: string }[];
+      note?: string;
+      resolved?: "approved" | "rejected";
+    }
+  | {
       // A live ask_user prompt (attended sessions answer inline; unattended ones route to the Inbox).
       kind: "question";
       question: string;
       header?: string;
-      options?: string[];
+      options?: QuestionOption[];
       allow_text?: boolean;
       multi?: boolean;
       resolved?: string;
     }
   | { kind: "notice"; tone: "info" | "warn"; text: string; retriable?: boolean };
+
+/** Rich or plain ask_user options (OPE-51). */
+export type QuestionOption =
+  | string
+  | {
+      label: string;
+      description?: string;
+      recommended?: boolean;
+      preview?: string;
+    };

@@ -18,7 +18,11 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 use ocw_data::VIS_INBOX;
 use ocw_data::VIS_INLINE;
-use ocw_engine::{ApprovalOutcome, Approver, PermissionRequest};
+use ocw_engine::{
+    parse_reviewer_response, build_review_prompt, ApprovalOutcome, Approver,
+    PermissionRequest, ReviewerDecision, ReviewerFn, REVIEWER_INSTRUCTIONS,
+};
+use ocw_provider::Provider;
 use ocw_skills::{LoadSkillTool, SkillLoader};
 use ocw_tools;
 
@@ -28,6 +32,39 @@ const MAX_MESSAGE_TEXT_CHARS: usize = 200_000;
 const MAX_ATTACHMENTS: usize = 8;
 const MAX_ATTACHMENTS_BYTES: usize = 15_000_000;
 const MAX_IMAGE_CHARS: usize = 12_000_000;
+
+/// Live Auto-Approve reviewer: same model as the session, fail-closed to Unsure.
+fn make_session_reviewer(provider: StdArc<dyn Provider>, model: String) -> ReviewerFn {
+    StdArc::new(move |tool, args, users, provenance| {
+        let provider = StdArc::clone(&provider);
+        let model = model.clone();
+        Box::pin(async move {
+            let mut prompt = build_review_prompt(&users, &tool, &args, &[]);
+            if !provenance.is_empty() {
+                prompt.push_str("\n\nPROVENANCE:\n");
+                prompt.push_str(&provenance);
+            }
+            let messages = vec![
+                json!({"role": "system", "content": REVIEWER_INSTRUCTIONS}),
+                json!({"role": "user", "content": prompt}),
+            ];
+            let settings = json!({"max_tokens": 256});
+            match tokio::task::spawn_blocking(move || {
+                provider.complete(&model, messages, None, settings)
+            })
+            .await
+            {
+                Ok(Ok(turn)) => {
+                    parse_reviewer_response(turn.text.as_deref().unwrap_or(""))
+                }
+                _ => ReviewerDecision {
+                    verdict: ocw_engine::ReviewerVerdict::Unsure,
+                    reason: "reviewer unavailable".into(),
+                },
+            }
+        })
+    })
+}
 const MAX_PDF_CHARS: usize = 15_000_000;
 const MAX_TEXT_CHARS: usize = 200_000;
 
@@ -387,11 +424,19 @@ async fn init_engine(state: &AppState, ctx: &SessionCtx) {
         system_messages,
     )
     .with_audit_sink(make_audit_sink(state.clone()))
+    .with_workspace_root(workspace.to_string())
     .with_context_provider(|| {
         chrono::Local::now()
             .format("Current date: %Y-%m-%d")
             .to_string()
     });
+    if let Ok(Some(record)) = state.conversation_store.load(&ctx.session_id) {
+        if let Some(raw) = record.compaction {
+            if let Some(cs) = ocw_engine::CompactionState::from_value(&raw) {
+                eng.set_compaction_state(Some(cs));
+            }
+        }
+    }
     {
         let mut ctx_map = serde_json::Map::new();
         ctx_map.insert("session_id".into(), serde_json::Value::String(ctx.session_id.clone()));
@@ -447,8 +492,21 @@ fn make_inbox_approver(
             };
             let task_id = owning_task.as_ref().map(|t| t.id.clone());
             let task_title = owning_task.as_ref().map(|t| t.title.clone());
-            let standing_target =
-                ocw_engine::standing_target_candidate(&req.tool_name, &req.arguments);
+            let meta = if !req.category.is_empty() {
+                Some(serde_json::json!({
+                    "category": req.category,
+                    "requires_approval": true,
+                }))
+            } else if matches!(req.tool_name.as_str(), "send_message" | "send_file") {
+                Some(serde_json::json!({"requires_approval": true}))
+            } else {
+                None
+            };
+            let standing_target = ocw_engine::standing_target_candidate_with(
+                &req.tool_name,
+                &req.arguments,
+                meta.as_ref(),
+            );
             let args_value = permission_args_to_value(&req);
             let title = format!("Run `{}`?", req.tool_name);
             let mut parts: Vec<String> = Vec::new();
@@ -576,6 +634,10 @@ fn map_approval_resolution(resolution: &str) -> ApprovalOutcome {
         "once" | "allow" => ApprovalOutcome::Once,
         "always_tool" | "always" => ApprovalOutcome::AlwaysTool,
         "always_command" => ApprovalOutcome::AlwaysCommand,
+        "always_domain" => ApprovalOutcome::AlwaysDomain,
+        "readonly_session" => ApprovalOutcome::ReadonlySession,
+        "always_trust" => ApprovalOutcome::AlwaysTrust,
+        "this_run" => ApprovalOutcome::ThisRun,
         _ => ApprovalOutcome::Deny,
     }
 }
@@ -587,6 +649,10 @@ fn approval_decision_to_resolution(decision: &str) -> String {
         "once" => "once".to_string(),
         "always_tool" => "always_tool".to_string(),
         "always_command" => "always_command".to_string(),
+        "always_domain" => "always_domain".to_string(),
+        "readonly_session" => "readonly_session".to_string(),
+        "always_trust" => "always_trust".to_string(),
+        "this_run" => "this_run".to_string(),
         // "Allow every time" on a run-session approval card (§25): pass through
         // so the approver's `wait` sees it and mints the standing task rule.
         "always_task" => "always_task".to_string(),
@@ -1358,11 +1424,20 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
         )
         .with_audit_sink(make_audit_sink(state.clone()))
         .with_cancel(StdArc::clone(&run.cancel))
+        .with_workspace_root(workspace.clone())
         .with_context_provider(|| {
             chrono::Local::now()
                 .format("Current date: %Y-%m-%d")
                 .to_string()
         });
+        // Restore compaction state from the durable session record when present.
+        if let Ok(Some(record)) = state.conversation_store.load(&session_id) {
+            if let Some(raw) = record.compaction {
+                if let Some(cs) = ocw_engine::CompactionState::from_value(&raw) {
+                    eng.set_compaction_state(Some(cs));
+                }
+            }
+        }
         {
             let mut ctx_map = serde_json::Map::new();
             ctx_map.insert("session_id".into(), serde_json::Value::String(session_id.clone()));
@@ -1391,6 +1466,11 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
     // time" mint can hot-update task_rules mid-run (mirrors Python's direct
     // `engine.permissions.task_rules` mutation in `mint_task_rule`).
     let perms = eng.permissions_handle();
+    let reviewer_model = state
+        .get_session_sync(&session_id)
+        .map(|s| s.model)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| state.default_model_or_configured());
     eng = eng
         .with_approver(make_inbox_approver(
             state.clone(),
@@ -1412,6 +1492,11 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             state.clone(),
             session_id.clone(),
             Some(persona_id),
+        ))
+        .with_is_attended(|| true)
+        .with_reviewer(make_session_reviewer(
+            StdArc::clone(&state.provider),
+            reviewer_model,
         ))
         .with_cancel(StdArc::clone(&run.cancel));
 
@@ -1493,6 +1578,8 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
         let grants = eng.grants().await;
         state.persist_turn(&session_id2);
         state.persist_grants(&session_id2, &grants);
+        let compaction_val = eng.compaction_state().map(|s| s.as_value());
+        state.persist_compaction(&session_id2, compaction_val.as_ref());
         state.maybe_autotitle(&session_id2);
         state.broadcast_sync(&session_id2, json!({"type": "turn_done", "data": {}}));
         *run2.engine.write() = Some(eng);
@@ -1615,6 +1702,8 @@ async fn on_retry(ctx: SessionCtx, state: AppState) {
                 state.persist_engine_messages_inner(&session_id2, &all_messages);
                 state.persist_turn(&session_id2);
                 state.persist_grants(&session_id2, &eng.grants().await);
+                let compaction_val = eng.compaction_state().map(|s| s.as_value());
+                state.persist_compaction(&session_id2, compaction_val.as_ref());
                 state.maybe_autotitle(&session_id2);
                 state.broadcast_sync(&session_id2, json!({"type": "turn_done", "data": {}}));
             }
@@ -1830,7 +1919,7 @@ mod tests {
 
         // The live engine hot-updated: the next call with the same target auto-allows.
         let guard = perms.lock().await;
-        let meta = json!({"risk_level": "write"});
+        let meta = json!({"requires_approval": true, "category": "connector"});
         let d = guard.evaluate("send_message", &json!({"target": "alice"}), Some(&meta));
         assert!(d.allowed, "expected rule hit, got {d:?}");
         assert_eq!(d.rule, "send_message → alice");

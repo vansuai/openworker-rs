@@ -44,6 +44,18 @@ describe("addTurnUsage", () => {
     const u = addTurnUsage(emptyUsage(), turn({ model: undefined }));
     expect(u.byModel["unknown"].input).toBe(100);
   });
+
+  it("uses fallbackModel when the sidecar omits model", () => {
+    const u = addTurnUsage(emptyUsage(), turn({ model: undefined }), "minimax:MiniMax-M3");
+    expect(Object.keys(u.byModel)).toEqual(["minimax:MiniMax-M3"]);
+    expect(u.byModel["minimax:MiniMax-M3"].model).toBe("minimax:MiniMax-M3");
+    expect(u.byModel["minimax:MiniMax-M3"].input).toBe(100);
+  });
+
+  it("prefers the sidecar model over fallbackModel", () => {
+    const u = addTurnUsage(emptyUsage(), turn(), "gpt-5.5");
+    expect(Object.keys(u.byModel)).toEqual(["anthropic:claude-fable-5"]);
+  });
 });
 
 describe("usageFromMessages", () => {
@@ -57,6 +69,14 @@ describe("usageFromMessages", () => {
     ]);
     expect(u.byModel["anthropic:claude-fable-5"].input).toBe(400);
     expect(u.context).toBe(360);
+  });
+
+  it("applies fallbackModel to sidecars that omit model", () => {
+    const u = usageFromMessages(
+      [{ role: "assistant", content: "a", usage: turn({ model: undefined }) as any }],
+      "minimax:MiniMax-M3",
+    );
+    expect(Object.keys(u.byModel)).toEqual(["minimax:MiniMax-M3"]);
   });
 });
 

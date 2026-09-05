@@ -1108,6 +1108,86 @@ pub async fn handler_mcp_tools(
     }
 }
 
+fn risk_override_store(state: &AppState) -> ocw_data::RiskOverrideStore {
+    let path = state.config.data_dir.join("risk_overrides.json");
+    ocw_data::RiskOverrideStore::open(Some(path))
+}
+
+/// OPE-136: list durable per-tool trust rules for an MCP server.
+pub async fn handler_mcp_trust_list(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    let Some(server) = state.mcp_store.get(&name) else {
+        return Json(json!({"ok": false, "error": format!("server '{name}' not found")}));
+    };
+    let store = risk_override_store(&state);
+    let tools = store.trusted_for_server(&name);
+    let legacy_dont_ask = !server.requires_approval;
+    Json(json!({
+        "ok": true,
+        "tools": tools,
+        "legacy_dont_ask": legacy_dont_ask,
+    }))
+}
+
+/// OPE-136: revoke one durable trust rule.
+pub async fn handler_mcp_trust_revoke(
+    State(state): State<AppState>,
+    Path((name, tool)): Path<(String, String)>,
+) -> Json<Value> {
+    if state.mcp_store.get(&name).is_none() {
+        return Json(json!({"ok": false, "error": format!("server '{name}' not found")}));
+    }
+    let store = risk_override_store(&state);
+    let full = if tool.starts_with("mcp__") {
+        tool
+    } else {
+        format!("mcp__{name}__{tool}")
+    };
+    let ok = store.revoke_trust(&full);
+    Json(json!({"ok": ok, "tool": full}))
+}
+
+/// OPE-136: migrate legacy server-wide don't-ask → per-tool trust rules.
+pub async fn handler_mcp_trust_convert(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    let Some(server) = state.mcp_store.get(&name) else {
+        return Json(json!({"ok": false, "error": format!("server '{name}' not found")}));
+    };
+    let store = risk_override_store(&state);
+    let mut trusted = Vec::new();
+    match state.mcp_runtime.tools_for(&server).await {
+        Ok(tools) => {
+            for t in tools {
+                let full = if t.name.starts_with("mcp__") {
+                    t.name.clone()
+                } else {
+                    format!("mcp__{name}__{}", t.name)
+                };
+                store.set_trust(&full);
+                trusted.push(full);
+            }
+        }
+        Err(e) => return Json(json!({"ok": false, "error": e})),
+    }
+    // Clear the legacy flag so the floor + trust rules own the behavior.
+    let _ = state
+        .mcp_store
+        .update(&name, json!({"requires_approval": true}));
+    Json(json!({"ok": true, "trusted": trusted}))
+}
+
+pub async fn handler_mcp_config_reveal(State(state): State<AppState>) -> Json<Value> {
+    let path = state.config.data_dir.join("mcp.json");
+    Json(json!({
+        "ok": true,
+        "path": path.to_string_lossy(),
+    }))
+}
+
 pub async fn handler_mcp_connect(
     State(state): State<AppState>,
     Path(name): Path<String>,

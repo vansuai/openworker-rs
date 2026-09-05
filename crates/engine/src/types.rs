@@ -102,6 +102,10 @@ pub enum Message {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ts: Option<f64>,
+        /// Display-only sidecar (approval chips, filter counts). Stripped from
+        /// provider wire via [`Self::to_wire`]; persisted for the GUI.
+        #[serde(rename = "_display", default, skip_serializing_if = "Option::is_none")]
+        display: Option<Value>,
     },
     /// Display-only marker (never sent to a provider).
     #[serde(rename = "notice")]
@@ -151,6 +155,21 @@ impl Message {
             tool_call_id,
             content,
             ts: Some(ts),
+            display: None,
+        }
+    }
+
+    pub fn tool_result_with_display(
+        tool_call_id: String,
+        content: String,
+        ts: f64,
+        display: Option<Value>,
+    ) -> Self {
+        Self::Tool {
+            tool_call_id,
+            content,
+            ts: Some(ts),
+            display,
         }
     }
 
@@ -163,6 +182,25 @@ impl Message {
             tool_call_id,
             content: serde_json::to_string(&body).unwrap_or_default(),
             ts: Some(ts),
+            display: None,
+        }
+    }
+
+    pub fn tool_error_with_display(
+        tool_call_id: String,
+        reason: &str,
+        ts: f64,
+        display: Option<Value>,
+    ) -> Self {
+        let body = serde_json::json!({
+            "error": "tool call not executed",
+            "reason": reason
+        });
+        Self::Tool {
+            tool_call_id,
+            content: serde_json::to_string(&body).unwrap_or_default(),
+            ts: Some(ts),
+            display,
         }
     }
 

@@ -1253,6 +1253,8 @@ pub struct AppState {
     /// per-session attempt count and the IDs currently generating.
     pub autotitle_attempts: StdShared<HashMap<String, u32>>,
     pub autotitle_inflight: StdShared<HashSet<String>>,
+    /// Agent-teams board store + attachment blobs + join tokens (`/v1/board`).
+    pub board: Arc<crate::teams::BoardServices>,
 }
 
 /// The auto-title system prompt (verbatim mirror of `manager.py::_AUTOTITLE_PROMPT`).
@@ -1401,6 +1403,7 @@ impl AppState {
             browser: Arc::new(BrowserController::new()),
             autotitle_attempts: Arc::new(StdRwLock::new(HashMap::new())),
             autotitle_inflight: Arc::new(StdRwLock::new(HashSet::new())),
+            board: Arc::new(crate::teams::BoardServices::open(&data_dir)),
         };
         if state.settings.effective_default_model_cached().is_empty() {
             let _ = state.default_model_or_configured();
@@ -1718,6 +1721,7 @@ impl AppState {
             updated_at: meta.updated_at.clone(),
             extra_roots,
             grants: serde_json::json!({}),
+            compaction: None,
             pinned: meta.pinned,
             archived: meta.archived,
             origin: None,
@@ -1810,6 +1814,13 @@ impl AppState {
     /// restart. Called after every turn from ws.rs / scheduler.rs.
     pub fn persist_grants(&self, session_id: &str, grants: &Value) {
         let _ = self.conversation_store.update_grants(session_id, grants);
+    }
+
+    /// Persist compaction state (OPE-27) after a turn.
+    pub fn persist_compaction(&self, session_id: &str, compaction: Option<&Value>) {
+        let _ = self
+            .conversation_store
+            .update_compaction(session_id, compaction);
     }
 
     // -- LLM auto-titles (FB-010, mirror of `manager.py::_maybe_autotitle`) ----
