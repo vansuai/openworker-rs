@@ -492,7 +492,8 @@ pub fn format_memories(items: &[MemoryItem]) -> String {
 /// The injected memories block. Full mode while affordable; index mode when over threshold.
 pub fn render_memory_block(items: &[MemoryItem]) -> String {
     let full = format_memories(items);
-    if full.len() <= INDEX_THRESHOLD_CHARS {
+    // Match Python `len(str)` — Unicode scalar count, not UTF-8 byte length.
+    if full.chars().count() <= INDEX_THRESHOLD_CHARS {
         return full;
     }
     format_memory_index(items)
@@ -596,5 +597,28 @@ mod tests {
         let block = render_memory_block(&items);
         assert!(block.contains("memory_read"));
         assert!(block.contains("sum 1") || block.contains("[#1]"));
+    }
+
+    #[test]
+    fn render_memory_block_threshold_uses_char_count_not_bytes() {
+        // ~7900 CJK chars + header ≈ 7945 chars (< 8000) but ~23k UTF-8 bytes (> 8000).
+        // Byte-length check would wrongly flip to index mode; Python len() is char count.
+        let content = "中".repeat(7900);
+        let items = vec![MemoryItem {
+            id: 1,
+            scope: Scope::Global,
+            content,
+            key: None,
+            summary: None,
+            workspace: None,
+            session_id: None,
+            created_at: None,
+        }];
+        let block = render_memory_block(&items);
+        assert!(
+            !block.contains("memory_read"),
+            "should stay in full mode when char count is under threshold"
+        );
+        assert!(block.contains("[#1]"));
     }
 }
