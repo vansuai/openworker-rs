@@ -666,12 +666,16 @@ async fn handler_delete_session(
 // ---------------------------------------------------------------------------
 
 async fn handler_list_memory(State(state): State<AppState>) -> Json<Value> {
-    let entries = state.memory_store.list(None, None, None).unwrap_or_default();
-    let items: Vec<Value> = entries
-        .iter()
-        .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
-        .collect();
-    Json(json!({ "memory": items }))
+    match state.memory_store.list(None, None, None) {
+        Ok(entries) => {
+            let items: Vec<Value> = entries
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
+                .collect();
+            Json(json!({ "memory": items }))
+        }
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 fn rest_add_memory(store: &dyn ocw_data::MemoryBackend, body: &Value) -> Value {
@@ -715,8 +719,10 @@ async fn handler_add_memory(State(state): State<AppState>, Json(body): Json<Valu
 }
 
 async fn handler_delete_all_memory(State(state): State<AppState>) -> Json<Value> {
-    let deleted = state.memory_store.delete_all().unwrap_or(0);
-    Json(json!({ "ok": true, "deleted": deleted }))
+    match state.memory_store.delete_all() {
+        Ok(deleted) => Json(json!({ "ok": true, "deleted": deleted })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 async fn handler_memory_settings_get(State(state): State<AppState>) -> Json<Value> {
