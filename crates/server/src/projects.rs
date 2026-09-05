@@ -216,6 +216,19 @@ impl ProjectStore {
     }
 }
 
+/// Format the user's standing rules for system-prompt injection.
+/// Mirror of `coworker/memory/settings.py::format_user_rules`. Empty rules -> empty string.
+pub fn format_user_rules(rules: &str) -> String {
+    let text = rules.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!(
+        "User rules (written by the user in Settings; always follow these — on any \
+conflict they outrank learned memories):\n{text}"
+    )
+}
+
 /// Memory settings (enabled + user_rules) — mirrors `coworker/memory/settings.py`.
 pub struct MemorySettingsStore {
     path: PathBuf,

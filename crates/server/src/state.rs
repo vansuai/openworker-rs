@@ -20,7 +20,8 @@ use crate::stores::{
 use ocw_data::ConversationStore;
 use ocw_data::InboxRouting;
 use ocw_data::InboxStore;
-use ocw_data::MemoryStore;
+use ocw_data::{MemoryBackend, SQLiteMemoryStore};
+use ocw_data::{render_memory_block, Scope};
 use ocw_provider::Provider;
 use ocw_provider::{self, model_context_windows, model_labels, models_for_provider};
 use ocw_shell::LocalExecutor;
@@ -35,13 +36,25 @@ pub type StdShared<T> = Arc<StdRwLock<T>>;
 
 // When-to-remember rules, injected whenever the memory store is wired. Without these,
 // models either never call `remember` or save noise the repo already records.
-// Mirror of `coworker/agent.py::_MEMORY_GUIDANCE`.
+// Verbatim mirror of `coworker/agent.py::_MEMORY_GUIDANCE`.
 const MEMORY_GUIDANCE: &str = "Memory:\n\
 - You have persistent memory across sessions. Use `remember` for durable facts: the user's \
 corrections and stated preferences (include the why), and project context you couldn't \
-rederive from the code. Don't save what the repo already records (code structure, git \
-history, AGENTS.md) or details that only matter to the current task. Use absolute dates, \
-never \"yesterday\".\n\
+rederive from the code. Scope by what the fact is about: facts about the user -> \"global\"; \
+facts about the current work -> \"workspace\". Always pass a one-line summary (15 words max) \
+alongside the full content.\n\
+- Save conservatively — a wrong memory costs more than a missing one. Save only clearly \
+durable facts (\"from now on\", \"always\", \"in all my chats\"). Ambiguous one-off phrasing \
+(\"I prefer simple talking\"): apply it now, don't save it. But when the user explicitly \
+asks you to remember something, always save it.\n\
+- Sensitive topics (health, finances, relationships, beliefs): never save silently. Ask \
+first — \"Want me to remember this for next time?\" — and save only on a yes.\n\
+- When you save, say so in one short plain sentence in your visible reply (\"I'll remember \
+that you prefer short replies.\"). And the first time a remembered fact shapes your \
+behavior in a session, note it in one quiet line (\"Keeping this short since you prefer \
+simple replies.\") — first use only, not every message.\n\
+- Don't save what the repo already records (code structure, git history, AGENTS.md) or \
+details that only matter to the current task. Use absolute dates, never \"yesterday\".\n\
 - Before saving, check the known-memories list: if an entry already covers it, revise that \
 entry with `memory_update` instead of adding a near-duplicate; retire wrong or obsolete \
 entries with `memory_forget`.\n\
@@ -1387,7 +1400,7 @@ impl SessionRunState {
 pub struct AppState {
     pub config: Config,
     pub provider: Arc<dyn Provider>,
-    pub memory_store: Arc<MemoryStore>,
+    pub memory_store: Arc<dyn MemoryBackend>,
     pub conversation_store: Arc<ConversationStore>,
     pub sessions: StdShared<HashMap<String, SessionMeta>>,
     pub session_messages: StdShared<HashMap<String, SessionMessages>>,
@@ -1546,10 +1559,17 @@ impl AppState {
 
         let (event_broadcast, _) = broadcast::channel(256);
 
+        // Open the SQLite-backed memory store at `<data_dir>/coworker.db` (mirror of
+        // `coworker/memory/sqlite_store.py`). Dyn-dispatched via `MemoryBackend`.
+        let memory_db = data_dir.join("coworker.db");
+        let memory_store: Arc<dyn MemoryBackend> = Arc::new(
+            SQLiteMemoryStore::open(&memory_db).expect("open memory db"),
+        );
+
         let state = Self {
             config,
             provider,
-            memory_store: Arc::new(MemoryStore::new()),
+            memory_store,
             conversation_store: Arc::new(conversation_store),
             sessions: Arc::new(StdRwLock::new(sessions)),
             session_messages: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1688,6 +1708,19 @@ impl AppState {
                 system.push_str(&conventions);
             }
         }
+        // User rules (Settings ▸ Memory) — session-stable standing instructions.
+        // Mirror of `coworker/agent.py`'s `rules_block = format_user_rules(...)`,
+        // injected after conventions and before the memory guidance.
+        let snapshot = self.memory_settings.snapshot();
+        let user_rules = snapshot
+            .get("user_rules")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let rules_block = crate::projects::format_user_rules(user_rules);
+        if !rules_block.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&rules_block);
+        }
         system.push_str("\n\n");
         system.push_str(MEMORY_GUIDANCE);
         if !memory_text.is_empty() {
@@ -1774,16 +1807,24 @@ impl AppState {
     }
 
     /// Format memory entries for system prompt injection.
+    /// Mirrors `coworker/agent.py::build_engine`: global memories always, plus
+    /// workspace memories whose `workspace` column equals `project_key(ws)` when
+    /// a workspace is given. Rendered via `render_memory_block` (full vs index mode).
     fn format_memory_for_prompt(&self, workspace: &str) -> String {
-        let entries = self.memory_store.list(None, Some(workspace), None);
-        if entries.is_empty() {
-            return String::new();
+        let mut items = self
+            .memory_store
+            .list(Some(Scope::Global), None, None)
+            .unwrap_or_default();
+        let ws = workspace.trim();
+        if !ws.is_empty() {
+            let key = crate::projects::project_key(ws);
+            items.extend(
+                self.memory_store
+                    .list(Some(Scope::Workspace), Some(&key), None)
+                    .unwrap_or_default(),
+            );
         }
-        let lines: Vec<String> = entries.iter().map(|e| format!("- {}", e.content)).collect();
-        format!(
-            "Memory (what the user has asked you to remember):\n{}",
-            lines.join("\n")
-        )
+        render_memory_block(&items)
     }
 
     /// Format skill catalog for system prompt injection.
@@ -3913,6 +3954,73 @@ mod tests {
         // Markdown → markdown kind.
         let md = state.read_artifact(&meta.session_id, "notes.md");
         assert_eq!(md["kind"], "markdown");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `build_system_messages` must inject the global + matching workspace memory
+    /// block (rendered via `render_memory_block`) and skip workspace memories that
+    /// belong to a different project. Mirrors `coworker/agent.py::build_engine`:
+    /// `remembered = list(scope=GLOBAL); if mem_ws: remembered += list(scope=WORKSPACE, workspace=mem_ws)`.
+    #[tokio::test]
+    async fn build_system_messages_injects_global_and_workspace_memory() {
+        let dir = temp_data_dir("mem-inject");
+        let state = make_state(dir.clone());
+
+        // Global memory — always injected.
+        state
+            .memory_store
+            .add("I am Alice", ocw_data::Scope::Global, None, None, None, None)
+            .unwrap();
+
+        // Create the workspace dir BEFORE computing project_key so `canonicalize`
+        // resolves the same symlink-resolved path at add time and at build time
+        // (macOS `/var` -> `/private/var`).
+        let ws = dir.join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let key = crate::projects::project_key(&ws.to_string_lossy());
+
+        // Workspace memory for THIS project — injected.
+        state
+            .memory_store
+            .add(
+                "uses cargo",
+                ocw_data::Scope::Workspace,
+                None,
+                None,
+                Some(&key),
+                None,
+            )
+            .unwrap();
+        // Workspace memory for a DIFFERENT project — must NOT be injected.
+        state
+            .memory_store
+            .add(
+                "other project",
+                ocw_data::Scope::Workspace,
+                None,
+                None,
+                Some("/other"),
+                None,
+            )
+            .unwrap();
+
+        let messages = state
+            .build_system_messages("cowork", &ws.to_string_lossy(), "test-model")
+            .await;
+        assert_eq!(messages.len(), 1);
+        let ocw_engine::Message::System { content } = &messages[0] else {
+            panic!("expected a system message");
+        };
+
+        // render_memory_block emits "[#id]" prefixes.
+        assert!(content.contains("[#"), "missing memory id prefix: {content}");
+        assert!(content.contains("Alice"), "missing global memory: {content}");
+        assert!(content.contains("uses cargo"), "missing workspace memory: {content}");
+        assert!(
+            !content.contains("other project"),
+            "poisoned workspace memory leaked: {content}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

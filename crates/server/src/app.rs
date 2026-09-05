@@ -666,7 +666,7 @@ async fn handler_delete_session(
 // ---------------------------------------------------------------------------
 
 async fn handler_list_memory(State(state): State<AppState>) -> Json<Value> {
-    let entries = state.memory_store.list(None, None, None);
+    let entries = state.memory_store.list(None, None, None).unwrap_or_default();
     let items: Vec<Value> = entries
         .iter()
         .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
@@ -681,12 +681,24 @@ async fn handler_add_memory(State(state): State<AppState>, Json(body): Json<Valu
         Some("session") => ocw_data::Scope::Session,
         _ => ocw_data::Scope::Workspace,
     };
-    let entry = state.memory_store.add(content, scope, None, None, None);
+    let entry = state
+        .memory_store
+        .add(content, scope, None, None, None, None)
+        .unwrap_or_else(|_| ocw_data::MemoryItem {
+            id: 0,
+            scope,
+            content: content.to_string(),
+            key: None,
+            summary: None,
+            workspace: None,
+            session_id: None,
+            created_at: None,
+        });
     Json(serde_json::to_value(&entry).unwrap_or(json!({})))
 }
 
 async fn handler_delete_all_memory(State(state): State<AppState>) -> Json<Value> {
-    let deleted = state.memory_store.delete_all();
+    let deleted = state.memory_store.delete_all().unwrap_or(0);
     Json(json!({ "ok": true, "deleted": deleted }))
 }
 
@@ -716,9 +728,10 @@ async fn handler_patch_memory(
     if content.is_empty() {
         return Json(json!({ "ok": false, "error": "content required" }));
     }
-    match state.memory_store.update(item_id, content) {
-        Some(item) => Json(json!({ "ok": true, "id": item.id, "content": item.content })),
-        None => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+    match state.memory_store.update(item_id, content, None) {
+        Ok(Some(item)) => Json(json!({ "ok": true, "id": item.id, "content": item.content })),
+        Ok(None) => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }
 
@@ -726,10 +739,10 @@ async fn handler_delete_memory(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
 ) -> Json<Value> {
-    if state.memory_store.delete(item_id) {
-        Json(json!({ "ok": true, "id": item_id }))
-    } else {
-        Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") }))
+    match state.memory_store.delete(item_id) {
+        Ok(true) => Json(json!({ "ok": true, "id": item_id })),
+        Ok(false) => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }
 
