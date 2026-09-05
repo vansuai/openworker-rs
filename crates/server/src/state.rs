@@ -70,6 +70,25 @@ yesterday's digest.\"). It is shown to the user as live progress. Don't narrate 
 single-call follow-ups, don't repeat the previous line, and never let narration replace \
 your final answer.";
 
+// Per-turn notice when saving is off — tools stay registered but writes refuse.
+// Verbatim mirror of `coworker/agent.py::_MEMORY_OFF_NOTICE`.
+const MEMORY_OFF_NOTICE: &str = "Saving new memories is turned off in this user's Settings. What \
+you already know about them (the known-memories list, if any) is still true and you should keep \
+using it — but you have no way to save, change, or delete anything, and nothing new from this \
+conversation will carry over to future ones. If the user asks you to remember something new, \
+state both halves plainly: you'll keep it in mind for the rest of this conversation, but it \
+won't be saved once the conversation ends — they can turn saving back on in Settings ▸ Memory. \
+Never imply you saved, noted, or will remember anything new.";
+
+/// Per-turn memory context when saving is disabled. Returns `None` when saving is on.
+pub(crate) fn memory_turn_context(saving_enabled: bool) -> Option<&'static str> {
+    if saving_enabled {
+        None
+    } else {
+        Some(MEMORY_OFF_NOTICE)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -3248,6 +3267,18 @@ pub(crate) fn recent_files(workspace: &str, since: f64, limit: usize) -> Vec<Str
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn memory_turn_context_none_when_saving_enabled() {
+        assert!(memory_turn_context(true).is_none());
+    }
+
+    #[test]
+    fn memory_turn_context_notice_when_saving_disabled() {
+        let notice = memory_turn_context(false).expect("notice");
+        assert_eq!(notice, MEMORY_OFF_NOTICE);
+        assert!(notice.contains("Saving new memories is turned off"));
+    }
 
     fn temp_data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

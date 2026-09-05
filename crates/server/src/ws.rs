@@ -15,7 +15,7 @@ use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::state::AppState;
+use crate::state::{memory_turn_context, AppState};
 use ocw_data::VIS_INBOX;
 use ocw_data::VIS_INLINE;
 use ocw_engine::{
@@ -453,10 +453,22 @@ async fn init_engine(state: &AppState, ctx: &SessionCtx) {
         let settings = state.settings.clone();
         move || settings.compaction_settings_sync()
     })
-    .with_context_provider(|| {
-        chrono::Local::now()
-            .format("Current date: %Y-%m-%d")
-            .to_string()
+    .with_context_provider({
+        let settings = state.memory_settings.clone();
+        move || {
+            let saving_enabled = settings
+                .snapshot()
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let date = chrono::Local::now()
+                .format("Current date: %Y-%m-%d")
+                .to_string();
+            match memory_turn_context(saving_enabled) {
+                Some(notice) => format!("{date}\n\n{notice}"),
+                None => date,
+            }
+        }
     });
     if let Ok(Some(record)) = state.conversation_store.load(&ctx.session_id) {
         if let Some(raw) = record.compaction {
@@ -1485,10 +1497,22 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
         .with_audit_sink(make_audit_sink(state.clone()))
         .with_cancel(StdArc::clone(&run.cancel))
         .with_workspace_root(workspace.clone())
-        .with_context_provider(|| {
-            chrono::Local::now()
-                .format("Current date: %Y-%m-%d")
-                .to_string()
+        .with_context_provider({
+            let settings = state.memory_settings.clone();
+            move || {
+                let saving_enabled = settings
+                    .snapshot()
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let date = chrono::Local::now()
+                    .format("Current date: %Y-%m-%d")
+                    .to_string();
+                match memory_turn_context(saving_enabled) {
+                    Some(notice) => format!("{date}\n\n{notice}"),
+                    None => date,
+                }
+            }
         });
         // Restore compaction state from the durable session record when present.
         if let Ok(Some(record)) = state.conversation_store.load(&session_id) {
