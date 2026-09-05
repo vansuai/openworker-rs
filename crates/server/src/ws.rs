@@ -336,6 +336,15 @@ pub(crate) fn build_builtin_registry(
     automations: Option<(StdArc<crate::automations::AutomationStore>, String)>,
     // Board/journal tools for team personas (None for scheduled runs / tests).
     board: Option<crate::board_tools::BoardToolsArgs>,
+    // Memory tools — `(store, workspace_key, saving_enabled)`. Some only for
+    // live sessions AND scheduled-task engines (Python's `_build_task_engine`
+    // passes `memory_store=self.memory_store`). None for tests / when memory
+    // is intentionally disabled at a call site.
+    memory: Option<(
+        StdArc<dyn ocw_data::MemoryBackend>,
+        Option<String>,
+        StdArc<dyn Fn() -> bool + Send + Sync>,
+    )>,
 ) -> StdArc<ocw_engine::ToolRegistry> {
     let mut reg = ocw_engine::ToolRegistry::new();
     let agent_config = crate::agents::get_agent(agent);
@@ -380,6 +389,15 @@ pub(crate) fn build_builtin_registry(
 
     if let Some(board_args) = board {
         crate::board_tools::register_board_tools(&mut reg, board_args);
+    }
+
+    // Agent-facing memory tools (remember / memory_read / memory_update /
+    // memory_forget) — mirror of `coworker/memory/tools.py`. Wired for live
+    // sessions AND scheduled-task engines (Python's `_build_task_engine` passes
+    // `memory_store=self.memory_store`); None for tests / when memory is
+    // intentionally disabled at a call site.
+    if let Some((store, workspace, saving)) = memory {
+        crate::memory_tools::register_memory_tools(&mut reg, store, workspace, saving, None);
     }
 
     // Shell executor is managed separately (persistent per-workspace) and registered
@@ -1399,6 +1417,20 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             &state.skill_store,
             Some((state.automations.read().await.clone(), session_id.clone())),
             Some(board_args),
+            Some((
+                StdArc::clone(&state.memory_store),
+                Some(crate::projects::project_key(&workspace)),
+                {
+                    let settings = state.memory_settings.clone();
+                    StdArc::new(move || {
+                        settings
+                            .snapshot()
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                    })
+                },
+            )),
         );
         let permissions = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
             state.config.data_dir.join("permissions.json"),
@@ -1822,6 +1854,7 @@ mod tests {
             agent,
             &ocw_skills::SkillStore::new(workspace.to_path_buf()),
             automations,
+            None,
             None,
         )
     }

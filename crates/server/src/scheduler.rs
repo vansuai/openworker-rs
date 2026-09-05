@@ -147,6 +147,25 @@ async fn run_task_inner(
         &state.skill_store,
         None, // scheduled-run engines get no scheduling tools (Python `task_store=None`)
         None, // no board tools on scheduled runs
+        // Scheduled-task engines DO get memory tools — Python's
+        // `_build_task_engine` passes `memory_store=self.memory_store`,
+        // `memory_workspace=self._memory_key_for(None, task.workspace)` (which
+        // with no binding resolves to `project_key(task.workspace)`), and
+        // `memory_saving_enabled=lambda: self.memory_settings.enabled`.
+        Some((
+            Arc::clone(&state.memory_store),
+            Some(crate::projects::project_key(&task.workspace)),
+            {
+                let settings = state.memory_settings.clone();
+                Arc::new(move || {
+                    settings
+                        .snapshot()
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true)
+                })
+            },
+        )),
     );
     let permissions = Arc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
         state.config.data_dir.join("permissions.json"),
