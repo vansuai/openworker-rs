@@ -93,7 +93,7 @@ afterEach(() => {
 });
 
 describe("Sidebar group/filter control", () => {
-  it("choosing Persona persists via setNavLayout and switches to the per-persona accordion", async () => {
+  it("choosing Coworker persists via setNavLayout and switches to the per-persona accordion", async () => {
     const calls = stubFetch([
       { match: "/v1/personas", method: "GET", json: PERSONAS },
       { match: "/v1/settings", method: "GET", json: { nav_layout: "flat" } },
@@ -104,9 +104,9 @@ describe("Sidebar group/filter control", () => {
     // personas load drives the surfaces; the RECENT header's group/filter control is always present.
     const control = await screen.findByLabelText("Group and filter conversations");
 
-    // Open the popover and choose "Group by → Persona".
+    // Open the popover and choose "Group by → Coworker".
     fireEvent.click(control);
-    fireEvent.click(await screen.findByText("Persona"));
+    fireEvent.click(await screen.findByText("Coworker"));
 
     // POSTs the new layout pref.
     await waitFor(() => {
