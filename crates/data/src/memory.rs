@@ -3,8 +3,70 @@
 use crate::types::{MemoryItem, Scope};
 use crate::Error;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashSet;
 use std::path::Path;
+
+/// Below this rendered size, every memory is injected in full; above it, the block
+/// flips to index mode (newest few in full, one-line summaries for the rest).
+pub const INDEX_THRESHOLD_CHARS: usize = 8_000;
+
+/// In index mode the newest N stay in full.
+const INDEX_FULL_NEWEST: usize = 10;
+
+const INDEX_NOTE: &str = "(Some memories above show only a one-line summary. Call memory_read with the \
+[#id]s before acting on anything a summary hints at.)";
+
+/// Unified memory store interface.
+pub trait MemoryBackend: Send + Sync {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error>;
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error>;
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error>;
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error>;
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error>;
+
+    fn delete_all(&self) -> Result<usize, Error>;
+}
+
+fn memory_item_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
+    let scope_str: String = row.get(1)?;
+    let scope = Scope::try_from(scope_str).unwrap_or(Scope::Workspace);
+    Ok(MemoryItem {
+        id: row.get(0)?,
+        scope,
+        content: row.get(3)?,
+        key: row.get(2)?,
+        summary: row.get(4)?,
+        workspace: row.get(5)?,
+        session_id: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+const MEMORY_SELECT: &str =
+    "SELECT id, scope, key, content, summary, workspace, session_id, created_at FROM memories";
 
 /// In-memory store for tests / ephemeral use.
 pub struct MemoryStore {
@@ -25,6 +87,7 @@ impl MemoryStore {
         content: &str,
         scope: Scope,
         key: Option<&str>,
+        summary: Option<&str>,
         workspace: Option<&str>,
         session_id: Option<&str>,
     ) -> MemoryItem {
@@ -38,6 +101,7 @@ impl MemoryStore {
             scope,
             content: content.to_string(),
             key: key.map(String::from),
+            summary: summary.map(String::from),
             workspace: workspace.map(String::from),
             session_id: session_id.map(String::from),
             created_at: Some(created_at),
@@ -69,10 +133,18 @@ impl MemoryStore {
             .collect()
     }
 
-    pub fn update(&self, item_id: i64, content: &str) -> Option<MemoryItem> {
+    pub fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Option<MemoryItem> {
         let mut items = self.items.lock();
         if let Some(item) = items.iter_mut().find(|i| i.id == item_id) {
             item.content = content.to_string();
+            if let Some(s) = summary {
+                item.summary = Some(s.to_string());
+            }
             return Some(item.clone());
         }
         None
@@ -99,6 +171,52 @@ impl Default for MemoryStore {
     }
 }
 
+impl MemoryBackend for MemoryStore {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error> {
+        Ok(MemoryStore::add(
+            self, content, scope, key, summary, workspace, session_id,
+        ))
+    }
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error> {
+        Ok(MemoryStore::get(self, item_id))
+    }
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error> {
+        Ok(MemoryStore::list(self, scope, workspace, session_id))
+    }
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error> {
+        Ok(MemoryStore::update(self, item_id, content, summary))
+    }
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error> {
+        Ok(MemoryStore::delete(self, item_id))
+    }
+
+    fn delete_all(&self) -> Result<usize, Error> {
+        Ok(MemoryStore::delete_all(self))
+    }
+}
+
 /// SQLite-backed persistent memory store.
 pub struct SQLiteMemoryStore {
     conn: Mutex<Connection>,
@@ -119,12 +237,25 @@ impl SQLiteMemoryStore {
                 scope TEXT NOT NULL,
                 key TEXT,
                 content TEXT NOT NULL,
+                summary TEXT,
                 workspace TEXT,
                 session_id TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )",
             [],
         )?;
+
+        let mut cols = HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for col in rows {
+                cols.insert(col?);
+            }
+        }
+        if !cols.contains("summary") {
+            conn.execute("ALTER TABLE memories ADD COLUMN summary TEXT", [])?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -137,32 +268,21 @@ impl SQLiteMemoryStore {
         content: &str,
         scope: Scope,
         key: Option<&str>,
+        summary: Option<&str>,
         workspace: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<MemoryItem, Error> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO memories (scope, key, content, workspace, session_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![scope.as_str(), key, content, workspace, session_id],
+            "INSERT INTO memories (scope, key, content, summary, workspace, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![scope.as_str(), key, content, summary, workspace, session_id],
         )?;
 
         let row = conn
             .query_row(
-                "SELECT id, scope, key, content, workspace, session_id, created_at FROM memories ORDER BY id DESC LIMIT 1",
+                &format!("{MEMORY_SELECT} ORDER BY id DESC LIMIT 1"),
                 [],
-                |row| {
-                let scope_str: String = row.get(1)?;
-                let scope = Scope::try_from(scope_str).unwrap_or(Scope::Workspace);
-                Ok(MemoryItem {
-                    id: row.get(0)?,
-                    scope,
-                    content: row.get(3)?,
-                    key: row.get(2)?,
-                    workspace: row.get(4)?,
-                    session_id: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            },
+                memory_item_from_row,
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
 
@@ -174,21 +294,9 @@ impl SQLiteMemoryStore {
         let conn = self.conn.lock();
         let result = conn
             .query_row(
-                "SELECT id, scope, key, content, workspace, session_id, created_at FROM memories WHERE id = ?",
+                &format!("{MEMORY_SELECT} WHERE id = ?"),
                 [item_id],
-                |row| {
-                let scope_str: String = row.get(1)?;
-                let scope = Scope::try_from(scope_str).unwrap_or(Scope::Workspace);
-                Ok(MemoryItem {
-                    id: row.get(0)?,
-                    scope,
-                    content: row.get(3)?,
-                    key: row.get(2)?,
-                    workspace: row.get(4)?,
-                    session_id: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            },
+                memory_item_from_row,
             )
             .optional();
 
@@ -206,7 +314,7 @@ impl SQLiteMemoryStore {
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryItem>, Error> {
         let conn = self.conn.lock();
-        let mut sql = "SELECT id, scope, key, content, workspace, session_id, created_at FROM memories WHERE 1=1".to_string();
+        let mut sql = format!("{MEMORY_SELECT} WHERE 1=1");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(s) = &scope {
@@ -226,19 +334,7 @@ impl SQLiteMemoryStore {
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            let scope_str: String = row.get(1)?;
-            let scope = Scope::try_from(scope_str).unwrap_or(Scope::Workspace);
-            Ok(MemoryItem {
-                id: row.get(0)?,
-                scope,
-                content: row.get(3)?,
-                key: row.get(2)?,
-                workspace: row.get(4)?,
-                session_id: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params_refs.as_slice(), memory_item_from_row)?;
 
         let mut items = Vec::new();
         for row in rows {
@@ -248,12 +344,24 @@ impl SQLiteMemoryStore {
     }
 
     /// Update a memory's content by id. Returns the updated item.
-    pub fn update(&self, item_id: i64, content: &str) -> Result<Option<MemoryItem>, Error> {
+    pub fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE memories SET content = ? WHERE id = ?",
-            params![content, item_id],
-        )?;
+        if summary.is_some() {
+            conn.execute(
+                "UPDATE memories SET content = ?, summary = ? WHERE id = ?",
+                params![content, summary, item_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE memories SET content = ? WHERE id = ?",
+                params![content, item_id],
+            )?;
+        }
         drop(conn);
         self.get(item_id)
     }
@@ -272,6 +380,100 @@ impl SQLiteMemoryStore {
     }
 }
 
+impl MemoryBackend for SQLiteMemoryStore {
+    fn add(
+        &self,
+        content: &str,
+        scope: Scope,
+        key: Option<&str>,
+        summary: Option<&str>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<MemoryItem, Error> {
+        SQLiteMemoryStore::add(self, content, scope, key, summary, workspace, session_id)
+    }
+
+    fn get(&self, item_id: i64) -> Result<Option<MemoryItem>, Error> {
+        SQLiteMemoryStore::get(self, item_id)
+    }
+
+    fn list(
+        &self,
+        scope: Option<Scope>,
+        workspace: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>, Error> {
+        SQLiteMemoryStore::list(self, scope, workspace, session_id)
+    }
+
+    fn update(
+        &self,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<MemoryItem>, Error> {
+        SQLiteMemoryStore::update(self, item_id, content, summary)
+    }
+
+    fn delete(&self, item_id: i64) -> Result<bool, Error> {
+        SQLiteMemoryStore::delete(self, item_id)
+    }
+
+    fn delete_all(&self) -> Result<usize, Error> {
+        SQLiteMemoryStore::delete_all(self)
+    }
+}
+
+fn index_line(item: &MemoryItem) -> String {
+    let mut text = item.summary.as_deref().unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        text = item
+            .content
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if text.chars().count() > 80 {
+            text = format!("{}...", text.chars().take(77).collect::<String>());
+        }
+    }
+    format!("- [#{}] {text}", item.id)
+}
+
+/// Index rendering: newest `full_newest` in full, one-line summaries for the rest.
+pub fn format_memory_index(items: &[MemoryItem]) -> String {
+    format_memory_index_with(items, INDEX_FULL_NEWEST)
+}
+
+fn format_memory_index_with(items: &[MemoryItem], full_newest: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&MemoryItem> = items.iter().collect();
+    sorted.sort_by_key(|i| i.id);
+    let newest: HashSet<i64> = sorted
+        .iter()
+        .rev()
+        .take(full_newest)
+        .map(|i| i.id)
+        .collect();
+    let lines: Vec<String> = items
+        .iter()
+        .map(|item| {
+            if newest.contains(&item.id) {
+                format!("- [#{id}] {content}", id = item.id, content = item.content)
+            } else {
+                index_line(item)
+            }
+        })
+        .collect();
+    format!(
+        "Known memories (from earlier sessions):\n{}\n{INDEX_NOTE}",
+        lines.join("\n")
+    )
+}
+
 /// Render memories for injection into the system prompt.
 pub fn format_memories(items: &[MemoryItem]) -> String {
     if items.is_empty() {
@@ -287,6 +489,16 @@ pub fn format_memories(items: &[MemoryItem]) -> String {
     )
 }
 
+/// The injected memories block. Full mode while affordable; index mode when over threshold.
+pub fn render_memory_block(items: &[MemoryItem]) -> String {
+    let full = format_memories(items);
+    // Match Python `len(str)` — Unicode scalar count, not UTF-8 byte length.
+    if full.chars().count() <= INDEX_THRESHOLD_CHARS {
+        return full;
+    }
+    format_memory_index(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +507,7 @@ mod tests {
     #[test]
     fn memory_store_in_memory() {
         let store = MemoryStore::new();
-        let item = store.add("hello world", Scope::Workspace, None, Some("/tmp"), None);
+        let item = store.add("hello world", Scope::Workspace, None, None, Some("/tmp"), None);
         assert_eq!(item.content, "hello world");
         assert_eq!(store.list(None, Some("/tmp"), None).len(), 1);
         assert!(store.delete(item.id));
@@ -309,14 +521,14 @@ mod tests {
         let store = SQLiteMemoryStore::open(&path).unwrap();
 
         let item = store
-            .add("test memory", Scope::Global, Some("key1"), None, None)
+            .add("test memory", Scope::Global, Some("key1"), None, None, None)
             .unwrap();
         assert_eq!(item.content, "test memory");
 
         let found = store.get(item.id).unwrap().unwrap();
         assert_eq!(found.content, "test memory");
 
-        let updated = store.update(item.id, "updated").unwrap().unwrap();
+        let updated = store.update(item.id, "updated", None).unwrap().unwrap();
         assert_eq!(updated.content, "updated");
 
         let listed = store.list(Some(Scope::Global), None, None).unwrap();
@@ -330,12 +542,83 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_persists_summary() {
+        let dir = tempdir().unwrap();
+        let store = SQLiteMemoryStore::open(dir.path().join("m.db")).unwrap();
+        let item = store
+            .add("full text", Scope::Global, None, Some("one line"), None, None)
+            .unwrap();
+        assert_eq!(item.summary.as_deref(), Some("one line"));
+        let got = store.get(item.id).unwrap().unwrap();
+        assert_eq!(got.summary.as_deref(), Some("one line"));
+    }
+
+    #[test]
     fn format_memories() {
         let store = MemoryStore::new();
-        let a = store.add("a", Scope::Workspace, None, None, None);
-        let b = store.add("b", Scope::Global, None, None, None);
+        let a = store.add("a", Scope::Workspace, None, None, None, None);
+        let b = store.add("b", Scope::Global, None, None, None, None);
         let text = super::format_memories(&[a, b]);
         assert!(text.contains("#1] a"));
         assert!(text.contains("#2] b"));
+    }
+
+    #[test]
+    fn render_memory_block_full_mode_under_threshold() {
+        let items = vec![MemoryItem {
+            id: 1,
+            scope: Scope::Global,
+            content: "likes tea".into(),
+            key: None,
+            summary: None,
+            workspace: None,
+            session_id: None,
+            created_at: None,
+        }];
+        let block = render_memory_block(&items);
+        assert!(block.contains("[#1] likes tea"));
+        assert!(!block.contains("memory_read"));
+    }
+
+    #[test]
+    fn render_memory_block_index_mode_over_threshold() {
+        let items: Vec<_> = (1..=40)
+            .map(|id| MemoryItem {
+                id,
+                scope: Scope::Global,
+                content: "x".repeat(300),
+                key: None,
+                summary: Some(format!("sum {id}")),
+                workspace: None,
+                session_id: None,
+                created_at: None,
+            })
+            .collect();
+        let block = render_memory_block(&items);
+        assert!(block.contains("memory_read"));
+        assert!(block.contains("sum 1") || block.contains("[#1]"));
+    }
+
+    #[test]
+    fn render_memory_block_threshold_uses_char_count_not_bytes() {
+        // ~7900 CJK chars + header ≈ 7945 chars (< 8000) but ~23k UTF-8 bytes (> 8000).
+        // Byte-length check would wrongly flip to index mode; Python len() is char count.
+        let content = "中".repeat(7900);
+        let items = vec![MemoryItem {
+            id: 1,
+            scope: Scope::Global,
+            content,
+            key: None,
+            summary: None,
+            workspace: None,
+            session_id: None,
+            created_at: None,
+        }];
+        let block = render_memory_block(&items);
+        assert!(
+            !block.contains("memory_read"),
+            "should stay in full mode when char count is under threshold"
+        );
+        assert!(block.contains("[#1]"));
     }
 }

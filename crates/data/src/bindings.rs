@@ -37,6 +37,7 @@ fn mem_to_dict(item: &RustMemItem, py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("scope", item.scope.as_str())?;
     d.set_item("content", &item.content)?;
     d.set_item("key", &item.key)?;
+    d.set_item("summary", &item.summary)?;
     d.set_item("workspace", &item.workspace)?;
     d.set_item("session_id", &item.session_id)?;
     d.set_item("created_at", &item.created_at)?;
@@ -58,6 +59,7 @@ impl PySQLiteMemoryStore {
         content: &str,
         scope: &str,
         key: Option<&str>,
+        summary: Option<&str>,
         workspace: Option<&str>,
         session_id: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
@@ -65,7 +67,7 @@ impl PySQLiteMemoryStore {
             RustScope::try_from(scope).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
         let item = self
             .inner
-            .add(content, scope, key, workspace, session_id)
+            .add(content, scope, key, summary, workspace, session_id)
             .map_err(err_io)?;
         mem_to_dict(&item, py)
     }
@@ -94,8 +96,18 @@ impl PySQLiteMemoryStore {
         items.iter().map(|i| mem_to_dict(i, py)).collect()
     }
 
-    fn update(&self, py: Python<'_>, item_id: i64, content: &str) -> PyResult<Option<Py<PyDict>>> {
-        match self.inner.update(item_id, content).map_err(err_io)? {
+    fn update(
+        &self,
+        py: Python<'_>,
+        item_id: i64,
+        content: &str,
+        summary: Option<&str>,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        match self
+            .inner
+            .update(item_id, content, summary)
+            .map_err(err_io)?
+        {
             Some(i) => Ok(Some(mem_to_dict(&i, py)?)),
             None => Ok(None),
         }

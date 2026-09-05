@@ -262,7 +262,7 @@
 
 | # | 问题 | 证据 |
 | --- | --- | --- |
-| N30 | **Memory 三连锁断**：服务端用内存版 Vec store（SQLiteMemoryStore 零引用，重启即丢）；REST 添加 workspace=None 而注入按 workspace 过滤 → REST 记忆永不进 prompt；无 remember/memory_update/memory_forget 工具 | state.rs L1262；app.rs L529-538；state.rs L1391-1402 |
+| N30 | ~~Memory 三连锁断~~（**核心已修复**，2026-09-05 `feat/rust-memory-parity`）：SQLiteMemoryStore 持久化 + summary；REST add 写入 workspace key；`build_system_messages` 注入 global+workspace + `MEMORY_GUIDANCE` + user_rules；remember/memory_update/memory_forget/memory_read 工具 + saving gate；WS `with_context_provider` 在 saving off 时追加 `_MEMORY_OFF_NOTICE`。**仍开放**：Settings toast/Undo（设计范围外）；binding/rekey（Python `_memory_key_for` 语义未移植）。**Task 6 残留**（本分支已补）：`scheduler.rs` 调度 run 的 `with_context_provider` 原先仅注入日期，未追加 off notice — 已在 Task 7 对齐 `ws.rs` | state.rs；app.rs；memory_tools.rs；ws.rs；scheduler.rs |
 | N31 | **load_skill 未注册**：LoadSkillTool 已实现但会话注册表零引用；catalog 注入的 prompt 却指示模型调用 load_skill → 指向不存在的工具 | skills/src/skill.rs L199-258；agents.rs |
 | N32 | **缺失工具清单**：send_message/send_file（senders 纯函数就绪但无工具接线）、attribution、memory×3、scheduling×4、selfwake×2（sleep_for/sleep_until）、subscription 工具、replace_in_file/apply_patch/apply_unified_diff | crates/tools/src/lib.rs register_all vs agent.py L161-285 |
 | N33 | **Personas 运行时不生效**：get_agent 硬编码 4 个 agent，未知 id 回退 Code；三方 persona 的 manifest system_prompt/tools/mcp/skills 不参与会话 | agents.rs L78-121 |
@@ -311,7 +311,7 @@ Python 898 个 `def test_`（实际收集 948）vs Rust 116 个 `#[test]`，行�
 
 ### P1（可感知缺口）
 13. N18 限流时钟 bug；N19 三类 prompt 进 inbox；N20 多视图广播；N21 参数名；N13/N14 usage 与消息字段落盘；N12 error notice 与 retry。
-14. Memory 三连锁（N30）；load_skill 注册（N31）；persona 运行时接线（N33）。
+14. ~~Memory 三连锁（N30）~~ — 核心闭环已接线（见 N30）；仍待 toast/Undo、binding/rekey；load_skill 注册（N31）；persona 运行时接线（N33）。
 15. Automations：timezone、schedule_human 一行修复、overlap guard、scheduling agent 工具、run.error 赋值。
 16. 缺失工具接线：send_message/send_file/attribution/memory/scheduling/selfwake/subscription。
 

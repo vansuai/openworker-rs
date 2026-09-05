@@ -19,6 +19,7 @@ pub mod events_ws;
 pub mod environment;
 pub mod mcp;
 pub mod mcp_runtime;
+pub mod memory_tools;
 pub mod persona_manifest;
 pub mod personas;
 pub mod project;

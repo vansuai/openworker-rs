@@ -15,7 +15,7 @@ use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::state::AppState;
+use crate::state::{memory_turn_context, AppState};
 use ocw_data::VIS_INBOX;
 use ocw_data::VIS_INLINE;
 use ocw_engine::{
@@ -349,6 +349,15 @@ pub(crate) fn build_builtin_registry(
     automations: Option<(StdArc<crate::automations::AutomationStore>, String)>,
     // Board/journal tools for team personas (None for scheduled runs / tests).
     board: Option<crate::board_tools::BoardToolsArgs>,
+    // Memory tools — `(store, workspace_key, saving_enabled)`. Some only for
+    // live sessions AND scheduled-task engines (Python's `_build_task_engine`
+    // passes `memory_store=self.memory_store`). None for tests / when memory
+    // is intentionally disabled at a call site.
+    memory: Option<(
+        StdArc<dyn ocw_data::MemoryBackend>,
+        Option<String>,
+        StdArc<dyn Fn() -> bool + Send + Sync>,
+    )>,
 ) -> StdArc<ocw_engine::ToolRegistry> {
     let mut reg = ocw_engine::ToolRegistry::new();
     let agent_config = crate::agents::get_agent(agent);
@@ -393,6 +402,15 @@ pub(crate) fn build_builtin_registry(
 
     if let Some(board_args) = board {
         crate::board_tools::register_board_tools(&mut reg, board_args);
+    }
+
+    // Agent-facing memory tools (remember / memory_read / memory_update /
+    // memory_forget) — mirror of `coworker/memory/tools.py`. Wired for live
+    // sessions AND scheduled-task engines (Python's `_build_task_engine` passes
+    // `memory_store=self.memory_store`); None for tests / when memory is
+    // intentionally disabled at a call site.
+    if let Some((store, workspace, saving)) = memory {
+        crate::memory_tools::register_memory_tools(&mut reg, store, workspace, saving, None);
     }
 
     // Shell executor is managed separately (persistent per-workspace) and registered
@@ -448,10 +466,22 @@ async fn init_engine(state: &AppState, ctx: &SessionCtx) {
         let settings = state.settings.clone();
         move || settings.compaction_settings_sync()
     })
-    .with_context_provider(|| {
-        chrono::Local::now()
-            .format("Current date: %Y-%m-%d")
-            .to_string()
+    .with_context_provider({
+        let settings = state.memory_settings.clone();
+        move || {
+            let saving_enabled = settings
+                .snapshot()
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let date = chrono::Local::now()
+                .format("Current date: %Y-%m-%d")
+                .to_string();
+            match memory_turn_context(saving_enabled) {
+                Some(notice) => format!("{date}\n\n{notice}"),
+                None => date,
+            }
+        }
     });
     if let Ok(Some(record)) = state.conversation_store.load(&ctx.session_id) {
         if let Some(raw) = record.compaction {
@@ -1402,6 +1432,20 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             &state.skill_store,
             Some((state.automations.read().await.clone(), session_id.clone())),
             Some(board_args),
+            Some((
+                StdArc::clone(&state.memory_store),
+                Some(crate::projects::project_key(&workspace)),
+                {
+                    let settings = state.memory_settings.clone();
+                    StdArc::new(move || {
+                        settings
+                            .snapshot()
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                    })
+                },
+            )),
         );
         let permissions = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
             state.config.data_dir.join("permissions.json"),
@@ -1456,10 +1500,22 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
         .with_audit_sink(make_audit_sink(state.clone()))
         .with_cancel(StdArc::clone(&run.cancel))
         .with_workspace_root(workspace.clone())
-        .with_context_provider(|| {
-            chrono::Local::now()
-                .format("Current date: %Y-%m-%d")
-                .to_string()
+        .with_context_provider({
+            let settings = state.memory_settings.clone();
+            move || {
+                let saving_enabled = settings
+                    .snapshot()
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let date = chrono::Local::now()
+                    .format("Current date: %Y-%m-%d")
+                    .to_string();
+                match memory_turn_context(saving_enabled) {
+                    Some(notice) => format!("{date}\n\n{notice}"),
+                    None => date,
+                }
+            }
         });
         // Restore compaction state from the durable session record when present.
         if let Ok(Some(record)) = state.conversation_store.load(&session_id) {
@@ -1825,6 +1881,7 @@ mod tests {
             agent,
             &ocw_skills::SkillStore::new(workspace.to_path_buf()),
             automations,
+            None,
             None,
         )
     }

@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::automations::{compute_next_run, AutomationStore, ScheduledTask, TaskRun};
-use crate::state::AppState;
+use crate::state::{memory_turn_context, AppState};
 use crate::ws::build_builtin_registry;
 use ocw_data::{args_preview, VIS_INBOX};
 use ocw_engine::{
@@ -147,6 +147,25 @@ async fn run_task_inner(
         &state.skill_store,
         None, // scheduled-run engines get no scheduling tools (Python `task_store=None`)
         None, // no board tools on scheduled runs
+        // Scheduled-task engines DO get memory tools — Python's
+        // `_build_task_engine` passes `memory_store=self.memory_store`,
+        // `memory_workspace=self._memory_key_for(None, task.workspace)` (which
+        // with no binding resolves to `project_key(task.workspace)`), and
+        // `memory_saving_enabled=lambda: self.memory_settings.enabled`.
+        Some((
+            Arc::clone(&state.memory_store),
+            Some(crate::projects::project_key(&task.workspace)),
+            {
+                let settings = state.memory_settings.clone();
+                Arc::new(move || {
+                    settings
+                        .snapshot()
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true)
+                })
+            },
+        )),
     );
     let permissions = Arc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
         state.config.data_dir.join("permissions.json"),
@@ -352,10 +371,22 @@ async fn run_task_inner(
             .collect();
         park_state.persist_engine_messages_inner(&park_sid, &values);
     }))
-    .with_context_provider(|| {
-        chrono::Local::now()
-            .format("Current date: %Y-%m-%d")
-            .to_string()
+    .with_context_provider({
+        let settings = state.memory_settings.clone();
+        move || {
+            let saving_enabled = settings
+                .snapshot()
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let date = chrono::Local::now()
+                .format("Current date: %Y-%m-%d")
+                .to_string();
+            match memory_turn_context(saving_enabled) {
+                Some(notice) => format!("{date}\n\n{notice}"),
+                None => date,
+            }
+        }
     });
     {
         let mut ctx_map = serde_json::Map::new();

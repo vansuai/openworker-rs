@@ -666,28 +666,63 @@ async fn handler_delete_session(
 // ---------------------------------------------------------------------------
 
 async fn handler_list_memory(State(state): State<AppState>) -> Json<Value> {
-    let entries = state.memory_store.list(None, None, None);
-    let items: Vec<Value> = entries
-        .iter()
-        .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
-        .collect();
-    Json(json!({ "memory": items }))
+    match state.memory_store.list(None, None, None) {
+        Ok(entries) => {
+            let items: Vec<Value> = entries
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
+                .collect();
+            Json(json!({ "memory": items }))
+        }
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+fn rest_add_memory(store: &dyn ocw_data::MemoryBackend, body: &Value) -> Value {
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        return json!({ "ok": false, "error": "content required" });
+    }
+    let scope = match body.get("scope").and_then(|v| v.as_str()) {
+        Some("global") => ocw_data::Scope::Global,
+        Some("session") => ocw_data::Scope::Workspace,
+        _ => ocw_data::Scope::Workspace,
+    };
+    let summary = body
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let workspace = body
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ws_key = workspace.map(crate::projects::project_key);
+    let ws_arg = if matches!(scope, ocw_data::Scope::Workspace) {
+        ws_key.as_deref()
+    } else {
+        None
+    };
+    match store.add(content, scope, None, summary, ws_arg, None) {
+        Ok(entry) => serde_json::to_value(&entry).unwrap_or(json!({})),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
 }
 
 async fn handler_add_memory(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
-    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let scope = match body.get("scope").and_then(|v| v.as_str()) {
-        Some("global") => ocw_data::Scope::Global,
-        Some("session") => ocw_data::Scope::Session,
-        _ => ocw_data::Scope::Workspace,
-    };
-    let entry = state.memory_store.add(content, scope, None, None, None);
-    Json(serde_json::to_value(&entry).unwrap_or(json!({})))
+    Json(rest_add_memory(state.memory_store.as_ref(), &body))
 }
 
 async fn handler_delete_all_memory(State(state): State<AppState>) -> Json<Value> {
-    let deleted = state.memory_store.delete_all();
-    Json(json!({ "ok": true, "deleted": deleted }))
+    match state.memory_store.delete_all() {
+        Ok(deleted) => Json(json!({ "ok": true, "deleted": deleted })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 async fn handler_memory_settings_get(State(state): State<AppState>) -> Json<Value> {
@@ -716,9 +751,20 @@ async fn handler_patch_memory(
     if content.is_empty() {
         return Json(json!({ "ok": false, "error": "content required" }));
     }
-    match state.memory_store.update(item_id, content) {
-        Some(item) => Json(json!({ "ok": true, "id": item.id, "content": item.content })),
-        None => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+    let summary: Option<&str> = if body.get("summary").is_some() {
+        Some(
+            body.get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+        )
+    } else {
+        None
+    };
+    match state.memory_store.update(item_id, content, summary) {
+        Ok(Some(item)) => Json(json!({ "ok": true, "id": item.id, "content": item.content })),
+        Ok(None) => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }
 
@@ -726,10 +772,10 @@ async fn handler_delete_memory(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
 ) -> Json<Value> {
-    if state.memory_store.delete(item_id) {
-        Json(json!({ "ok": true, "id": item_id }))
-    } else {
-        Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") }))
+    match state.memory_store.delete(item_id) {
+        Ok(true) => Json(json!({ "ok": true, "id": item_id })),
+        Ok(false) => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }
 
@@ -1438,4 +1484,57 @@ pub async fn run(state: AppState) -> std::io::Result<()> {
     let app = build_app(state);
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await
+}
+
+#[cfg(test)]
+mod memory_handler_tests {
+    use super::*;
+    use ocw_data::{MemoryBackend, MemoryStore, Scope};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn rest_add_memory_stores_workspace_key() {
+        let store = Arc::new(MemoryStore::new()) as Arc<dyn MemoryBackend>;
+        let ws_dir = std::env::temp_dir().join(format!("ocw-mem-test-{}", std::process::id()));
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_path = ws_dir.to_string_lossy().to_string();
+        let key = crate::projects::project_key(&ws_path);
+
+        let body = json!({
+            "content": "uses cargo",
+            "scope": "workspace",
+            "summary": "build tool",
+            "workspace": ws_path,
+        });
+        let result = rest_add_memory(store.as_ref(), &body);
+        assert!(
+            result.get("id").is_some(),
+            "expected success entry: {result}"
+        );
+
+        let listed = store
+            .list(Some(Scope::Workspace), Some(&key), None)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "uses cargo");
+        assert_eq!(listed[0].summary.as_deref(), Some("build tool"));
+        assert_eq!(listed[0].workspace.as_deref(), Some(key.as_str()));
+
+        let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[test]
+    fn rest_add_memory_session_scope_maps_to_workspace() {
+        let store = Arc::new(MemoryStore::new()) as Arc<dyn MemoryBackend>;
+        let body = json!({
+            "content": "fact",
+            "scope": "session",
+        });
+        let result = rest_add_memory(store.as_ref(), &body);
+        assert_eq!(
+            result.get("scope").and_then(|v| v.as_str()),
+            Some("workspace")
+        );
+    }
 }
