@@ -409,13 +409,15 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/sessions/{session_id}/reviewer-stats",
             get(handler_reviewer_stats),
         )
-        // Team chat / journal stubs
+        // Team registry + chat / journal
+        .route("/v1/teams", get(teams::handler_list_teams))
+        .route("/v1/teams", post(teams::handler_create_team))
+        .route("/v1/teams/journal", get(teams::handler_teams_journal))
         .route("/v1/teams/{team_id}/chat", get(teams::handler_team_chat_get))
         .route(
             "/v1/teams/{team_id}/chat",
             post(teams::handler_team_chat_post),
         )
-        .route("/v1/teams/journal", get(teams::handler_teams_journal))
         // Auth / OAuth
         .route("/auth/callback", get(subsystems::handler_auth_callback))
         .route("/oauth/callback", post(subsystems::handler_oauth_callback))

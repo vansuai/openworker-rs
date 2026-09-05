@@ -369,6 +369,53 @@ export async function boardTransition(
   return res.json();
 }
 
+/** Token-auth board mutations (BoardView open board). Python uses body field `id`. */
+export async function tokenBoardComment(
+  space: string,
+  id: number,
+  body: string,
+  token?: string,
+): Promise<{ ok?: boolean; error?: string; seq?: number }> {
+  const res = await fetch(`${httpBase()}/v1/board/items/comment`, {
+    method: "POST",
+    headers: boardAuthHeaders(token),
+    body: JSON.stringify({ space, id, body }),
+  });
+  return res.json();
+}
+
+export async function tokenBoardTransition(
+  space: string,
+  id: number,
+  to: string,
+  comment = "",
+  token?: string,
+): Promise<BoardItem | { error: string }> {
+  const res = await fetch(`${httpBase()}/v1/board/items/transition`, {
+    method: "POST",
+    headers: boardAuthHeaders(token),
+    body: JSON.stringify({ space, id, to, comment }),
+  });
+  return res.json();
+}
+
+export interface TeamInfo {
+  team_id: string;
+  space: string;
+  lead_session: string;
+  lead_actor: string;
+  workers: { actor: string; persona: string; session_id: string }[];
+  chat_enabled?: boolean;
+  chat_group?: string;
+  paused?: boolean;
+}
+
+export async function getTeams(): Promise<TeamInfo[]> {
+  const res = await fetch(`${httpBase()}/v1/teams`);
+  const data = await res.json();
+  return data.teams ?? [];
+}
+
 export interface ChatMessage {
   seq: number;
   ts: string;
@@ -1021,6 +1068,14 @@ export interface ModelSettings {
   nav_layout?: "flat" | "grouped";
   // Sidebar: sessions shown per group before "Show more" (default 5, 1–50).
   sessions_peek?: number;
+  // Composer: show the context-window fill bar (default FALSE; absent → the chip shows
+  // the session total). The usage popover keeps both numbers regardless.
+  context_bar?: boolean;
+  // Auto-Approve mode (spec §1.5): the feature flag that offers the reviewer mode, and its
+  // shadow-eval sibling. Both default FALSE and are absent on older backends — the composer
+  // hides the Auto-Approve mode entry unless auto_approve is explicitly true.
+  auto_approve?: boolean;
+  auto_approve_shadow?: boolean;
   // Curated-matrix display names ({full id → "GLM-5.2 · via Together"}); custom models absent.
   model_labels?: Record<string, string>;
   // {full id → context window in tokens}, verified matrix entries only — drives the
@@ -1031,6 +1086,12 @@ export interface ModelSettings {
   pdf_fallback?: "text" | "images";
   pdf_max_pages?: number; // default 20, 1–100
   pdf_max_mb?: number; // default 10, 1–10
+  // Auto-compaction of long histories (OPE-27): trigger = min(threshold% × context
+  // window, cap tokens); model pins the summarizer ("" → the session's own model).
+  // Optional so the GUI is robust to an older backend.
+  compaction_threshold_pct?: number; // default 0.8, 0.10–0.95
+  compaction_cap_tokens?: number; // default 250000
+  compaction_model?: string;
 }
 
 export interface PdfSettings {
@@ -1039,11 +1100,29 @@ export interface PdfSettings {
   pdf_max_mb: number;
 }
 
+export interface CompactionSettings {
+  compaction_threshold_pct: number;
+  compaction_cap_tokens: number;
+  compaction_model: string;
+}
+
 /** Persist the Token-savings PDF settings (fallback mode + attach thresholds). */
 export async function setPdfSettings(
   patch: Partial<PdfSettings>,
 ): Promise<{ ok: boolean; error?: string } & Partial<PdfSettings>> {
   const res = await fetch(`${httpBase()}/v1/settings/pdf`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  return res.json();
+}
+
+/** Persist the auto-compaction overrides (threshold %, token cap, summarizer model). */
+export async function setCompactionSettings(
+  patch: Partial<CompactionSettings>,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/settings/compaction`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
@@ -1059,6 +1138,45 @@ export async function inspectPdf(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ data_url: dataUrl }),
+  });
+  return res.json();
+}
+
+/** Persist whether the composer shows the context-window fill bar. */
+export async function setContextBar(
+  shown: boolean,
+): Promise<{ ok: boolean; context_bar?: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/settings/context-bar`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ context_bar: shown }),
+  });
+  return res.json();
+}
+
+export type AutoApproveResult = {
+  ok: boolean;
+  auto_approve?: boolean;
+  auto_approve_shadow?: boolean;
+  error?: string;
+};
+
+/** Toggle the Auto-Approve feature flag (spec §1.5); applies to the next session build. */
+export async function setAutoApprove(on: boolean): Promise<AutoApproveResult> {
+  const res = await fetch(`${httpBase()}/v1/settings/auto-approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_approve: on }),
+  });
+  return res.json();
+}
+
+/** Toggle shadow evaluation (Part 6 step 3): the reviewer records but never decides. */
+export async function setAutoApproveShadow(on: boolean): Promise<AutoApproveResult> {
+  const res = await fetch(`${httpBase()}/v1/settings/auto-approve-shadow`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_approve_shadow: on }),
   });
   return res.json();
 }
@@ -1379,6 +1497,138 @@ export async function setSessionConnection(
   return res.json();
 }
 
+// -- Skills (SKILLS-SPEC §5/§6) ------------------------------------------------
+
+export interface SkillRow {
+  name: string;
+  description: string;
+  instructions: string;
+  scope: "global" | "project";
+  source: string; // "local" | "uploaded"
+  enabled: boolean;
+  path: string;
+  files?: number; // bundled resources beyond SKILL.md (§6 — rich skills are visible)
+}
+
+export interface SessionSkillRow {
+  name: string;
+  description: string;
+  scope: "global" | "project";
+  enabled: boolean; // false = muted for this session only
+}
+
+export interface SkillUploadPreview {
+  ok: boolean;
+  error?: string;
+  token?: string;
+  name?: string;
+  description?: string;
+  instructions?: string;
+  files?: string[];
+}
+
+const skillUrl = (path = "") => `${httpBase()}/v1/skills${path}`;
+const skillJsonPost = (body: unknown, method = "POST") => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+export async function listSkills(workspace?: string): Promise<SkillRow[]> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
+  const res = await fetch(skillUrl(qs));
+  return (await res.json()).skills ?? [];
+}
+
+export async function createSkill(body: {
+  name: string;
+  description: string;
+  instructions: string;
+  scope?: "global" | "project";
+  workspace?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(skillUrl(), skillJsonPost(body));
+  return res.json();
+}
+
+export async function updateSkill(
+  name: string,
+  patch: { description?: string; instructions?: string; enabled?: boolean; workspace?: string },
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(skillUrl(`/${encodeURIComponent(name)}`), skillJsonPost(patch, "PATCH"));
+  return res.json();
+}
+
+export async function revealSkill(name: string): Promise<{ ok: boolean; error?: string }> {
+  // §6 "Show folder": the backend opens the skill's folder in the OS file manager.
+  const res = await fetch(skillUrl(`/${encodeURIComponent(name)}/reveal`), skillJsonPost({}));
+  return res.json();
+}
+
+export async function deleteSkill(
+  name: string,
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
+  const res = await fetch(skillUrl(`/${encodeURIComponent(name)}${qs}`), { method: "DELETE" });
+  return res.json();
+}
+
+export async function moveSkill(
+  name: string,
+  scope: "global" | "project",
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(skillUrl(`/${encodeURIComponent(name)}/move`), skillJsonPost({ scope, workspace }));
+  return res.json();
+}
+
+export async function stageSkillUpload(
+  dataB64: string,
+  filename = "",
+): Promise<SkillUploadPreview> {
+  const res = await fetch(skillUrl("/upload"), skillJsonPost({ data_b64: dataB64, filename }));
+  return res.json();
+}
+
+export async function confirmSkillUpload(
+  token: string,
+  scope: "global" | "project" = "global",
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(skillUrl("/upload/confirm"), skillJsonPost({ token, scope, workspace }));
+  return res.json();
+}
+
+export async function sessionSkills(
+  sessionId: string,
+  workspace?: string,
+): Promise<SessionSkillRow[]> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/skills${qs}`,
+  );
+  return (await res.json()).skills ?? [];
+}
+
+export async function setSessionSkill(
+  sessionId: string,
+  skill: string,
+  enabled: boolean,
+  opts: { clear?: boolean; workspace?: string } = {},
+): Promise<{ skills?: SessionSkillRow[]; ok?: boolean; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/skills`,
+    skillJsonPost({
+      skill,
+      enabled,
+      ...(opts.clear ? { clear: true } : {}),
+      ...(opts.workspace ? { workspace: opts.workspace } : {}),
+    }),
+  );
+  return res.json();
+}
+
 // -- Inbox + Unattended -------------------------------------------------------
 export interface InboxItem {
   id: string;
@@ -1597,6 +1847,73 @@ export async function setOnboarded(value: boolean): Promise<{ ok: boolean; onboa
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value }),
+  });
+  return res.json();
+}
+
+// -- Memory (MEMORY-SPEC §5.3/§6: the memory screen, user rules, toast Undo) ----
+
+export interface MemoryEntry {
+  id: number;
+  scope: string;
+  content: string;
+  summary: string;
+  created_at: string;
+}
+
+export interface MemorySettings {
+  enabled: boolean;
+  user_rules: string;
+}
+
+// Fired whenever memory changes from OUTSIDE the memory screen — today the agent
+// saving or editing one mid-conversation. The screen only loads its list on mount, so
+// without this it sits there stale and the user reads "Nothing yet" seconds after a
+// save actually landed (owner-hit 2026-07-28).
+export const MEMORY_CHANGED = "coworker:memory-changed";
+export function announceMemoryChanged() {
+  window.dispatchEvent(new CustomEvent(MEMORY_CHANGED));
+}
+
+export async function getMemory(): Promise<MemoryEntry[]> {
+  const res = await fetch(`${httpBase()}/v1/memory`);
+  return (await res.json()).memory ?? [];
+}
+
+export async function updateMemory(
+  id: number,
+  content: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/memory/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  return res.json();
+}
+
+export async function deleteMemory(id: number): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/memory/${id}`, { method: "DELETE" });
+  return res.json();
+}
+
+export async function deleteAllMemory(): Promise<{ ok: boolean; deleted: number }> {
+  const res = await fetch(`${httpBase()}/v1/memory`, { method: "DELETE" });
+  return res.json();
+}
+
+export async function getMemorySettings(): Promise<MemorySettings> {
+  const res = await fetch(`${httpBase()}/v1/memory/settings`);
+  return res.json();
+}
+
+export async function setMemorySettings(
+  patch: Partial<MemorySettings>,
+): Promise<MemorySettings> {
+  const res = await fetch(`${httpBase()}/v1/memory/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
   });
   return res.json();
 }

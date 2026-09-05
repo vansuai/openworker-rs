@@ -19,6 +19,7 @@ pub const VALID_WORKSPACES: [&str; 4] = ["git", "project", "deliverable", "none"
 pub const VALID_MODES: [&str; 5] = ["discuss", "plan", "interactive", "custom", "auto"];
 pub const VALID_REC_KINDS: [&str; 2] = ["connector", "mcp"];
 pub const VALID_REC_TIERS: [&str; 2] = ["core", "optional"];
+pub const VALID_TEAM: [&str; 2] = ["lead", "worker"];
 /// Known tool capability ids (mirror of `coworker/catalog.py` `CATALOG`).
 pub const KNOWN_TOOLS: [&str; 6] = ["code_files", "files", "git", "search", "shell", "todo"];
 
@@ -77,6 +78,9 @@ pub struct PersonaManifest {
     pub mcp: Vec<String>,
     #[serde(default)]
     pub recommends: Vec<Recommendation>,
+    /// Team trait: `"lead"` | `"worker"` | None (solo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     #[serde(default)]
     pub builtin: bool,
     /// Where it was loaded from (path / url), for provenance.
@@ -379,6 +383,17 @@ pub fn parse_manifest(
     let tools = strlist(&meta, "tools")?;
     validate_tools(&persona_id, &tools)?;
 
+    let team_raw = meta_str(&meta, "team").to_lowercase();
+    let team = if team_raw.is_empty() {
+        None
+    } else if VALID_TEAM.contains(&team_raw.as_str()) {
+        Some(team_raw)
+    } else {
+        return Err(format!(
+            "persona {persona_id:?}: team must be one of [lead, worker] (omit for a solo coworker)"
+        ));
+    };
+
     let name = meta_str(&meta, "name");
     let name = if name.is_empty() { persona_id.clone() } else { name };
 
@@ -400,6 +415,7 @@ pub fn parse_manifest(
         skills: strlist(&meta, "skills")?,
         mcp: strlist(&meta, "mcp")?,
         recommends,
+        team,
         builtin,
         source: source.map(|s| s.to_string()),
     })

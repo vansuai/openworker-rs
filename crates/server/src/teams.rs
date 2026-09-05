@@ -13,7 +13,10 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ocw_data::{space_for_workspace, Actor, AttachmentStore, BoardError, BoardItem, Role, TeamStore};
+use ocw_data::{
+    space_for_workspace, Actor, AttachmentStore, BoardError, BoardItem, ChatMember, ChatStore,
+    JournalStore, Role, TeamRegistry, TeamStore, TeamWorker,
+};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -112,8 +115,11 @@ fn random_token() -> String {
 
 pub struct BoardServices {
     pub store: Arc<TeamStore>,
+    pub journal: Arc<JournalStore>,
+    pub chat: Arc<ChatStore>,
     pub attachments: Arc<AttachmentStore>,
     pub tokens: Arc<BoardTokens>,
+    pub registry: Arc<TeamRegistry>,
 }
 
 impl BoardServices {
@@ -121,10 +127,19 @@ impl BoardServices {
         let store = TeamStore::open(data_dir.join("teams.db")).unwrap_or_else(|_| {
             TeamStore::open_in_memory().expect("in-memory team store")
         });
+        let journal = JournalStore::open(data_dir.join("journal.db")).unwrap_or_else(|_| {
+            JournalStore::open_in_memory().expect("in-memory journal store")
+        });
+        let chat = ChatStore::open(data_dir.join("chat.db")).unwrap_or_else(|_| {
+            ChatStore::open_in_memory().expect("in-memory chat store")
+        });
         Self {
             store: Arc::new(store),
+            journal: Arc::new(journal),
+            chat: Arc::new(chat),
             attachments: Arc::new(AttachmentStore::new(data_dir.join("attachments"))),
             tokens: Arc::new(BoardTokens::open(data_dir.join("board-tokens.json"))),
+            registry: Arc::new(TeamRegistry::open(data_dir.join("teams.json"))),
         }
     }
 }
@@ -366,7 +381,13 @@ pub async fn handler_create_item(
             parent,
             case,
         ) {
-            Ok(item) => Json(item).into_response(),
+            Ok(item) => {
+                if !item.case_id.is_empty() {
+                    let _ = state.board.journal.ensure_case(&item.case_id, &actor.id);
+                }
+                crate::team_tick::kick_team_tick(state.clone());
+                Json(item).into_response()
+            }
             Err(e) => map_board_err(e),
         }
     })
@@ -423,7 +444,10 @@ pub async fn handler_board_transition(
         let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
         let comment = body.get("comment").and_then(|v| v.as_str()).unwrap_or("");
         match state.board.store.transition(space, &actor, id, to, comment) {
-            Ok(item) => Json(item).into_response(),
+            Ok(item) => {
+                crate::team_tick::kick_team_tick(state.clone());
+                Json(item).into_response()
+            }
             Err(e) => map_board_err(e),
         }
     })
@@ -439,7 +463,10 @@ pub async fn handler_board_comment(
         let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
         match state.board.store.comment(space, &actor, id, text) {
-            Ok(event) => Json(event).into_response(),
+            Ok(event) => {
+                crate::team_tick::kick_team_tick(state.clone());
+                Json(event).into_response()
+            }
             Err(e) => map_board_err(e),
         }
     })
@@ -454,8 +481,26 @@ pub async fn handler_board_assign(
         let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
         let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let assignee = body.get("assignee").and_then(|v| v.as_str()).unwrap_or("");
+        let previous = state
+            .board
+            .store
+            .get_item(space, id, &actor)
+            .map(|item| item.assignee)
+            .unwrap_or_default();
         match state.board.store.assign(space, &actor, id, assignee) {
-            Ok(item) => Json(item).into_response(),
+            Ok(item) => {
+                if !item.case_id.is_empty() {
+                    let _ = state.board.journal.sync_assignment(
+                        &item.case_id,
+                        space,
+                        item.id,
+                        &previous,
+                        assignee,
+                    );
+                }
+                crate::team_tick::kick_team_tick(state.clone());
+                Json(item).into_response()
+            }
             Err(e) => map_board_err(e),
         }
     })
@@ -470,7 +515,19 @@ pub async fn handler_board_claim(
         let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
         let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         match state.board.store.claim(space, &actor, id) {
-            Ok(item) => Json(item).into_response(),
+            Ok(item) => {
+                if !item.case_id.is_empty() {
+                    let _ = state.board.journal.sync_assignment(
+                        &item.case_id,
+                        space,
+                        item.id,
+                        "",
+                        &actor.id,
+                    );
+                }
+                crate::team_tick::kick_team_tick(state.clone());
+                Json(item).into_response()
+            }
             Err(e) => map_board_err(e),
         }
     })
@@ -637,9 +694,11 @@ pub async fn handler_board_journal_cases(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    with_actor(&headers, &state, |_actor| {
-        // Journal store tables not yet ported — honest empty stub.
-        Json(json!({ "cases": [] })).into_response()
+    with_actor(&headers, &state, |actor| {
+        match state.board.journal.overview(&actor) {
+            Ok(cases) => Json(json!({ "cases": cases })).into_response(),
+            Err(e) => map_board_err(e),
+        }
     })
 }
 
@@ -663,21 +722,90 @@ pub struct JournalQuery {
 pub async fn handler_board_journal_get(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(_q): Query<JournalQuery>,
+    Query(q): Query<JournalQuery>,
 ) -> Response {
-    with_actor(&headers, &state, |_actor| {
-        Json(json!({ "entries": [] })).into_response()
+    with_actor(&headers, &state, |actor| {
+        let author = if q.author.is_empty() {
+            None
+        } else {
+            Some(q.author.as_str())
+        };
+        let kind = if q.kind.is_empty() {
+            None
+        } else {
+            Some(q.kind.as_str())
+        };
+        let entity = if q.entity.is_empty() {
+            None
+        } else {
+            Some(q.entity.as_str())
+        };
+        match state.board.journal.read(
+            &actor,
+            &q.case,
+            q.item,
+            author,
+            kind,
+            entity,
+            0,
+            !q.include_raw.is_empty(),
+            q.limit,
+        ) {
+            Ok(entries) => Json(json!({ "entries": entries })).into_response(),
+            Err(e) => map_board_err(e),
+        }
     })
 }
 
 pub async fn handler_board_journal_post(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
-    with_actor(&headers, &state, |_actor| {
-        // Journal store tables not yet ported — honest accept stub.
-        Json(json!({ "ok": true })).into_response()
+    with_actor(&headers, &state, |actor| {
+        let case = body.get("case").and_then(|v| v.as_str()).unwrap_or("");
+        let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("note");
+        let space = body
+            .get("space")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let item = body.get("item").and_then(|v| v.as_i64());
+        let entities: Vec<String> = body
+            .get("entities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let refs: Vec<String> = body
+            .get("refs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match state.board.journal.append(
+            &actor,
+            case,
+            text,
+            kind,
+            space,
+            item,
+            Some(&entities),
+            Some(&refs),
+        ) {
+            Ok(entry) => Json(entry).into_response(),
+            Err(e) => map_board_err(e),
+        }
     })
 }
 
@@ -816,11 +944,14 @@ pub async fn handler_session_board_comment(
         .store
         .comment(&space, &user_actor(), item_id, text)
     {
-        Ok(event) => Json(json!({
-            "ok": true,
-            "seq": event.get("seq").and_then(|s| s.as_i64()).unwrap_or(0),
-        }))
-        .into_response(),
+        Ok(event) => {
+            crate::team_tick::kick_team_tick(state.clone());
+            Json(json!({
+                "ok": true,
+                "seq": event.get("seq").and_then(|s| s.as_i64()).unwrap_or(0),
+            }))
+            .into_response()
+        }
         Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
@@ -842,7 +973,10 @@ pub async fn handler_session_board_transition(
         .store
         .transition(&space, &user_actor(), item_id, to, comment)
     {
-        Ok(item) => Json(item).into_response(),
+        Ok(item) => {
+            crate::team_tick::kick_team_tick(state.clone());
+            Json(item).into_response()
+        }
         Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
@@ -851,19 +985,175 @@ pub async fn handler_session_board_transition(
 // Team chat / journal stubs
 // ---------------------------------------------------------------------------
 
-pub async fn handler_team_chat_get(AxumPath(_team_id): AxumPath<String>) -> Response {
-    Json(json!({ "enabled": false, "messages": [], "members": [] })).into_response()
+/// Register a team in the wake roster (tests / kick path before Phase D create_team tool).
+pub async fn handler_create_team(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+    let lead_session = body
+        .get("lead_session")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let lead_actor = body
+        .get("lead_actor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("lead");
+    if space.is_empty() || lead_session.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "space and lead_session are required" })),
+        )
+            .into_response();
+    }
+    let workers: Vec<TeamWorker> = body
+        .get("workers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    let actor = w.get("actor")?.as_str()?.to_string();
+                    let persona = w
+                        .get("persona")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or(&actor)
+                        .to_string();
+                    let session_id = w.get("session_id")?.as_str()?.to_string();
+                    Some(TeamWorker {
+                        actor,
+                        persona,
+                        session_id,
+                        model: w
+                            .get("model")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        reason: w
+                            .get("reason")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // MVP: enable chat by default for registered teams unless explicitly disabled.
+    let mut chat_enabled = body
+        .get("chat_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let mut chat_group = body
+        .get("chat_group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if chat_enabled && chat_group.is_empty() {
+        let mut members: Vec<ChatMember> = workers
+            .iter()
+            .map(|w| ChatMember {
+                name: w.actor.clone(),
+                persona: w.persona.clone(),
+                role: "worker".into(),
+            })
+            .collect();
+        members.push(ChatMember {
+            name: "lead".into(),
+            persona: lead_actor.to_string(),
+            role: "lead".into(),
+        });
+        match state.board.chat.create_group("team chat", members) {
+            Ok(group) => {
+                chat_group = group
+                    .get("group_id")
+                    .and_then(|g| g.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            Err(e) => {
+                tracing::warn!("chat group create failed: {e}");
+                chat_enabled = false;
+            }
+        }
+    }
+    let team = state.board.registry.create(
+        space,
+        lead_session,
+        lead_actor,
+        workers,
+        chat_enabled,
+        &chat_group,
+    );
+    Json(team).into_response()
+}
+
+pub async fn handler_list_teams(State(state): State<AppState>) -> Response {
+    Json(json!({ "teams": state.board.registry.all() })).into_response()
+}
+
+pub async fn handler_team_chat_get(
+    State(state): State<AppState>,
+    AxumPath(team_id): AxumPath<String>,
+) -> Response {
+    let Some(team) = state.board.registry.get(&team_id) else {
+        return Json(json!({ "enabled": false, "messages": [], "members": [] })).into_response();
+    };
+    if !team.chat_enabled || team.chat_group.is_empty() {
+        return Json(json!({ "enabled": false, "messages": [], "members": [] })).into_response();
+    }
+    let group = state
+        .board
+        .chat
+        .get_group(&team.chat_group)
+        .unwrap_or_else(|| json!({ "members": [] }));
+    let messages = state.board.chat.messages(&team.chat_group, 0, 200);
+    if let Some(last) = messages
+        .last()
+        .and_then(|m| m.get("seq").and_then(|s| s.as_i64()))
+    {
+        // Viewing IS reading for the user (Python team_chat mark_read).
+        state.board.chat.consume(&team.chat_group, "user", last);
+    }
+    let members = group.get("members").cloned().unwrap_or(json!([]));
+    Json(json!({
+        "enabled": true,
+        "team_id": team_id,
+        "members": members,
+        "messages": messages,
+    }))
+    .into_response()
 }
 
 pub async fn handler_team_chat_post(
-    AxumPath(_team_id): AxumPath<String>,
-    Json(_body): Json<Value>,
+    State(state): State<AppState>,
+    AxumPath(team_id): AxumPath<String>,
+    Json(body): Json<Value>,
 ) -> Response {
-    Json(json!({ "error": "team chat not configured" })).into_response()
+    let Some(team) = state.board.registry.get(&team_id) else {
+        return Json(json!({ "error": "unknown team" })).into_response();
+    };
+    if !team.chat_enabled || team.chat_group.is_empty() {
+        return Json(json!({ "error": "chat is not enabled for this team" })).into_response();
+    }
+    let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    match state
+        .board
+        .chat
+        .post(&team.chat_group, "user", text, "user")
+    {
+        Ok(message) => {
+            crate::team_tick::kick_team_tick(state.clone());
+            Json(message).into_response()
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
+    }
 }
 
-pub async fn handler_teams_journal() -> Response {
-    Json(json!({ "cases": [] })).into_response()
+pub async fn handler_teams_journal(State(state): State<AppState>) -> Response {
+    match state.board.journal.overview(&user_actor()) {
+        Ok(cases) => Json(json!({ "cases": cases })).into_response(),
+        Err(e) => map_board_err(e),
+    }
 }
 
 #[cfg(test)]

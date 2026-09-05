@@ -165,33 +165,34 @@
 | MCP trust / revoke / convert API | server routes + GUI `CustomMcp` / `ToolReview` |
 | GUI OPE-136 审批卡 + i18n en/zh | cherry-pick；保留 Tauri/`ocw-server` 接线 |
 | Compaction / reviewer / provenance | **已挂入 TurnEngine**（due→summarize、overflow 重试、`apply_to_outbound`、SessionFiles、`_display` origin、AutoApprove 评审） |
-| Teams/Board HTTP | `/v1/board/*`（token 鉴权）+ GUI Board 面板 / Sidebar 入口 |
+| Teams/Board HTTP | `/v1/board/*` + session board + JournalStore + team_tick BoardWake |
 | Codex / OpenAI Responses | **已实现并接入 router**（stock OpenAI → Responses；`openai-codex` 描述符） |
 | Security personas | Python builtin 资源已随覆盖带入 |
 | Scheduler #379 | claim-at-dispatch + catchup 后 `sleep(30)` 再 schedule（对齐 Python，避免 interval 立即双跑） |
+| Board 引擎工具 / Team chat | persona `team` 门控 board/journal tools；ChatStore + TeamChatView |
 
 ### 7.2 仍存缺口（相对上游行为契约）
 
 | 缺口 | 说明 |
 | --- | --- |
-| HTTP 路由面 | **已对齐**：Python-only 仅 `_debug/inject_inbound`；settings/codex/board/memory/projects/misc 已挂 `ocw-server` |
-| Board journal | token `/v1/board/journal*` 仍为 **stub**（空 cases/entries） |
-| Codex OAuth 浏览器流 | status/signout **真**；signin 诚实 stub（可读 secrets 里已有 token） |
-| reviewer-stats | 形状对齐，计量暂为 zeros stub（未接 audit 聚合） |
-| `ocw` CLI / board MCP | 可后置 |
-| RightRail 内 BoardSection 深度集成 | 组件已有；App session 右栏挂载可继续打磨 |
-| Team chat | HTTP stub（`enabled:false`） |
+| HTTP 路由面 | **已对齐**：Python-only 仅 `_debug/inject_inbound` |
+| GUI + Board 闭环（本期） | **已对齐**：`nav_layout` 契约、RightRail `BoardSection`、BoardView 可写、`JournalStore`、`team_tick`/`BoardWake`、board/journal tools、Team chat + `TeamChatView` |
+| Codex OAuth 浏览器流 | status/signout **真**；signin 诚实 stub |
+| reviewer-stats | 形状对齐；审计聚合仍浅 |
+| `ocw` CLI / board MCP | **后置**（本期不做） |
+| MCP tools/call、Gateway 入站、Browser | 切流级缺口，另立计划 |
+| BoardWake 投递 | 当前落盘 + WS `turn_start`/`turn_done`（含 source）；完整引擎 turn 续跑可再加深 |
 
-> 2026-09-05 补丁：TurnEngine 已挂 compaction/reviewer/provenance；WS 仅在 `auto_approve` 时挂 reviewer，并注入 live compaction settings；stock OpenAI / `openai-codex` 走 Responses；scheduler catchup 后 sleep 再 tick；settings/board/memory/project 路由面与 Python 重合。
+> 2026-09-05：路由面补齐后继续 GUI+Board 等价对齐——Journal / TeamRegistry / team_tick / board_tools / ChatStore；GUI RightRail Board + TeamChat；`ocw-server` lib 102、GUI vitest 143。
 
 ### 7.3 验收命令（2026-09-05）
 
 ```text
-.venv/bin/python -m pytest tests -q --ignore=tests/test_url_address_guard.py
-# → ~1911 passed
+python3 scripts/rust_route_parity.py
+# → Python-only: 1 (_debug)
 
-cd crates && cargo test --workspace --lib
-# → 各 crate ok（engine 38、provider 含 Responses 单测、ocw-server 等）
+cd crates && cargo test -p ocw-data --lib && cargo test -p ocw-server --lib
+# → ocw-data 44；ocw-server 102
 
 cd surfaces/gui && npx tsc --noEmit && npx vitest run
 # → tsc 0；143 tests passed

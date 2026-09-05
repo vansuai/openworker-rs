@@ -1192,7 +1192,8 @@ impl TeamStore {
     fn set_cursor(conn: &Connection, key: &str, upto_seq: i64) -> Result<(), BoardError> {
         conn.execute(
             "INSERT INTO team_cursors (cursor_key, consumed_seq) VALUES (?, ?)
-             ON CONFLICT(cursor_key) DO UPDATE SET consumed_seq = excluded.consumed_seq",
+             ON CONFLICT(cursor_key) DO UPDATE SET consumed_seq =
+               MAX(consumed_seq, excluded.consumed_seq)",
             params![key, upto_seq],
         )?;
         Ok(())
@@ -1241,6 +1242,68 @@ impl TeamStore {
 
     pub fn consume_feed(&self, space: &str, actor_id: &str, upto_seq: i64) -> Result<(), BoardError> {
         let key = format!("feed:{actor_id}:{space}");
+        let conn = self.conn.lock();
+        Self::set_cursor(&conn, &key, upto_seq)
+    }
+
+    /// Lead subscription allowlist: review/blocked transitions, new filings, claims.
+    pub const SUBSCRIBED_TRANSITIONS: &'static [&'static str] = &["review", "blocked"];
+
+    /// Unconsumed subscription-worthy events on a space for one subscriber (lead).
+    pub fn subscribed_events(
+        &self,
+        space: &str,
+        subscriber: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>, BoardError> {
+        let key = format!("sub:{subscriber}:{space}");
+        let conn = self.conn.lock();
+        let since = self.cursor(&conn, &key)?;
+        let mut stmt = conn.prepare(
+            "SELECT space, seq, kind, actor, role, item_id, case_id, payload, ts
+             FROM team_events WHERE space = ? AND seq > ? ORDER BY seq LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![space, since, limit], Self::row_to_event)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let event = row?;
+            let actor = event.get("actor").and_then(|a| a.as_str()).unwrap_or("");
+            if actor == subscriber {
+                continue;
+            }
+            let kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            let payload = event.get("payload").cloned().unwrap_or(json!({}));
+            match kind {
+                ITEM_TRANSITIONED => {
+                    let to = payload.get("to").and_then(|t| t.as_str()).unwrap_or("");
+                    if !Self::SUBSCRIBED_TRANSITIONS.contains(&to) {
+                        continue;
+                    }
+                }
+                ITEM_CREATED => {}
+                ITEM_ASSIGNED => {
+                    if !payload
+                        .get("claimed")
+                        .and_then(|c| c.as_bool())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            out.push(event);
+        }
+        Ok(out)
+    }
+
+    pub fn consume_subscription(
+        &self,
+        space: &str,
+        subscriber: &str,
+        upto_seq: i64,
+    ) -> Result<(), BoardError> {
+        let key = format!("sub:{subscriber}:{space}");
         let conn = self.conn.lock();
         Self::set_cursor(&conn, &key, upto_seq)
     }
@@ -1571,5 +1634,48 @@ mod tests {
             PathBuf::from(&space).canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn lead_subscriptions_are_an_allowlist() {
+        let store = TeamStore::open_in_memory().unwrap();
+        let space = "proj";
+        let lead = lead();
+        let w = worker("swe-worker");
+        let item = store
+            .create_item(space, &lead, "Task", "tests pass", "", None, None)
+            .unwrap();
+        store.assign(space, &lead, item.id, "swe-worker").unwrap();
+        store
+            .transition(space, &w, item.id, "in_progress", "")
+            .unwrap();
+        store.comment(space, &w, item.id, "halfway").unwrap();
+        store
+            .transition(space, &w, item.id, "review", "done, please check")
+            .unwrap();
+        let _filed = store
+            .create_item(space, &w, "Found a bug", "fix", "", None, None)
+            .unwrap();
+        let subs = store.subscribed_events(space, "lead-1", 200).unwrap();
+        assert!(subs
+            .iter()
+            .all(|e| e.get("actor").and_then(|a| a.as_str()) != Some("lead-1")));
+        let pairs: std::collections::HashSet<(String, Option<String>)> = subs
+            .iter()
+            .map(|e| {
+                let kind = e.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+                let to = e
+                    .get("payload")
+                    .and_then(|p| p.get("to"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                (kind, to)
+            })
+            .collect();
+        assert!(pairs.contains(&("item_transitioned".into(), Some("review".into()))));
+        assert!(pairs.contains(&("item_created".into(), None)));
+        let last = subs.last().unwrap().get("seq").and_then(|s| s.as_i64()).unwrap();
+        store.consume_subscription(space, "lead-1", last).unwrap();
+        assert!(store.subscribed_events(space, "lead-1", 200).unwrap().is_empty());
     }
 }

@@ -1,16 +1,20 @@
 //! OpenWorker Data Layer — Rust reimplementation of Memory/Sessions/Conversations/Automation.
 
 mod automation;
+mod chat;
 mod conversation;
 mod error;
 mod inbox;
 mod inbox_routing;
+mod journal;
 mod memory;
 mod overrides;
+mod team_registry;
 mod teams;
 mod types;
 
 pub use automation::{Schedule, ScheduledTask, TaskRun, TaskStore};
+pub use chat::{ChatMember, ChatStore};
 pub use conversation::{default_base_dir, ConversationStore};
 pub use error::Error;
 pub use inbox::{
@@ -20,8 +24,10 @@ pub use inbox::{
 pub use inbox_routing::{
     reply_intent, resolve_from_reply, InboxBinding, InboxRouting, DEFAULT_INBOX,
 };
+pub use journal::{JournalStore, GENESIS, JOURNAL_BODY_LIMIT, JOURNAL_KINDS};
 pub use memory::{format_memories, MemoryStore, SQLiteMemoryStore};
 pub use overrides::RiskOverrideStore;
+pub use team_registry::{Team, TeamRegistry, TeamWorker};
 pub use teams::{
     space_for_workspace, stored_name, validate_stored_name, Actor, AttachmentStore, BoardError,
     BoardItem, Role, TeamStore,

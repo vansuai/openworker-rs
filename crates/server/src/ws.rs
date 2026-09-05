@@ -334,6 +334,8 @@ pub(crate) fn build_builtin_registry(
     // engines pass None (Python's `_build_task_engine` uses `task_store=None`)
     // so an automation cannot recursively create automations.
     automations: Option<(StdArc<crate::automations::AutomationStore>, String)>,
+    // Board/journal tools for team personas (None for scheduled runs / tests).
+    board: Option<crate::board_tools::BoardToolsArgs>,
 ) -> StdArc<ocw_engine::ToolRegistry> {
     let mut reg = ocw_engine::ToolRegistry::new();
     let agent_config = crate::agents::get_agent(agent);
@@ -374,6 +376,10 @@ pub(crate) fn build_builtin_registry(
                 },
             );
         }
+    }
+
+    if let Some(board_args) = board {
+        crate::board_tools::register_board_tools(&mut reg, board_args);
     }
 
     // Shell executor is managed separately (persistent per-workspace) and registered
@@ -1367,6 +1373,23 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             .get_session_sync(&session_id)
             .and_then(|s| s.workspace)
             .unwrap_or_else(|| ".".to_string());
+        let team_role = state
+            .persona_store
+            .get(&agent)
+            .and_then(|e| e.team.clone());
+        let board_kick_state = state.clone();
+        let board_args = crate::board_tools::BoardToolsArgs {
+            store: StdArc::clone(&state.board.store),
+            journal: StdArc::clone(&state.board.journal),
+            team_registry: StdArc::clone(&state.board.registry),
+            session_id: session_id.clone(),
+            persona: agent.clone(),
+            workspace: workspace.clone(),
+            team_role,
+            on_mutate: Some(StdArc::new(move || {
+                crate::team_tick::kick_team_tick(board_kick_state.clone());
+            })),
+        };
         let registry = build_builtin_registry(
             &workspace,
             StdArc::clone(&todo_list),
@@ -1375,6 +1398,7 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             &agent,
             &state.skill_store,
             Some((state.automations.read().await.clone(), session_id.clone())),
+            Some(board_args),
         );
         let permissions = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
             state.config.data_dir.join("permissions.json"),
@@ -1798,6 +1822,7 @@ mod tests {
             agent,
             &ocw_skills::SkillStore::new(workspace.to_path_buf()),
             automations,
+            None,
         )
     }
 

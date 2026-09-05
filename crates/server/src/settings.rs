@@ -278,8 +278,10 @@ pub async fn handler_set_nav_layout(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    // GUI / Python send `nav_layout`; accept legacy `layout` as a fallback.
     let layout = body
-        .get("layout")
+        .get("nav_layout")
+        .or_else(|| body.get("layout"))
         .and_then(|v| v.as_str())
         .unwrap_or("flat")
         .trim()
@@ -291,6 +293,20 @@ pub async fn handler_set_nav_layout(
     }
     state.settings.set_nav_layout(layout.clone()).await;
     Json(serde_json::json!({ "ok": true, "nav_layout": layout }))
+}
+
+#[cfg(test)]
+mod nav_layout_tests {
+    #[test]
+    fn prefers_nav_layout_key() {
+        let body = serde_json::json!({ "nav_layout": "grouped", "layout": "flat" });
+        let layout = body
+            .get("nav_layout")
+            .or_else(|| body.get("layout"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("flat");
+        assert_eq!(layout, "grouped");
+    }
 }
 
 pub async fn handler_set_experimental_connectors(

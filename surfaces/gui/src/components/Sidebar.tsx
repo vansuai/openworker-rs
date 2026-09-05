@@ -137,12 +137,10 @@ interface Props {
   onOpenIntegrations: () => void;
   onOpenAudit: () => void;
   onOpenInbox: () => void;
-  onOpenBoard: () => void;
   scheduledActive: boolean;
   integrationsActive: boolean;
   auditActive: boolean;
   inboxActive: boolean;
-  boardActive: boolean;
   // Collapse controls (⌘B / hover-peek). `onCollapse` docks/undocks; `onPeekLeave` hides the
   // floating peek when the pointer leaves the panel.
   collapsed?: boolean;
@@ -1040,17 +1038,6 @@ export function Sidebar(props: Props) {
           <Icon name="clock" size={15} className="shrink-0" />
           <span className="flex-1">Automations</span>
         </button>
-        <button
-          className={
-            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-left hover:bg-paper hover:text-ink " +
-            (props.boardActive ? "text-ink bg-paper" : "text-muted")
-          }
-          data-testid="nav-board"
-          onClick={props.onOpenBoard}
-        >
-          <Icon name="table" size={15} className="shrink-0" />
-          <span className="flex-1">Board</span>
-        </button>
       </div>
 
       {/* Scroll area: Pinned band + the RECENT header (with group/filter control), then the body —
@@ -1190,7 +1177,6 @@ export function Sidebar(props: Props) {
                   <AttnBadge n={totalAttention} />,
                 )}
                 {appMenuItem("plug", "Connectors", props.onOpenIntegrations, props.integrationsActive)}
-                {appMenuItem("table", "Board", props.onOpenBoard, props.boardActive)}
                 <div className="h-px bg-line my-1 mx-2" />
                 {appMenuItem(
                   "gear",

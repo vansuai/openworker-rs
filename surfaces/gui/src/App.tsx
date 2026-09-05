@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import { useTranslation } from "react-i18next";
 import {
   announceInboxUnlock,
   ApiError,
@@ -66,8 +67,10 @@ import { ApprovalCard } from "./components/ApprovalCard";
 import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
-import { BoardView } from "./components/BoardView";
+import { TeamChatView } from "./components/TeamChatView";
 import { coerceTodoArray } from "./todoUtils";
+
+type SettingsTab = "appearance" | "models" | "context" | "skills" | "voice" | "memory" | "personas";
 
 const newId = () =>
   (crypto as any).randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14);
@@ -156,6 +159,7 @@ function fallbackWorkspace(current: string | null, projects: RecentWorkspace[]):
 }
 
 export function App() {
+  const { t } = useTranslation();
   const [workspace, setWorkspace] = useState<string | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [showGate, setShowGate] = useState(false);
@@ -211,10 +215,8 @@ export function App() {
   const [scheduledOpenId, setScheduledOpenId] = useState<string | null>(null);
   const [gateCreate, setGateCreate] = useState(false);
   // Which Settings section the full-page Settings surface opens on (§ Settings-as-page).
-  const [settingsTab, setSettingsTab] = useState<"appearance" | "models" | "voice" | "personas">(
-    "appearance",
-  );
-  const openSettings = (tab: "appearance" | "models" | "voice" | "personas" = "appearance") => {
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("appearance");
+  const openSettings = (tab: SettingsTab = "appearance") => {
     setSettingsTab(tab);
     setSurface("settings");
   };
@@ -226,8 +228,13 @@ export function App() {
   // a "Could not reach server" chip with a retry action instead of the perpetual "Loading models…".
   const [modelsLoadError, setModelsLoadError] = useState(false);
   const [surface, setSurface] = useState<
-    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings" | "board"
+    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings"
   >("session");
+  // # team chat overlay (agent teams) — fills .main in place when open.
+  const [teamChatId, setTeamChatId] = useState<string | null>(null);
+  useEffect(() => {
+    setTeamChatId(null);
+  }, [sessionId]);
   // Force remount of ScheduledView when navigating to it via the sidebar button,
   // so it always lands on the list even if already on a detail page.
   const [scheduledKey, setScheduledKey] = useState(0);
@@ -1406,12 +1413,10 @@ export function App() {
         onOpenIntegrations={() => setSurface("integrations")}
         onOpenAudit={() => setSurface("audit")}
         onOpenInbox={() => setSurface("inbox")}
-        onOpenBoard={() => setSurface("board")}
         scheduledActive={surface === "scheduled"}
         integrationsActive={surface === "integrations"}
         auditActive={surface === "audit"}
         inboxActive={surface === "inbox"}
-        boardActive={surface === "board"}
         collapsed={navCollapsed}
         onCollapse={toggleNav}
         onPeekLeave={() => setNavPeek(false)}
@@ -1429,14 +1434,22 @@ export function App() {
         />
       ) : surface === "integrations" ? (
         <IntegrationsView />
-      ) : surface === "board" ? (
-        <BoardView />
       ) : surface === "settings" ? (
         <SettingsView
           key={settingsTab}
           initialTab={settingsTab}
           onOpenPersona={(id) => openPersona(id, "settings")}
-          onSettingsChanged={loadSettings}
+          onCreateSkill={(description) => {
+            // The Skills doorway (SKILLS-SPEC §5.2): creation is a conversation. Fresh
+            // session, description in the composer — the user reads and hits send. With
+            // no description, the prefill invites them to finish the sentence there.
+            startNewSession();
+            prefillComposer(
+              description
+                ? t("app.build_skill_prefill", { description })
+                : t("app.build_skill_prefill_empty"),
+            );
+          }}
         />
       ) : surface === "audit" ? (
         <AuditView />
@@ -1738,7 +1751,11 @@ export function App() {
             scratchPrimary={agent === "cowork"}
             openAccessKey={accessKey}
             onOpenIntegrations={() => setSurface("integrations")}
+            onOpenTeamChat={(id) => setTeamChatId(id)}
           />
+          {teamChatId && (
+            <TeamChatView teamId={teamChatId} onClose={() => setTeamChatId(null)} />
+          )}
         </div>
       </div>
       )}

@@ -146,6 +146,7 @@ async fn run_task_inner(
         &task.agent,
         &state.skill_store,
         None, // scheduled-run engines get no scheduling tools (Python `task_store=None`)
+        None, // no board tools on scheduled runs
     );
     let permissions = Arc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
         state.config.data_dir.join("permissions.json"),
@@ -508,6 +509,8 @@ async fn run_tick(state: &Arc<AppState>, trigger: String) {
             RUNNING_IDS.lock().remove(&task_id);
         });
     }
+    // Board wake drain — mirrors Python's scheduler calling team_tick each tick.
+    let _ = crate::team_tick::team_tick(state.as_ref()).await;
 }
 
 pub async fn start_scheduler(state: Arc<AppState>) {

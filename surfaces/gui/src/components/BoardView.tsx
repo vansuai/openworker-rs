@@ -11,6 +11,8 @@ import {
   getTokenBoardItem,
   setStoredBoardSpace,
   setStoredBoardToken,
+  tokenBoardComment,
+  tokenBoardTransition,
   type Board,
   type BoardItemDetail,
 } from "../api";
@@ -170,6 +172,16 @@ export function BoardView() {
           loadItem={loadItem}
           loadAttachment={loadAttachment}
           initialItem={detailId}
+          onTransition={(item, to, comment) => {
+            void tokenBoardTransition(space.trim(), item, to, comment ?? "", token.trim()).then(
+              () => refresh(token, space),
+            );
+          }}
+          onComment={(item, body) =>
+            tokenBoardComment(space.trim(), item, body, token.trim()).then(() =>
+              refresh(token, space),
+            )
+          }
         />
       )}
     </div>

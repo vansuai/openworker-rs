@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 // Emits the asset URL only; the worker itself loads lazily with the pdfjs chunk.
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { useTranslation } from "react-i18next";
 import {
   getArtifacts,
+  getTeams,
   readArtifact,
   revealArtifact,
   type ArtifactContent,
@@ -57,6 +59,7 @@ interface Props {
   scratchPrimary?: boolean;
   openAccessKey?: number;
   onOpenIntegrations?: () => void;
+  onOpenTeamChat?: (teamId: string) => void;
 }
 
 export function RightRail({
@@ -75,7 +78,9 @@ export function RightRail({
   scratchPrimary,
   openAccessKey = 0,
   onOpenIntegrations,
+  onOpenTeamChat,
 }: Props) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState<Record<Panel, boolean>>({
     progress: true,
     artifacts: true,
@@ -83,12 +88,25 @@ export function RightRail({
   const [artifacts, setArtifacts] = useState<ArtifactInfo[]>([]);
   const [selected, setSelected] = useState<ArtifactInfo | null>(null);
   const [content, setContent] = useState<ArtifactContent | null>(null);
+  const [teamId, setTeamId] = useState<string | null>(null);
 
   const refreshArtifacts = () => getArtifacts(sessionId).then(setArtifacts).catch(() => setArtifacts([]));
+  const refreshTeam = () =>
+    getTeams()
+      .then((teams) => {
+        const mine = teams.find(
+          (tm) =>
+            tm.lead_session === sessionId ||
+            tm.workers?.some((w) => w.session_id === sessionId),
+        );
+        setTeamId(mine?.chat_enabled !== false && mine?.team_id ? mine.team_id : null);
+      })
+      .catch(() => setTeamId(null));
 
   useEffect(() => {
     if (!active) return;
     if (showArtifacts) refreshArtifacts();
+    refreshTeam();
   }, [active, sessionId, refreshKey, showArtifacts]);
 
   // Switching conversations closes any open artifact — it belongs to the previous session's
@@ -205,6 +223,17 @@ export function RightRail({
               </div>
             )}
           </RailSection>
+          )}
+
+          {teamId && onOpenTeamChat && (
+            <button
+              className="teamreq-chat"
+              data-testid="rail-team-chat"
+              onClick={() => onOpenTeamChat(teamId)}
+            >
+              <Icon name="chat" size={14} />
+              <span>{t("rail.team_chat")}</span>
+            </button>
           )}
 
           {/* §32: Access — the former Session-settings drawer, one section among peers.

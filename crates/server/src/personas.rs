@@ -57,6 +57,9 @@ pub struct PersonaEntry {
     /// Connector/MCP recommendations surfaced in the connections drawer.
     #[serde(default)]
     pub recommends: Vec<Recommendation>,
+    /// Team trait from manifest: `"lead"` | `"worker"` | None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -88,6 +91,7 @@ impl PersonaEntry {
             skills: m.skills,
             mcp: m.mcp,
             recommends: m.recommends,
+            team: m.team,
         }
     }
 }
@@ -173,6 +177,7 @@ impl PersonaStore {
                 skills: vec![],
                 mcp: vec![],
                 recommends: vec![],
+                team: None,
             },
             PersonaEntry {
                 id: "code".into(),
@@ -199,6 +204,7 @@ impl PersonaStore {
                 skills: vec![],
                 mcp: vec![],
                 recommends: vec![],
+                team: None,
             },
             PersonaEntry {
                 id: "chat".into(),
@@ -220,6 +226,7 @@ impl PersonaStore {
                 skills: vec![],
                 mcp: vec![],
                 recommends: vec![],
+                team: None,
             },
         ];
 
