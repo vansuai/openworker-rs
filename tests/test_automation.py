@@ -379,6 +379,31 @@ async def test_manual_run_prepare_and_finalize(tmp_path, monkeypatch):
     assert manager.task_store.get(task.id).run_count == 1
 
 
+def test_prepare_manual_run_provisions_empty_workspace(tmp_path, monkeypatch):
+    """Legacy tasks with workspace='' must get scratch_base/__task__{id} before Run-now
+    returns — otherwise the GUI sticky keeps another conversation's Temporary space."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.set_scratch_base(str(tmp_path / "scratch"))
+
+    task = _task(workspace="", agent="cowork")
+    # Simulate a GUI-created task id + empty workspace (pre-provision legacy).
+    task.id = "task-f3ec5d2d-9"
+    task.task_session_id = "__task__task-f3ec5d2d-9"
+    task.title = "Morning news briefing"
+    manager.task_store.save(task)
+
+    prep = manager.prepare_manual_run(task.id)
+    assert prep["ok"]
+    assert prep["workspace"], "must not return empty workspace"
+    assert prep["workspace"].endswith("__task__task-f3ec5d2d-9")
+    assert (tmp_path / "scratch" / "__task__task-f3ec5d2d-9").is_dir()
+    stored = manager.task_store.get(task.id)
+    assert stored.workspace == prep["workspace"]
+
+
 # -- REST ----------------------------------------------------------------------
 def test_automations_rest(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient

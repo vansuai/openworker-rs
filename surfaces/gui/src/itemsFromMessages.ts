@@ -90,12 +90,14 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
         }
         const preview = results[tc.id];
         const hidden = hiddenCounts[tc.id];
+        // No result yet → still running (mid-turn reconnect). Don't default to "ok"
+        // or a sidebar revisit paints in-flight tools as finished.
         items.push({
           kind: "tool",
           id: tc.id,
           name: tc.function?.name,
           args,
-          status: statuses[tc.id] || "ok",
+          status: statuses[tc.id] || "…",
           preview,
           ...(hidden ? { hidden } : {}),
         });

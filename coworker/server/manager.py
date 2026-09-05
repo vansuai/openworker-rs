@@ -4899,6 +4899,7 @@ class SessionManager:
         )
 
     async def _run_scheduled_task(self, task, trigger: str) -> TaskRun:
+        task = self._ensure_task_workspace(task)
         run = TaskRun(
             task_id=task.id, trigger=trigger
         )  # __post_init__ sets run.session_id
@@ -5108,6 +5109,19 @@ class SessionManager:
     def delete_automation(self, task_id: str) -> dict[str, Any]:
         return {"ok": self.task_store.delete(task_id), "id": task_id}
 
+    def _ensure_task_workspace(self, task):
+        """Legacy tasks may carry an empty workspace — allocate scratch_base/__task__{id}
+        (same as create_automation) so Run-now / scheduled runs don't return "" and let the
+        GUI sticky to another conversation's Temporary space."""
+        if (task.workspace or "").strip():
+            Path(task.workspace).mkdir(parents=True, exist_ok=True)
+            return task
+        if not (task.task_session_id or "").strip():
+            task.task_session_id = f"__task__{task.id}"
+        task.workspace = self._provision_scratch(task.task_session_id)
+        self.task_store.save(task)
+        return task
+
     def prepare_manual_run(self, task_id: str) -> dict[str, Any]:
         """Create a 'running' manual run and return its session, so the GUI can open it and
         drive the task LIVE over the normal session WS (you watch the agent + follow up). The
@@ -5115,7 +5129,7 @@ class SessionManager:
         task = self.task_store.get(task_id)
         if task is None:
             return {"ok": False, "error": "not found"}
-        Path(task.workspace).mkdir(parents=True, exist_ok=True)
+        task = self._ensure_task_workspace(task)
         run = TaskRun(
             task_id=task.id, trigger="manual"
         )  # status "running", session_id auto

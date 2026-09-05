@@ -605,6 +605,10 @@ pub(crate) async fn ensure_task_workspace(
     state: &crate::state::AppState,
     task: ScheduledTask,
 ) -> ScheduledTask {
+    let mut task = task;
+    if task.task_session_id.trim().is_empty() {
+        task.task_session_id = format!("__task__{}", task.id);
+    }
     let task = if task.workspace.trim().is_empty() {
         let ws = provision_scratch(state, &task.task_session_id).await;
         let mut t = task;

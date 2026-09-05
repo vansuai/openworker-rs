@@ -23,3 +23,4 @@ surfaces/gui/src-tauri/target/
 # Runtime-generated automation artifacts
 surfaces/gui/src-tauri/briefing/
 surfaces/gui/src-tauri/briefings/
+.worktrees/

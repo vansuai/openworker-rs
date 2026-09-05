@@ -609,7 +609,7 @@ async fn handler_list_sessions(
     axum::extract::Query(params): axum::extract::Query<Value>,
 ) -> Json<Value> {
     let workspace = params.get("workspace").and_then(|v| v.as_str());
-    let sessions = state.list_sessions(workspace).await;
+    let sessions = state.list_sessions_with_liveness(workspace).await;
     Json(json!({ "sessions": sessions }))
 }
 

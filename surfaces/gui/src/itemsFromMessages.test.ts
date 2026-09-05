@@ -4,6 +4,29 @@
 import { describe, expect, it } from "vitest";
 import { itemsFromMessages } from "./itemsFromMessages";
 
+describe("itemsFromMessages in-flight tools", () => {
+  it("marks tool calls without a result as still running (sidebar revisit mid-turn)", () => {
+    const items = itemsFromMessages([
+      { role: "user", content: "search" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "t1", function: { name: "web_search", arguments: '{"query":"x"}' } },
+          { id: "t2", function: { name: "web_search", arguments: '{"query":"y"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "t1", content: '{"ok":true}' },
+      // t2 still in flight — no role:tool result yet
+    ] as any);
+
+    const tools = items.filter((i: any) => i.kind === "tool") as any[];
+    expect(tools).toHaveLength(2);
+    expect(tools[0].status).toBe("ok");
+    expect(tools[1].status).toBe("…");
+  });
+});
+
 describe("itemsFromMessages _display sidecar", () => {
   it("attaches hidden counts to the matching tool item", () => {
     const items = itemsFromMessages([

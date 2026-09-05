@@ -520,6 +520,25 @@ impl SettingsManager {
         p.save(&self.prefs_path);
     }
 
+    /// Sync scratch-base path (prefs or `~/OpenWorker`). Used by artifact scan root.
+    pub fn scratch_base_path(&self) -> PathBuf {
+        let raw = match self.prefs.try_read() {
+            Ok(p) => p
+                .scratch_base
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join("OpenWorker").to_string_lossy().to_string())
+                        .unwrap_or_else(|| "OpenWorker".into())
+                }),
+            Err(_) => dirs::home_dir()
+                .map(|h| h.join("OpenWorker").to_string_lossy().to_string())
+                .unwrap_or_else(|| "OpenWorker".into()),
+        };
+        expand_user_path(&raw)
+    }
+
     pub async fn set_sessions_peek(&self, n: u32) {
         let mut p = self.prefs.write().await;
         p.sessions_peek = Some(n);
@@ -2152,13 +2171,36 @@ impl AppState {
         workspace: Option<&str>,
         model: Option<&str>,
     ) -> SessionMeta {
-        // Normalize "/" (a polluted legacy workspace value persisted by older sessions) to
-        // None everywhere, so it never lands in a new SessionMeta and the legacy-adoption
-        // branch below sees it as empty.
-        let workspace = workspace.filter(|w| !w.trim().is_empty() && *w != "/");
+        // Normalize "/" (polluted legacy) and reject UUID sessions binding to another
+        // automation's `__task__*` scratch (GUI sticky / WS query contamination).
+        let workspace: Option<String> = match Self::sanitize_session_workspace(session_id, workspace)
+        {
+            Some(ws) => Some(ws.to_string()),
+            None if workspace
+                .filter(|w| !w.trim().is_empty() && *w != "/")
+                .is_some_and(|w| Self::is_foreign_task_scratch(session_id, w)) =>
+            {
+                Some(self.provision_session_scratch_sync(session_id))
+            }
+            None => None,
+        };
         {
             let existing = self.sessions.read().unwrap().get(session_id).cloned();
             if let Some(s) = existing {
+                // Rewrite a persisted foreign `__task__*` binding on reconnect.
+                if s.workspace
+                    .as_deref()
+                    .is_some_and(|w| Self::is_foreign_task_scratch(session_id, w))
+                {
+                    let own = self.provision_session_scratch_sync(session_id);
+                    let mut sessions = self.sessions.write().unwrap();
+                    if let Some(meta) = sessions.get_mut(session_id) {
+                        meta.workspace = Some(own);
+                        let msgs = self.messages_snapshot(session_id);
+                        let _ = self.persist_session_meta(meta, &msgs);
+                        return meta.clone();
+                    }
+                }
                 let ws_empty = s
                     .workspace
                     .as_deref()
@@ -2189,7 +2231,7 @@ impl AppState {
             .unwrap_or_else(|| self.default_model_or_configured());
         let meta = SessionMeta::new(
             session_id.to_string(),
-            workspace.map(String::from),
+            workspace,
             agent,
             &model,
         );
@@ -2213,6 +2255,48 @@ impl AppState {
         // `selectSession` catch-all clears the transcript.
         let _ = self.persist_session_meta(&meta, &[]);
         meta
+    }
+
+    /// Sync allocate `scratch_base/{session_id}` (for foreign-task rewrite paths).
+    pub fn provision_session_scratch_sync(&self, session_id: &str) -> String {
+        let d = self.settings.scratch_base_path().join(session_id);
+        let _ = std::fs::create_dir_all(&d);
+        d.canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| d.to_string_lossy().to_string())
+    }
+
+    /// True when `workspace` is an automation `__task__*` scratch that this session
+    /// must not adopt (UUID chat / wrong sticky). `__run__*` and matching `__task__*`
+    /// session ids are allowed.
+    pub fn is_foreign_task_scratch(session_id: &str, workspace: &str) -> bool {
+        let Some(dir_name) = Path::new(workspace)
+            .file_name()
+            .and_then(|n| n.to_str())
+        else {
+            return false;
+        };
+        if !dir_name.starts_with("__task__") {
+            return false;
+        }
+        if session_id.starts_with("__run__") {
+            return false;
+        }
+        if session_id == dir_name {
+            return false;
+        }
+        true
+    }
+
+    fn sanitize_session_workspace<'a>(
+        session_id: &str,
+        workspace: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let ws = workspace.filter(|w| !w.trim().is_empty() && *w != "/")?;
+        if Self::is_foreign_task_scratch(session_id, ws) {
+            return None;
+        }
+        Some(ws)
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionMeta> {
@@ -2262,6 +2346,32 @@ impl AppState {
                 .collect(),
             None => sessions.values().cloned().collect(),
         }
+    }
+
+    /// working = in-flight turn; idle = otherwise. Rust has no self-wake yet (Python's sleeping).
+    pub fn session_liveness(&self, session_id: &str) -> &'static str {
+        if let Some(run) = self.running_engines.read().get(session_id) {
+            if *run.running.read() {
+                return "working";
+            }
+        }
+        "idle"
+    }
+
+    /// List sessions as JSON values with ephemeral `liveness` for the sidebar LiveDot.
+    pub async fn list_sessions_with_liveness(&self, workspace: Option<&str>) -> Vec<Value> {
+        let sessions = self.list_sessions(workspace).await;
+        sessions
+            .into_iter()
+            .map(|meta| {
+                let liveness = self.session_liveness(&meta.session_id);
+                let mut v = serde_json::to_value(&meta).unwrap_or(json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("liveness".into(), json!(liveness));
+                }
+                v
+            })
+            .collect()
     }
 
     pub async fn delete_session(&self, session_id: &str) {
@@ -2706,16 +2816,134 @@ impl AppState {
         Ok(self.get_roots(session_id))
     }
 
-    /// List artifacts (files) in the session's workspace directory.
-    pub fn list_artifacts(&self, session_id: &str) -> Vec<Value> {
+    /// True when `path` lives under the scratch base (per-conversation temp dir).
+    /// Mirror of Python `SessionManager.is_temp_workspace`.
+    pub fn is_temp_workspace(&self, path: &str) -> bool {
+        if path.trim().is_empty() {
+            return false;
+        }
+        let resolved = resolve_path(&expand_user_path(path));
+        let base = resolve_path(&self.settings.scratch_base_path());
+        resolved.starts_with(&base)
+    }
+
+    fn session_id_ok(session_id: &str) -> bool {
+        !session_id.is_empty()
+            && session_id != "."
+            && session_id != ".."
+            && session_id.len() <= 64
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    }
+
+    /// Artifacts panel scan root — mirror of Python `_artifact_scan_root`.
+    /// Only the session's scratch surface; never the user's repo / other sessions.
+    pub fn artifact_scan_root(&self, session_id: &str) -> Option<PathBuf> {
+        let sessions = self.sessions.read().unwrap();
+        let workspace = sessions.get(session_id).and_then(|m| m.workspace.clone());
+        let has_record = sessions.contains_key(session_id);
+        drop(sessions);
+
+        if let Some(ref ws) = workspace {
+            if self.is_temp_workspace(ws) {
+                return Some(resolve_path(&expand_user_path(ws)));
+            }
+        }
+        if Self::session_id_ok(session_id) {
+            let d = self.settings.scratch_base_path().join(session_id);
+            if d.is_dir() {
+                return Some(resolve_path(&d));
+            }
+        }
+        // Legacy: workspace set but no durable session record yet.
+        if let Some(ws) = workspace {
+            if !has_record {
+                return Some(resolve_path(&expand_user_path(&ws)));
+            }
+        }
+        None
+    }
+
+    /// Resolve an artifact path under workspace + session scratch + extra roots
+    /// (Python `_artifact_target`). Listing still uses `artifact_scan_root` only.
+    fn artifact_target(
+        &self,
+        session_id: &str,
+        path: &str,
+        allow_dir: bool,
+    ) -> Result<PathBuf, String> {
         let sessions = self.sessions.read().unwrap();
         let workspace = sessions.get(session_id).and_then(|m| m.workspace.clone());
         drop(sessions);
 
-        let Some(ws) = workspace else {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(ref ws) = workspace {
+            let p = resolve_path(&expand_user_path(ws));
+            if !candidates.iter().any(|c| c == &p) {
+                candidates.push(p);
+            }
+        }
+        if Self::session_id_ok(session_id) {
+            let scratch = self.settings.scratch_base_path().join(session_id);
+            if scratch.is_dir() {
+                let p = resolve_path(&scratch);
+                if !candidates.iter().any(|c| c == &p) {
+                    candidates.push(p);
+                }
+            }
+        }
+        {
+            let roots = self.session_roots.read().unwrap();
+            if let Some(entries) = roots.get(session_id) {
+                for r in entries.iter().filter(|r| !r.primary) {
+                    let p = expand_user_path(&r.path);
+                    if p.is_dir() {
+                        let p = resolve_path(&p);
+                        if !candidates.iter().any(|c| c == &p) {
+                            candidates.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Err("no workspace".into());
+        }
+
+        let mut found_missing = false;
+        for root in &candidates {
+            let Ok(root_canon) = root.canonicalize() else {
+                continue;
+            };
+            match join_under_root(&root_canon, path) {
+                Some(target) if target.exists() => {
+                    if allow_dir && target.is_dir() {
+                        return Ok(target);
+                    }
+                    if target.is_file() {
+                        return Ok(target);
+                    }
+                    found_missing = true;
+                }
+                Some(_) => found_missing = true,
+                None => continue,
+            }
+        }
+        if found_missing {
+            return Err(
+                "This isn't in the conversation's folder anymore — it may have been moved or deleted."
+                    .into(),
+            );
+        }
+        Err("path escapes workspace".into())
+    }
+
+    /// List artifacts under the session's scratch scan root only (Python `list_artifacts`).
+    pub fn list_artifacts(&self, session_id: &str) -> Vec<Value> {
+        let Some(root) = self.artifact_scan_root(session_id) else {
             return Vec::new();
         };
-        let root = PathBuf::from(&ws);
         if !root.is_dir() {
             return Vec::new();
         }
@@ -2759,8 +2987,7 @@ impl AppState {
             .copied()
             .collect();
 
-        // Recursive walk (mirrors Python's `root.rglob("*")` — the previous
-        // read_dir-only version missed every file under a subdirectory).
+        // Recursive walk under the scan root only (never other sessions / user repos).
         let mut artifacts: Vec<_> = walk_files(&root, &skip_dirs)
             .into_iter()
             .filter_map(|path| {
@@ -2798,25 +3025,36 @@ impl AppState {
 
     /// Read an artifact file, returning a data URL for binary/image files or text content.
     pub fn read_artifact(&self, session_id: &str, path: &str) -> Value {
-        let sessions = self.sessions.read().unwrap();
-        let workspace = sessions.get(session_id).and_then(|m| m.workspace.clone());
-        drop(sessions);
-
-        let Some(ws) = workspace else {
-            return json!({"ok": false, "error": "no workspace"});
+        let target = match self.artifact_target(session_id, path, true) {
+            Ok(t) => t,
+            Err(e) => return json!({"ok": false, "error": e}),
         };
-        let root = PathBuf::from(&ws);
-        let target = root.join(path);
 
-        // Security: path must be within workspace
-        if target
-            .canonicalize()
-            .map_or(true, |t| !t.starts_with(&root))
-        {
-            return json!({"ok": false, "error": "path escapes workspace"});
-        }
-        if !target.is_file() {
-            return json!({"ok": false, "error": "not found"});
+        if target.is_dir() {
+            let mut entries = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&target) {
+                let mut children: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+                children.sort_by_key(|e| {
+                    (
+                        e.file_type().map(|t| t.is_file()).unwrap_or(true),
+                        e.file_name().to_string_lossy().to_lowercase(),
+                    )
+                });
+                for child in children.into_iter().take(500) {
+                    let is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let size = if is_dir {
+                        0
+                    } else {
+                        child.metadata().map(|m| m.len()).unwrap_or(0)
+                    };
+                    entries.push(json!({
+                        "name": child.file_name().to_string_lossy(),
+                        "dir": is_dir,
+                        "size": size,
+                    }));
+                }
+            }
+            return json!({"ok": true, "path": path, "kind": "folder", "entries": entries});
         }
 
         let ext = target
@@ -2879,29 +3117,18 @@ impl AppState {
 
     /// Reveal a file in the OS file manager or open with default app.
     pub fn reveal_artifact(&self, session_id: &str, path: &str, mode: &str) -> Value {
-        let sessions = self.sessions.read().unwrap();
-        let workspace = sessions.get(session_id).and_then(|m| m.workspace.clone());
-        drop(sessions);
-
-        let Some(ws) = workspace else {
-            return json!({"ok": false, "error": "no workspace"});
+        let target = match self.artifact_target(session_id, path, true) {
+            Ok(t) => t,
+            Err(e) => return json!({"ok": false, "error": e}),
         };
-        let root = PathBuf::from(&ws);
-        let target = root.join(path);
-
-        if target
-            .canonicalize()
-            .map_or(true, |t| !t.starts_with(&root))
-        {
-            return json!({"ok": false, "error": "path escapes workspace"});
-        }
-        if !target.is_file() {
+        if !target.exists() {
             return json!({"ok": false, "error": "not found"});
         }
 
+        let is_dir = target.is_dir();
         let result = if cfg!(target_os = "macos") {
             let target_str = target.to_string_lossy().to_string();
-            if mode == "reveal" {
+            if mode == "reveal" && !is_dir {
                 std::process::Command::new("open")
                     .args(["-R", &target_str])
                     .spawn()
@@ -2909,7 +3136,7 @@ impl AppState {
                 std::process::Command::new("open").arg(&target_str).spawn()
             }
         } else if cfg!(target_os = "windows") {
-            if mode == "reveal" {
+            if mode == "reveal" && !is_dir {
                 std::process::Command::new("explorer")
                     .arg(format!("/select,{}", target.display()))
                     .spawn()
@@ -2919,7 +3146,7 @@ impl AppState {
                     .spawn()
             }
         } else {
-            let tgt = if mode == "reveal" {
+            let tgt = if mode == "reveal" && !is_dir {
                 target
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
@@ -3126,6 +3353,44 @@ impl AppState {
     }
 }
 
+/// Expand a leading `~` to the home directory.
+fn expand_user_path(path: &str) -> PathBuf {
+    if path.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            return PathBuf::from(path.replacen('~', &home.to_string_lossy(), 1));
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Best-effort canonicalize (falls back to the input path if missing).
+fn resolve_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Join `path` under `root`, rejecting `..` escapes. Returns an absolute path
+/// (canonical when the target exists).
+fn join_under_root(root_canon: &Path, path: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = root_canon.to_path_buf();
+    for c in Path::new(path).components() {
+        match c {
+            Component::Normal(s) => out.push(s),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() || !out.starts_with(root_canon) {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if !out.starts_with(root_canon) {
+        return None;
+    }
+    Some(out.canonicalize().unwrap_or(out))
+}
+
 /// Recursively collect files under `root` (stack DFS). Skips any entry whose name
 /// starts with `.` (hidden) or is in `skip_dirs` — mirrors Python's
 /// `any(part.startswith(".") for part in rel.parts)` skip logic.
@@ -3242,6 +3507,33 @@ mod tests {
             ..Config::default()
         };
         AppState::new(config, provider)
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_liveness_reports_working() {
+        let dir = temp_data_dir("liveness");
+        let state = make_state(dir);
+        let meta = state.create_session(Some("/tmp/ws"), "code").await;
+        let sid = meta.session_id.clone();
+
+        let listed = state.list_sessions_with_liveness(None).await;
+        let row = listed
+            .iter()
+            .find(|s| s["session_id"] == sid)
+            .expect("session row");
+        assert_eq!(row["liveness"], "idle");
+
+        let run = Arc::new(SessionRunState::new());
+        *run.running.write() = true;
+        state.running_engines.write().insert(sid.clone(), run);
+
+        let listed = state.list_sessions_with_liveness(None).await;
+        let row = listed
+            .iter()
+            .find(|s| s["session_id"] == sid)
+            .expect("session row");
+        assert_eq!(row["liveness"], "working");
+        assert_eq!(state.session_liveness(&sid), "working");
     }
 
     /// Fake provider for auto-title tests — every completion returns the same text.
@@ -3747,19 +4039,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `list_artifacts` must recurse into subdirectories (Python `rglob("*")`)
-    /// and classify file kinds by suffix.
-    #[test]
-    fn list_artifacts_includes_subdirectories() {
+    /// `list_artifacts` must recurse into subdirectories under the session
+    /// scratch scan root (Python `_artifact_scan_root` + walk).
+    #[tokio::test]
+    async fn list_artifacts_includes_subdirectories() {
         let dir = temp_data_dir("artifacts-subdir");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
         let state = make_state(dir.clone());
-        std::fs::create_dir_all(dir.join("output")).unwrap();
-        std::fs::write(dir.join("output").join("report.md"), "# report").unwrap();
-        std::fs::write(dir.join("root.txt"), "root").unwrap();
-        std::fs::write(dir.join("output").join("skip.bin"), "bin").unwrap();
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
 
         let sid = "artifacts-sub-session".to_string();
-        state.get_or_create_session(&sid, "cowork", Some(&dir.to_string_lossy()), None);
+        let ws = scratch.join(&sid);
+        std::fs::create_dir_all(ws.join("output")).unwrap();
+        std::fs::write(ws.join("output").join("report.md"), "# report").unwrap();
+        std::fs::write(ws.join("root.txt"), "root").unwrap();
+        std::fs::write(ws.join("output").join("skip.bin"), "bin").unwrap();
+
+        state.get_or_create_session(&sid, "cowork", Some(&ws.to_string_lossy()), None);
 
         let artifacts = state.list_artifacts(&sid);
         let paths: Vec<String> = artifacts
@@ -3783,6 +4083,129 @@ mod tests {
             .find(|a| a.get("path").and_then(|p| p.as_str()) == Some("output/report.md"))
             .expect("report artifact present");
         assert_eq!(report.get("kind").and_then(|k| k.as_str()), Some("markdown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two sessions' scratch dirs must not leak into each other's Artifacts panel.
+    #[tokio::test]
+    async fn list_artifacts_isolates_session_scratch() {
+        let dir = temp_data_dir("artifact-isolation");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
+
+        let a = scratch.join("session-a");
+        let b = scratch.join("session-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a-only.md"), "from A").unwrap();
+        std::fs::write(b.join("b-only.md"), "from B").unwrap();
+
+        state.get_or_create_session("session-a", "cowork", Some(&a.to_string_lossy()), None);
+        state.get_or_create_session("session-b", "cowork", Some(&b.to_string_lossy()), None);
+
+        let paths_a: Vec<_> = state
+            .list_artifacts("session-a")
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+        let paths_b: Vec<_> = state
+            .list_artifacts("session-b")
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+
+        assert_eq!(paths_a, vec!["a-only.md".to_string()]);
+        assert_eq!(paths_b, vec!["b-only.md".to_string()]);
+        assert!(!paths_a.iter().any(|p| p.contains("b-only")));
+        assert!(!paths_b.iter().any(|p| p.contains("a-only")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Folder-gated sessions whose workspace is a shared user repo must NOT list
+    /// that repo as artifacts — only the side scratch under scratch_base.
+    #[tokio::test]
+    async fn list_artifacts_skips_shared_repo_workspace() {
+        let dir = temp_data_dir("artifact-repo-gate");
+        let scratch = dir.join("scratch");
+        let repo = dir.join("shared-repo");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("morning-briefing.md"), "leak?").unwrap();
+        std::fs::write(repo.join("src.rs"), "fn main() {}").unwrap();
+
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
+
+        // Workspace points at shared repo (not under scratch) — no side scratch yet.
+        state.get_or_create_session(
+            "gated-session",
+            "code",
+            Some(&repo.to_string_lossy()),
+            None,
+        );
+        assert!(
+            state.list_artifacts("gated-session").is_empty(),
+            "must not scan user repo as artifacts"
+        );
+
+        // Side scratch for the session — only these should appear.
+        let side = scratch.join("gated-session");
+        std::fs::create_dir_all(&side).unwrap();
+        std::fs::write(side.join("notes.md"), "scratch only").unwrap();
+        let paths: Vec<_> = state
+            .list_artifacts("gated-session")
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+        assert_eq!(paths, vec!["notes.md".to_string()]);
+        assert!(!paths.iter().any(|p| p.contains("morning-briefing")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Origin-bound automation writes into the launching session's scratch —
+    /// source session Artifacts must still see those files (Python product semantics).
+    #[tokio::test]
+    async fn list_artifacts_sees_origin_bound_automation_outputs() {
+        let dir = temp_data_dir("artifact-origin-bound");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
+
+        let origin = scratch.join("origin-session");
+        std::fs::create_dir_all(&origin).unwrap();
+        // Simulate create_scheduled_task writing briefing back into origin workspace.
+        std::fs::write(origin.join("morning-briefing-2026-09-05.md"), "# news").unwrap();
+
+        state.get_or_create_session(
+            "origin-session",
+            "cowork",
+            Some(&origin.to_string_lossy()),
+            None,
+        );
+        let paths: Vec<_> = state
+            .list_artifacts("origin-session")
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "morning-briefing-2026-09-05.md"),
+            "origin session must see agent-created automation outputs: {paths:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3849,6 +4272,106 @@ mod tests {
             None,
         );
         assert_eq!(meta.workspace.as_deref(), Some(ws.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UUID conversations must not adopt another automation's `__task__*` scratch
+    /// (GUI sticky / WS `?workspace=` contamination). `__run__*` sessions may.
+    #[tokio::test]
+    async fn get_or_create_session_rejects_foreign_task_scratch() {
+        let dir = temp_data_dir("foreign-task");
+        let scratch = dir.join("scratch");
+        let foreign = scratch.join("__task__task-other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
+
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let meta = state.get_or_create_session(
+            uuid,
+            "cowork",
+            Some(&foreign.to_string_lossy()),
+            None,
+        );
+        let ws = meta.workspace.expect("own scratch provisioned");
+        assert!(
+            ws.contains(uuid) && !ws.contains("__task__task-other"),
+            "uuid session must get own scratch, got {ws}"
+        );
+
+        // Persisted foreign binding is rewritten on reconnect.
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.get_mut(uuid).unwrap().workspace =
+                Some(foreign.to_string_lossy().to_string());
+        }
+        let fixed = state.get_or_create_session(uuid, "cowork", None, None);
+        let fixed_ws = fixed.workspace.expect("rewritten");
+        assert!(
+            fixed_ws.contains(uuid) && !fixed_ws.contains("__task__task-other"),
+            "persisted foreign binding must rewrite, got {fixed_ws}"
+        );
+
+        // Automation run sessions intentionally use the task scratch.
+        let run = state.get_or_create_session(
+            "__run__run-abc123",
+            "cowork",
+            Some(&foreign.to_string_lossy()),
+            None,
+        );
+        assert!(
+            run.workspace
+                .as_deref()
+                .is_some_and(|w| w.contains("__task__task-other")),
+            "__run__ may keep task scratch: {:?}",
+            run.workspace
+        );
+
+        assert!(!AppState::is_foreign_task_scratch(
+            "__task__task-other",
+            &foreign.to_string_lossy()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty-workspace automation run must list only its own scratch — not another
+    /// task's briefing files (cross-task Temporary space isolation).
+    #[tokio::test]
+    async fn empty_task_workspace_artifacts_isolated_from_other_task() {
+        let dir = temp_data_dir("task-ws-iso");
+        let scratch = dir.join("scratch");
+        let other = scratch.join("__task__task-135e67c4-7");
+        let mine = scratch.join("__task__task-f3ec5d2d-9");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(other.join("morning-briefing.md"), "# leak?").unwrap();
+        std::fs::write(mine.join("own.md"), "# mine").unwrap();
+
+        let state = make_state(dir.clone());
+        state
+            .settings
+            .set_scratch_base(scratch.to_string_lossy().to_string())
+            .await;
+
+        // Morning-news style: run session bound to its own task scratch.
+        state.get_or_create_session(
+            "__run__run-morning",
+            "cowork",
+            Some(&mine.to_string_lossy()),
+            None,
+        );
+        let paths: Vec<_> = state
+            .list_artifacts("__run__run-morning")
+            .iter()
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+            .collect();
+        assert_eq!(paths, vec!["own.md".to_string()]);
+        assert!(!paths.iter().any(|p| p.contains("morning-briefing")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

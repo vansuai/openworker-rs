@@ -207,6 +207,19 @@ async fn send_ws(ws: &mut WebSocket, type_: &str, data: serde_json::Value) {
     let _ = ws.send(Message::Text(json_str.into())).await;
 }
 
+/// Handshake payload for a reconnecting client. `running` is server truth so a
+/// mid-turn sidebar revisit can restore Stop + the waiting row (Python parity).
+fn ready_payload(session: &crate::state::SessionMeta, running: bool) -> serde_json::Value {
+    json!({
+        "session_id": session.session_id,
+        "agent": session.agent,
+        "model": session.model,
+        "mode": session.mode,
+        "workspace": session.workspace,
+        "running": running,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Per-socket session context
 // ---------------------------------------------------------------------------
@@ -996,18 +1009,8 @@ async fn handle_socket(ws: WebSocket, state: AppState, ctx: SessionCtx) {
     // Lazily create sessions at WS connect time (matches Python server behavior).
     let session =
         state.get_or_create_session(&ctx.session_id, &ctx.agent, ctx.workspace.as_deref(), None);
-    send_ws(
-        &mut ws,
-        "ready",
-        json!({
-            "session_id": ctx.session_id,
-            "agent": session.agent,
-            "model": session.model,
-            "mode": session.mode,
-            "workspace": session.workspace,
-        }),
-    )
-    .await;
+    let running = *ctx.run.running.read();
+    send_ws(&mut ws, "ready", ready_payload(&session, running)).await;
 
     let mut broadcast_rx = state.register_ws_async(&ctx.session_id).await;
     state.broadcast_sync(
@@ -1824,6 +1827,29 @@ mod tests {
             automations,
             None,
         )
+    }
+
+    #[test]
+    fn ready_payload_reports_live_turn() {
+        // A reconnect can land mid-turn (sidebar revisit, relaunch, dropped socket).
+        // `ready` must carry server truth on the running turn or the GUI loses Stop +
+        // the waiting row (owner catch 2026-08-24; Python: test_ws_ready_reports_live_turn).
+        let meta = crate::state::SessionMeta::new(
+            "live1".into(),
+            Some("/tmp/ws".into()),
+            "code",
+            "test-model",
+        );
+        let idle = ready_payload(&meta, false);
+        assert_eq!(idle["session_id"], "live1");
+        assert_eq!(idle["running"], false);
+        assert_eq!(idle["agent"], "code");
+        assert_eq!(idle["workspace"], "/tmp/ws");
+
+        let live = ready_payload(&meta, true);
+        assert_eq!(live["running"], true);
+        assert_eq!(live["model"], "test-model");
+        assert_eq!(live["mode"], "interactive");
     }
 
     #[test]

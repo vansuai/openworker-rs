@@ -610,11 +610,16 @@ export function App() {
           if (d.model) setModel(d.model);
           if (d.mode) setMode(d.mode);
           if (d.command_trust?.required) setWorkspaceTrustRequest(d.command_trust);
-          // Cowork: adopt the server-provisioned scratch dir (only when we don't already have
-          // one). Ignore "/" — a polluted legacy workspace value that reads as truthy and would
-          // otherwise block adoption forever.
-          if (typeof d.workspace === "string" && d.workspace.trim() && d.workspace !== "/") {
-            setWorkspace((cur) => (!cur || cur === "/") ? d.workspace : cur);
+          // Reconnect can land mid-turn (sidebar revisit). Without adopting server truth the
+          // GUI never learns a turn is live — no Stop button, no waiting row.
+          if (typeof d.running === "boolean") setRunning(d.running);
+          // Server truth for this connected session. Always adopt (don't sticky the previous
+          // session's folder) — otherwise Run-now on a task with empty workspace keeps showing
+          // another conversation's Temporary space. Ignore "/" (polluted legacy value).
+          if (typeof d.workspace === "string") {
+            const next = d.workspace.trim() === "/" ? "" : d.workspace.trim();
+            setWorkspace(next || null);
+            if (next) setBranch(null);
           }
           break;
         case "turn_start":
@@ -1044,13 +1049,25 @@ export function App() {
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
   const selectSession = async (id: string, ws: string, ag: string) => {
     setSurface("session"); // selecting a conversation always returns to the conversation view
+    // Re-clicking the already-selected session must not clear running/streaming: sessionId
+    // won't change so WS won't reconnect, and ready won't re-fire — wiping would leave the
+    // UI looking idle until turn_done.
+    if (id === sessionId) {
+      followLatest();
+      return;
+    }
     setTodo([]);
     setStreaming("");
-    setRunning(false);
+    // Optimistic from the session list; ready.running is the server truth on reconnect.
+    const listed = sessions.find((s) => s.session_id === id);
+    setRunning(listed?.liveness === "working");
     if (ag) setAgent(ag);
     if (!gatesWorkspace(ag)) setShowGate(false);
-    if (ws && ws !== workspace) {
-      setWorkspace(ws); // switch project to the session's folder
+    // Always sync workspace on session switch. Empty/missing ws must CLEAR sticky state
+    // so a Run-now with "" doesn't keep showing the previous conversation's Temporary space.
+    const nextWs = ws && ws !== "/" ? ws : null;
+    if (nextWs !== workspace) {
+      setWorkspace(nextWs);
       setBranch(null);
     }
     setSessionId(id);
