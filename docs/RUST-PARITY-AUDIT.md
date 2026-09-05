@@ -6,7 +6,7 @@
 - **口径**：HTTP/WS 路由、JSON 字段、事件、权限、SQLite/JSONL、桌面 sidecar
 - **修订**：2026-09-05（相对上游 `andrewyng/openworker` `main` @ `5bc10d9` 全量同步后更新；此前 2026-08-07 源码级复核见 [parity-report-2026-08-07.md](parity-report-2026-08-07.md)）
 - **上游基线**：Python 参考已覆盖至 `5bc10d9`（含 OPE-136 MCP 权限、compaction/reviewer/provenance/teams、security personas）
-- **总判定**：**Python 参考与核心安全契约已对齐上游；Rust 产品路径完成 Egress/MCP floor、审批 grant、conversation 健壮性、Anthropic stream-complete、skills staging、inbox 句首 intent、board API 骨架与 GUI 审批卡/i18n/MCP trust。** 仍有深度接线缺口（见 §7）。
+- **总判定**：**Python 参考与核心安全契约已对齐上游；Rust 产品路径完成 Egress/MCP floor、审批 grant、conversation 健壮性、Anthropic stream-complete、skills staging、inbox 句首 intent、board API 骨架与 GUI 审批卡/i18n/MCP trust。** HTTP 路由面已与 Python 基本重合（Python-only 仅 debug）；仍有深度接线缺口（见 §7）。
 
 ## 0. 相对 2026-08-05 审计：已推进
 
@@ -30,26 +30,25 @@
 
 | | Count |
 | --- | --- |
-| Python（`coworker/server/app.py` `@app.*`） | **122** |
-| Rust（`crates/server/src/app.rs` `.route`；WS upgrade 计为 WS） | **~130** |
-| 归一化重合 | **~118** |
-| Python-only | **4** |
-| Rust-only | **12** |
+| Python（`coworker/server/app.py` `@app.*`） | **182**（`scripts/rust_route_parity.py`，2026-09-05） |
+| Rust（`crates/server/src/*.rs` `.route`） | **185** |
+| 归一化重合 | **181** |
+| Python-only | **1** |
+| Rust-only | **4** |
 
-### 1.1 Python-only（2026-08-07 源码复核后更新）
+### 1.1 Python-only（2026-09-05 路由对齐后）
 
 | Method | Path | 影响 |
 | --- | --- | --- |
-| POST | `/v1/_debug/inject_inbound` | debug only（唯一 Python-only 路由） |
+| POST | `/v1/_debug/inject_inbound` | debug only（有意跳过） |
 
-> 下表三条已于复核确认在 Rust 注册（app.rs L318-327），原列为过时信息，保留仅供追溯：
-> ~~GET /v1/connectors/slack/status、GET /v1/connectors/github/status、POST .../github/installations/{id}/disconnect~~
+> 2026-09-05 已补齐：settings（auto-approve / compaction / context-bar）、Codex status/signin/signout、token board 突变、memory CRUD/settings、project bindings/menu、persona media/export、skills reveal、temp workspace、reviewer-stats。
 
 ### 1.2 Rust-only（超集，不算回归）
 
-- `POST/GET /v1/sessions`、`GET/POST /v1/sessions/{id}/skills`
-- Skills 全 CRUD / upload / move（Python 仅 `GET /v1/skills` + 文件系统）
-- `GET /v1/connectors/{name}/status`（通用路径；**不能**替代 GUI 的 slack/github 专用 URL）
+- `POST/GET /v1/sessions`、`GET/POST /v1/sessions/{id}/skills` 等会话/技能超集
+- Skills 全 CRUD / upload / move（相对 Python 文件系统侧）
+- 其它产品路径扩展路由（见 `scripts/rust_route_parity.py` Rust-only 列表）
 
 ### 1.3 子系统语义状态
 
@@ -175,12 +174,15 @@
 
 | 缺口 | 说明 |
 | --- | --- |
-| Session-scoped board 路由 | **已补** `/v1/sessions/{id}/board*` + transition/comment；GUI `getBoard(sessionId)` 等已对齐；token `/v1/board/*` 仍供 BoardView |
+| HTTP 路由面 | **已对齐**：Python-only 仅 `_debug/inject_inbound`；settings/codex/board/memory/projects/misc 已挂 `ocw-server` |
+| Board journal | token `/v1/board/journal*` 仍为 **stub**（空 cases/entries） |
+| Codex OAuth 浏览器流 | status/signout **真**；signin 诚实 stub（可读 secrets 里已有 token） |
+| reviewer-stats | 形状对齐，计量暂为 zeros stub（未接 audit 聚合） |
 | `ocw` CLI / board MCP | 可后置 |
 | RightRail 内 BoardSection 深度集成 | 组件已有；App session 右栏挂载可继续打磨 |
-| Team chat / journal | HTTP stub（`enabled:false` / `cases:[]`） |
+| Team chat | HTTP stub（`enabled:false`） |
 
-> 2026-09-05 补丁：TurnEngine 已挂 compaction/reviewer/provenance；WS 交互会话注入 attended + session-model reviewer，并在 turn 结束写回 compaction；stock OpenAI / `openai-codex` 走 Responses；scheduler catchup 后 sleep 再 tick。
+> 2026-09-05 补丁：TurnEngine 已挂 compaction/reviewer/provenance；WS 仅在 `auto_approve` 时挂 reviewer，并注入 live compaction settings；stock OpenAI / `openai-codex` 走 Responses；scheduler catchup 后 sleep 再 tick；settings/board/memory/project 路由面与 Python 重合。
 
 ### 7.3 验收命令（2026-09-05）
 

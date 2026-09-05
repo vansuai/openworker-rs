@@ -21,6 +21,7 @@ pub mod mcp_runtime;
 pub mod persona_manifest;
 pub mod personas;
 pub mod project;
+pub mod projects;
 pub mod scheduler;
 pub mod settings;
 pub mod state;

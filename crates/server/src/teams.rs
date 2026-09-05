@@ -403,6 +403,284 @@ pub async fn handler_attachment(
     })
 }
 
+pub async fn handler_board_spaces(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    with_actor(&headers, &state, |_actor| {
+        match state.board.store.spaces() {
+            Ok(spaces) => Json(json!({ "spaces": spaces })).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_transition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
+        let comment = body.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+        match state.board.store.transition(space, &actor, id, to, comment) {
+            Ok(item) => Json(item).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        match state.board.store.comment(space, &actor, id, text) {
+            Ok(event) => Json(event).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_assign(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let assignee = body.get("assignee").and_then(|v| v.as_str()).unwrap_or("");
+        match state.board.store.assign(space, &actor, id, assignee) {
+            Ok(item) => Json(item).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        match state.board.store.claim(space, &actor, id) {
+            Ok(item) => Json(item).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let src = body.get("src").and_then(|v| v.as_i64()).unwrap_or(0);
+        let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let dst = body.get("dst").and_then(|v| v.as_i64()).unwrap_or(0);
+        match state.board.store.link(space, &actor, src, kind, dst) {
+            Ok(()) => Json(json!({ "ok": true })).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_attach(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let raw = body.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+        if raw.len() > 15 * 1024 * 1024 {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "attachment exceeds 10MB" })))
+                .into_response();
+        }
+        use base64::Engine as _;
+        let data = match base64::engine::general_purpose::STANDARD.decode(raw) {
+            Ok(d) => d,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "data_b64 is not valid base64" })),
+                )
+                    .into_response();
+            }
+        };
+        let filename = body
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ext = std::path::Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_ascii_lowercase();
+        let ext = if (1..=5).contains(&ext.len())
+            && ext.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'))
+        {
+            ext
+        } else {
+            "bin".to_string()
+        };
+        let hash = Sha256::digest(&data);
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let stored = format!("{hex}.{ext}");
+        let ref_str = match state.board.attachments.put_bytes(&data, filename, &stored) {
+            Ok(r) => r,
+            Err(e) => return map_board_err(e),
+        };
+        let caption = body
+            .get("caption")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attached {filename}"));
+        match state
+            .board
+            .store
+            .attach_ref(space, &actor, id, &caption, &ref_str)
+        {
+            Ok(event) => Json(json!({
+                "ref": ref_str,
+                "seq": event.get("seq").and_then(|s| s.as_i64()).unwrap_or(0),
+            }))
+            .into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PolicyQuery {
+    pub space: String,
+}
+
+pub async fn handler_board_policy_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PolicyQuery>,
+) -> Response {
+    with_actor(&headers, &state, |_actor| {
+        match state.board.store.policy(&q.space) {
+            Ok(policy) => Json(policy).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_policy_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let claims = body.get("claims").and_then(|v| v.as_str()).unwrap_or("");
+        match state.board.store.set_policy(space, &actor, claims) {
+            Ok(policy) => Json(policy).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PendingQuery {
+    pub space: String,
+    #[serde(default = "default_pending_limit")]
+    pub limit: i64,
+}
+
+fn default_pending_limit() -> i64 {
+    200
+}
+
+pub async fn handler_board_pending(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PendingQuery>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        match state.board.store.feed_for(&q.space, &actor.id, q.limit) {
+            Ok(events) => Json(json!({ "events": events })).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_consume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |actor| {
+        let space = body.get("space").and_then(|v| v.as_str()).unwrap_or("");
+        let upto = body.get("upto_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+        match state.board.store.consume_feed(space, &actor.id, upto) {
+            Ok(()) => Json(json!({ "ok": true })).into_response(),
+            Err(e) => map_board_err(e),
+        }
+    })
+}
+
+pub async fn handler_board_journal_cases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    with_actor(&headers, &state, |_actor| {
+        // Journal store tables not yet ported — honest empty stub.
+        Json(json!({ "cases": [] })).into_response()
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JournalQuery {
+    pub case: String,
+    #[serde(default)]
+    pub item: Option<i64>,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub entity: String,
+    #[serde(default)]
+    pub include_raw: String,
+    #[serde(default = "default_pending_limit")]
+    pub limit: i64,
+}
+
+pub async fn handler_board_journal_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(_q): Query<JournalQuery>,
+) -> Response {
+    with_actor(&headers, &state, |_actor| {
+        Json(json!({ "entries": [] })).into_response()
+    })
+}
+
+pub async fn handler_board_journal_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> Response {
+    with_actor(&headers, &state, |_actor| {
+        // Journal store tables not yet ported — honest accept stub.
+        Json(json!({ "ok": true })).into_response()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Session-auth board handlers (`/v1/sessions/{id}/board/*`)
 // ---------------------------------------------------------------------------

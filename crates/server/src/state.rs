@@ -156,6 +156,16 @@ struct Prefs {
     pdf_max_mb: u32,
     /// The session a DM to the bot is routed to (user-designated); `None` → DMs park as unrouted.
     dm_session: Option<String>,
+    /// Composer context-window fill bar (OFF by default).
+    context_bar: bool,
+    /// Auto-Approve feature flag (prefs win over config.toml).
+    auto_approve: Option<bool>,
+    /// Shadow-eval sibling of Auto-Approve (audit-only later).
+    auto_approve_shadow: Option<bool>,
+    /// Auto-compaction overrides (OPE-27).
+    compaction_threshold_pct: Option<f64>,
+    compaction_cap_tokens: Option<i64>,
+    compaction_model: Option<String>,
 }
 
 impl Prefs {
@@ -190,6 +200,16 @@ impl Prefs {
             pdf_max_pages: get_u32("pdf_max_pages").unwrap_or(20),
             pdf_max_mb: get_u32("pdf_max_mb").unwrap_or(10),
             dm_session: get_str("dm_session"),
+            context_bar: get_bool("context_bar"),
+            auto_approve: obj.get("auto_approve").and_then(|v| v.as_bool()),
+            auto_approve_shadow: obj.get("auto_approve_shadow").and_then(|v| v.as_bool()),
+            compaction_threshold_pct: obj
+                .get("compaction_threshold_pct")
+                .and_then(|v| v.as_f64()),
+            compaction_cap_tokens: obj
+                .get("compaction_cap_tokens")
+                .and_then(|v| v.as_i64()),
+            compaction_model: get_str("compaction_model"),
         }
     }
 
@@ -232,6 +252,24 @@ impl Prefs {
         obj.insert("pdf_max_mb".into(), serde_json::json!(self.pdf_max_mb));
         if let Some(ref dm) = self.dm_session {
             obj.insert("dm_session".into(), serde_json::json!(dm));
+        }
+        if self.context_bar {
+            obj.insert("context_bar".into(), serde_json::json!(true));
+        }
+        if let Some(v) = self.auto_approve {
+            obj.insert("auto_approve".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.auto_approve_shadow {
+            obj.insert("auto_approve_shadow".into(), serde_json::json!(v));
+        }
+        if let Some(pct) = self.compaction_threshold_pct {
+            obj.insert("compaction_threshold_pct".into(), serde_json::json!(pct));
+        }
+        if let Some(cap) = self.compaction_cap_tokens {
+            obj.insert("compaction_cap_tokens".into(), serde_json::json!(cap));
+        }
+        if let Some(ref model) = self.compaction_model {
+            obj.insert("compaction_model".into(), serde_json::json!(model));
         }
         let text = serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default();
         if let Some(parent) = path.parent() {
@@ -734,6 +772,146 @@ impl SettingsManager {
     }
 
     /// Enable or disable experimental connectors.
+    pub async fn context_bar(&self) -> bool {
+        self.prefs.read().await.context_bar
+    }
+
+    pub async fn set_context_bar(&self, shown: bool) {
+        let mut p = self.prefs.write().await;
+        p.context_bar = shown;
+        p.save(&self.prefs_path);
+    }
+
+    pub async fn auto_approve(&self) -> bool {
+        self.prefs.read().await.auto_approve.unwrap_or(false)
+    }
+
+    pub async fn auto_approve_shadow(&self) -> bool {
+        self.prefs
+            .read()
+            .await
+            .auto_approve_shadow
+            .unwrap_or(false)
+    }
+
+    pub async fn set_auto_approve(&self, on: bool) {
+        let mut p = self.prefs.write().await;
+        p.auto_approve = Some(on);
+        p.save(&self.prefs_path);
+    }
+
+    pub async fn set_auto_approve_shadow(&self, on: bool) {
+        let mut p = self.prefs.write().await;
+        p.auto_approve_shadow = Some(on);
+        p.save(&self.prefs_path);
+    }
+
+    /// Live auto-compaction knobs (OPE-27) — engine reads these per check.
+    pub async fn compaction_settings(&self) -> serde_json::Map<String, Value> {
+        let p = self.prefs.read().await;
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "threshold_pct".into(),
+            json!(p
+                .compaction_threshold_pct
+                .unwrap_or(ocw_engine::DEFAULT_THRESHOLD_PCT)),
+        );
+        m.insert(
+            "cap_tokens".into(),
+            json!(p
+                .compaction_cap_tokens
+                .unwrap_or(ocw_engine::DEFAULT_CAP_TOKENS)),
+        );
+        m.insert(
+            "model".into(),
+            json!(p.compaction_model.clone().unwrap_or_default()),
+        );
+        m.insert("enabled".into(), json!(true));
+        m
+    }
+
+    pub async fn compaction_settings_payload(&self) -> Value {
+        let s = self.compaction_settings().await;
+        json!({
+            "compaction_threshold_pct": s.get("threshold_pct"),
+            "compaction_cap_tokens": s.get("cap_tokens"),
+            "compaction_model": s.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+        })
+    }
+
+    pub async fn set_compaction_settings(
+        &self,
+        threshold_pct: Option<f64>,
+        cap_tokens: Option<i64>,
+        model: Option<String>,
+    ) -> Result<Value, String> {
+        let mut p = self.prefs.write().await;
+        if let Some(pct) = threshold_pct {
+            if !(0.10..=0.95).contains(&pct) {
+                return Err("compaction_threshold_pct must be between 0.10 and 0.95".into());
+            }
+            p.compaction_threshold_pct = Some(pct);
+        }
+        if let Some(cap) = cap_tokens {
+            p.compaction_cap_tokens = Some(cap.clamp(10_000, 2_000_000));
+        }
+        if let Some(m) = model {
+            p.compaction_model = Some(m);
+        }
+        p.save(&self.prefs_path);
+        drop(p);
+        let s = self.compaction_settings().await;
+        Ok(json!({
+            "ok": true,
+            "threshold_pct": s.get("threshold_pct"),
+            "cap_tokens": s.get("cap_tokens"),
+            "model": s.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+        }))
+    }
+
+    /// Sync compaction map for engine hot paths (try_read; falls back to defaults).
+    pub fn compaction_settings_sync(&self) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        match self.prefs.try_read() {
+            Ok(p) => {
+                m.insert(
+                    "threshold_pct".into(),
+                    json!(p
+                        .compaction_threshold_pct
+                        .unwrap_or(ocw_engine::DEFAULT_THRESHOLD_PCT)),
+                );
+                m.insert(
+                    "cap_tokens".into(),
+                    json!(p
+                        .compaction_cap_tokens
+                        .unwrap_or(ocw_engine::DEFAULT_CAP_TOKENS)),
+                );
+                m.insert(
+                    "model".into(),
+                    json!(p.compaction_model.clone().unwrap_or_default()),
+                );
+                m.insert("enabled".into(), json!(true));
+            }
+            Err(_) => {
+                m.insert(
+                    "threshold_pct".into(),
+                    json!(ocw_engine::DEFAULT_THRESHOLD_PCT),
+                );
+                m.insert("cap_tokens".into(), json!(ocw_engine::DEFAULT_CAP_TOKENS));
+                m.insert("model".into(), json!(""));
+                m.insert("enabled".into(), json!(true));
+            }
+        }
+        m
+    }
+
+    pub fn auto_approve_sync(&self) -> bool {
+        self.prefs
+            .try_read()
+            .map(|p| p.auto_approve.unwrap_or(false))
+            .unwrap_or(false)
+    }
+
     pub async fn set_experimental_connectors(&self, value: bool) {
         let mut m = Map::new();
         m.insert("enabled".into(), Value::Bool(value));
@@ -864,6 +1042,16 @@ impl SettingsManager {
             "pdf_fallback": prefs.pdf_fallback,
             "pdf_max_pages": prefs.pdf_max_pages,
             "pdf_max_mb": prefs.pdf_max_mb,
+            "context_bar": prefs.context_bar,
+            "auto_approve": prefs.auto_approve.unwrap_or(false),
+            "auto_approve_shadow": prefs.auto_approve_shadow.unwrap_or(false),
+            "compaction_threshold_pct": prefs
+                .compaction_threshold_pct
+                .unwrap_or(ocw_engine::DEFAULT_THRESHOLD_PCT),
+            "compaction_cap_tokens": prefs
+                .compaction_cap_tokens
+                .unwrap_or(ocw_engine::DEFAULT_CAP_TOKENS),
+            "compaction_model": prefs.compaction_model.clone().unwrap_or_default(),
         })
     }
 
@@ -1255,6 +1443,10 @@ pub struct AppState {
     pub autotitle_inflight: StdShared<HashSet<String>>,
     /// Agent-teams board store + attachment blobs + join tokens (`/v1/board`).
     pub board: Arc<crate::teams::BoardServices>,
+    /// Project names + session bindings (UX-044).
+    pub project_store: Arc<crate::projects::ProjectStore>,
+    /// Memory on/off + user rules (MEMORY-SPEC).
+    pub memory_settings: Arc<crate::projects::MemorySettingsStore>,
 }
 
 /// The auto-title system prompt (verbatim mirror of `manager.py::_AUTOTITLE_PROMPT`).
@@ -1404,6 +1596,10 @@ impl AppState {
             autotitle_attempts: Arc::new(StdRwLock::new(HashMap::new())),
             autotitle_inflight: Arc::new(StdRwLock::new(HashSet::new())),
             board: Arc::new(crate::teams::BoardServices::open(&data_dir)),
+            project_store: Arc::new(crate::projects::ProjectStore::open(&data_dir)),
+            memory_settings: Arc::new(crate::projects::MemorySettingsStore::open(
+                data_dir.join("memory-settings.json"),
+            )),
         };
         if state.settings.effective_default_model_cached().is_empty() {
             let _ = state.default_model_or_configured();

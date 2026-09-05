@@ -84,6 +84,13 @@ impl MemoryStore {
         items.retain(|i| i.id != item_id);
         items.len() < len_before
     }
+
+    pub fn delete_all(&self) -> usize {
+        let mut items = self.items.lock();
+        let n = items.len();
+        items.clear();
+        n
+    }
 }
 
 impl Default for MemoryStore {
@@ -256,6 +263,12 @@ impl SQLiteMemoryStore {
         let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM memories WHERE id = ?", [item_id])?;
         Ok(n > 0)
+    }
+
+    pub fn delete_all(&self) -> Result<usize, Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM memories", [])?;
+        Ok(n)
     }
 }
 

@@ -29,6 +29,7 @@ chrono = "0.4"
 chrono-tz = "0.10"
 base64 = "0.22"
 sha2 = "0.10"
+zip = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 ocw-data = { path = "../data" }

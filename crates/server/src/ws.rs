@@ -425,6 +425,10 @@ async fn init_engine(state: &AppState, ctx: &SessionCtx) {
     )
     .with_audit_sink(make_audit_sink(state.clone()))
     .with_workspace_root(workspace.to_string())
+    .with_compaction_settings({
+        let settings = state.settings.clone();
+        move || settings.compaction_settings_sync()
+    })
     .with_context_provider(|| {
         chrono::Local::now()
             .format("Current date: %Y-%m-%d")
@@ -1494,11 +1498,20 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
             Some(persona_id),
         ))
         .with_is_attended(|| true)
-        .with_reviewer(make_session_reviewer(
+        .with_compaction_settings({
+            let settings = state.settings.clone();
+            move || settings.compaction_settings_sync()
+        })
+        .with_cancel(StdArc::clone(&run.cancel));
+
+    // Auto-Approve: only attach the live reviewer when the setting is on
+    // (mirrors Python's conditional reviewer wiring).
+    if state.settings.auto_approve_sync() {
+        eng = eng.with_reviewer(make_session_reviewer(
             StdArc::clone(&state.provider),
             reviewer_model,
-        ))
-        .with_cancel(StdArc::clone(&run.cancel));
+        ));
+    }
 
     // Seed the mirror with the full engine history so checkpoints match Python's
     // `manager.save(session_id, engine)` (full messages, not turn deltas only).

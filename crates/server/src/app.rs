@@ -5,7 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -55,10 +58,22 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/skills/{name}", patch(handler_update_skill))
         .route("/v1/skills/{name}", delete(handler_delete_skill))
         .route("/v1/skills/{name}/move", post(handler_move_skill))
+        .route("/v1/skills/{name}/reveal", post(handler_reveal_skill_folder))
         .route("/v1/skills/upload", post(handler_stage_upload))
         .route("/v1/skills/upload/confirm", post(handler_confirm_upload))
         .route("/v1/memory", get(handler_list_memory))
         .route("/v1/memory", post(handler_add_memory))
+        .route("/v1/memory", delete(handler_delete_all_memory))
+        .route("/v1/memory/settings", get(handler_memory_settings_get))
+        .route("/v1/memory/settings", axum::routing::put(handler_memory_settings_put))
+        .route(
+            "/v1/memory/{item_id}",
+            patch(handler_patch_memory),
+        )
+        .route(
+            "/v1/memory/{item_id}",
+            delete(handler_delete_memory),
+        )
         .route("/v1/chat/completions", post(handler_chat_completions))
         // Settings
         .route("/v1/settings", get(settings::handler_get_settings))
@@ -100,6 +115,22 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/settings/experimental-connectors",
             post(settings::handler_set_experimental_connectors),
         )
+        .route(
+            "/v1/settings/context-bar",
+            post(settings::handler_set_context_bar),
+        )
+        .route(
+            "/v1/settings/auto-approve",
+            post(settings::handler_set_auto_approve),
+        )
+        .route(
+            "/v1/settings/auto-approve-shadow",
+            post(settings::handler_set_auto_approve_shadow),
+        )
+        .route(
+            "/v1/settings/compaction",
+            post(settings::handler_set_compaction),
+        )
         // Providers
         .route("/v1/providers", get(settings::handler_get_providers))
         .route("/v1/providers", post(settings::handler_connect_provider))
@@ -110,6 +141,18 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/providers/verify",
             post(settings::handler_verify_provider),
+        )
+        .route(
+            "/v1/providers/openai-codex/status",
+            get(settings::handler_codex_status),
+        )
+        .route(
+            "/v1/providers/openai-codex/signin",
+            post(settings::handler_codex_signin),
+        )
+        .route(
+            "/v1/providers/openai-codex/signout",
+            post(settings::handler_codex_signout),
         )
         // Automations
         .route("/v1/automations", get(handler_list))
@@ -185,6 +228,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/workspaces/trust",
             post(subsystems::handler_workspaces_trust),
         )
+        .route("/v1/workspaces/temp", post(handler_workspaces_temp))
         // Personas
         .route("/v1/personas", get(subsystems::handler_personas_list))
         .route(
@@ -206,6 +250,14 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/personas/{persona_id}/connections",
             post(subsystems::handler_persona_connections),
+        )
+        .route(
+            "/v1/personas/{persona_id}/media/{name}",
+            get(handler_persona_media),
+        )
+        .route(
+            "/v1/personas/{persona_id}/export",
+            post(handler_persona_export),
         )
         .route(
             "/v1/personas/install",
@@ -289,10 +341,33 @@ pub fn build_app(state: AppState) -> Router {
         )
         // Agent teams board (token-authenticated `/v1/board` — matches Python paths)
         .route("/v1/board/whoami", get(teams::handler_whoami))
+        .route("/v1/board/spaces", get(teams::handler_board_spaces))
         .route("/v1/board/items", get(teams::handler_list_items))
         .route("/v1/board/items", post(teams::handler_create_item))
         .route("/v1/board/item", get(teams::handler_get_item))
+        .route(
+            "/v1/board/items/transition",
+            post(teams::handler_board_transition),
+        )
+        .route(
+            "/v1/board/items/comment",
+            post(teams::handler_board_comment),
+        )
+        .route("/v1/board/items/assign", post(teams::handler_board_assign))
+        .route("/v1/board/items/claim", post(teams::handler_board_claim))
+        .route("/v1/board/items/attach", post(teams::handler_board_attach))
+        .route("/v1/board/link", post(teams::handler_board_link))
         .route("/v1/board/attachment", get(teams::handler_attachment))
+        .route("/v1/board/policy", get(teams::handler_board_policy_get))
+        .route("/v1/board/policy", post(teams::handler_board_policy_set))
+        .route("/v1/board/pending", get(teams::handler_board_pending))
+        .route("/v1/board/consume", post(teams::handler_board_consume))
+        .route(
+            "/v1/board/journal/cases",
+            get(teams::handler_board_journal_cases),
+        )
+        .route("/v1/board/journal", get(teams::handler_board_journal_get))
+        .route("/v1/board/journal", post(teams::handler_board_journal_post))
         // Session-scoped board (sidecar session auth — no board bearer)
         .route(
             "/v1/sessions/{session_id}/board",
@@ -313,6 +388,26 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/sessions/{session_id}/board/transition",
             post(teams::handler_session_board_transition),
+        )
+        .route(
+            "/v1/sessions/{session_id}/project-menu",
+            get(handler_project_menu),
+        )
+        .route(
+            "/v1/sessions/{session_id}/project-name",
+            post(handler_project_name),
+        )
+        .route(
+            "/v1/sessions/{session_id}/save-as-project",
+            post(handler_save_as_project),
+        )
+        .route(
+            "/v1/sessions/{session_id}/bindings",
+            axum::routing::put(handler_session_bindings),
+        )
+        .route(
+            "/v1/sessions/{session_id}/reviewer-stats",
+            get(handler_reviewer_stats),
         )
         // Team chat / journal stubs
         .route("/v1/teams/{team_id}/chat", get(teams::handler_team_chat_get))
@@ -586,6 +681,54 @@ async fn handler_add_memory(State(state): State<AppState>, Json(body): Json<Valu
     };
     let entry = state.memory_store.add(content, scope, None, None, None);
     Json(serde_json::to_value(&entry).unwrap_or(json!({})))
+}
+
+async fn handler_delete_all_memory(State(state): State<AppState>) -> Json<Value> {
+    let deleted = state.memory_store.delete_all();
+    Json(json!({ "ok": true, "deleted": deleted }))
+}
+
+async fn handler_memory_settings_get(State(state): State<AppState>) -> Json<Value> {
+    Json(state.memory_settings.snapshot())
+}
+
+async fn handler_memory_settings_put(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let enabled = body.get("enabled").and_then(|v| v.as_bool());
+    let user_rules = body.get("user_rules").and_then(|v| v.as_str());
+    Json(state.memory_settings.set(enabled, user_rules))
+}
+
+async fn handler_patch_memory(
+    State(state): State<AppState>,
+    Path(item_id): Path<i64>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        return Json(json!({ "ok": false, "error": "content required" }));
+    }
+    match state.memory_store.update(item_id, content) {
+        Some(item) => Json(json!({ "ok": true, "id": item.id, "content": item.content })),
+        None => Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") })),
+    }
+}
+
+async fn handler_delete_memory(
+    State(state): State<AppState>,
+    Path(item_id): Path<i64>,
+) -> Json<Value> {
+    if state.memory_store.delete(item_id) {
+        Json(json!({ "ok": true, "id": item_id }))
+    } else {
+        Json(json!({ "ok": false, "error": format!("no memory with id {item_id}") }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1120,294 @@ async fn handler_set_unattended(
         .unwrap_or(false);
     state.set_unattended(&session_id, on);
     Json(json!({"ok": true, "session_id": session_id, "unattended": on}))
+}
+
+// ---------------------------------------------------------------------------
+// Skills reveal (OS folder), personas media/export, projects, temp workspace
+// ---------------------------------------------------------------------------
+
+async fn handler_reveal_skill_folder(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let workspace = body.get("workspace").and_then(|v| v.as_str());
+    let ws = workspace.map(std::path::PathBuf::from);
+    let (folder, _scope) = match state.skill_store.find(&name, ws.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({ "ok": false, "error": e })),
+    };
+    let path_str = folder.to_string_lossy().to_string();
+    let opened = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&path_str).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&path_str).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&path_str).spawn()
+    };
+    match opened {
+        Ok(_) => Json(json!({ "ok": true, "path": path_str })),
+        Err(_) => Json(json!({ "ok": true, "path": path_str })),
+    }
+}
+
+async fn handler_persona_media(
+    State(state): State<AppState>,
+    Path((persona_id, name)): Path<(String, String)>,
+) -> Response {
+    if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(media_dir) = state.persona_store.media_dir(&persona_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let file = media_dir.join(&name);
+    let Ok(canon) = file.canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(media_canon) = media_dir.canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !canon.starts_with(&media_canon) || !canon.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match std::fs::read(&canon) {
+        Ok(bytes) => {
+            let mime = match canon.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("webp") => "image/webp",
+                Some("svg") => "image/svg+xml",
+                _ => "application/octet-stream",
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn handler_persona_export(
+    State(state): State<AppState>,
+    Path(persona_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let dest = body.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+    if dest.is_empty() {
+        return Json(json!({ "ok": false, "error": "dest required" }));
+    }
+    Json(state.persona_store.export_persona(&persona_id, dest))
+}
+
+async fn handler_workspaces_temp(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let session_id = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+    {
+        return Json(json!({ "ok": false, "error": "invalid session id" }));
+    }
+    let git = body.get("git").and_then(|v| v.as_bool()).unwrap_or(true);
+    let path = crate::automations::provision_scratch(&state, session_id).await;
+    if git {
+        let git_dir = std::path::Path::new(&path).join(".git");
+        if !git_dir.is_dir() {
+            let _ = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&path)
+                .output();
+        }
+    }
+    let has_git = std::path::Path::new(&path).join(".git").is_dir();
+    Json(json!({ "ok": true, "path": path, "git": has_git }))
+}
+
+fn empty_reviewer_bucket() -> Value {
+    json!({
+        "checks": 0,
+        "allow": 0,
+        "deny": 0,
+        "unsure": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+    })
+}
+
+async fn handler_reviewer_stats(
+    State(_state): State<AppState>,
+    Path(_session_id): Path<String>,
+) -> Json<Value> {
+    // Audit-backed aggregation not yet ported — honest zeros matching Python shape.
+    Json(json!({
+        "live": empty_reviewer_bucket(),
+        "shadow": empty_reviewer_bucket(),
+    }))
+}
+
+async fn handler_project_menu(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let kind = params
+        .get("kind")
+        .map(|s| s.as_str())
+        .unwrap_or("memory");
+    let workspace = state
+        .get_session_sync(&session_id)
+        .and_then(|s| s.workspace)
+        .filter(|w| !w.is_empty());
+    let derived = workspace.as_ref().map(|ws| {
+        let key = crate::projects::project_key(ws);
+        let mut label = crate::projects::project_label(&key);
+        if let Some(obj) = label.as_object_mut() {
+            obj.insert("key".into(), json!(key));
+        }
+        label
+    });
+    let bindings = state.project_store.get_bindings(&session_id);
+    let bound = bindings.get(kind).cloned();
+    let named = state.project_store.list_names(kind);
+    Json(json!({
+        "kind": kind,
+        "bound": bound,
+        "derived": derived,
+        "named": named,
+    }))
+}
+
+async fn handler_project_name(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let workspace = state
+        .get_session_sync(&session_id)
+        .and_then(|s| s.workspace)
+        .filter(|w| !w.is_empty());
+    let Some(ws) = workspace else {
+        return Json(json!({ "ok": false, "error": "session has no workspace" }));
+    };
+    let key = crate::projects::project_key(&ws);
+    match state.project_store.name_current(kind, name, &key) {
+        Ok(entry) => {
+            let mut out = entry;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("ok".into(), json!(true));
+            }
+            Json(out)
+        }
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn handler_session_bindings(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if state.running_engines.read().contains_key(&session_id) {
+        return Json(json!({ "ok": false, "error": "wait for the current task to finish first" }));
+    }
+    match state.project_store.set_binding(&session_id, kind, name) {
+        Ok(bindings) => Json(json!({ "ok": true, "bindings": bindings })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn handler_save_as_project(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let dest = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if dest.is_empty() {
+        return Json(json!({ "ok": false, "error": "no destination folder" }));
+    }
+    if state.running_engines.read().contains_key(&session_id) {
+        return Json(json!({ "ok": false, "error": "wait for the current task to finish first" }));
+    }
+    let src = state
+        .get_session_sync(&session_id)
+        .and_then(|s| s.workspace)
+        .filter(|w| !w.is_empty());
+    let Some(src) = src else {
+        return Json(json!({ "ok": false, "error": "this session is not in a temporary folder" }));
+    };
+    let scratch = {
+        let settings = state.settings.get_settings().await;
+        settings
+            .get("scratch_base")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let src_path = std::path::PathBuf::from(&src);
+    let scratch_path = std::path::PathBuf::from(shellexpand::tilde(&scratch).as_ref());
+    let under_scratch = src_path
+        .canonicalize()
+        .ok()
+        .zip(scratch_path.canonicalize().ok())
+        .map(|(s, sc)| s.starts_with(&sc))
+        .unwrap_or(false);
+    if !under_scratch || !src_path.is_dir() {
+        return Json(json!({ "ok": false, "error": "this session is not in a temporary folder" }));
+    }
+    let dest_path = std::path::PathBuf::from(shellexpand::tilde(dest).as_ref());
+    if dest_path.exists() {
+        if !dest_path.is_dir() || std::fs::read_dir(&dest_path).map(|mut d| d.next().is_some()).unwrap_or(true)
+        {
+            return Json(json!({ "ok": false, "error": "destination must be a new or empty folder" }));
+        }
+        let _ = std::fs::remove_dir(&dest_path);
+    }
+    if let Some(parent) = dest_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(&src_path, &dest_path) {
+        Ok(()) => {
+            let new_path = dest_path
+                .canonicalize()
+                .unwrap_or(dest_path)
+                .to_string_lossy()
+                .to_string();
+            // Rebind session workspace if present in-memory.
+            {
+                let mut sessions = state.sessions.write().unwrap();
+                if let Some(meta) = sessions.get_mut(&session_id) {
+                    meta.workspace = Some(new_path.clone());
+                }
+            }
+            state.running_engines.write().remove(&session_id);
+            Json(json!({ "ok": true, "path": new_path }))
+        }
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 // ---------------------------------------------------------------------------

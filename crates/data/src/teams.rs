@@ -312,6 +312,10 @@ impl TeamStore {
                 ts TEXT NOT NULL,
                 PRIMARY KEY (space, seq)
             );
+            CREATE TABLE IF NOT EXISTS team_cursors (
+                cursor_key TEXT PRIMARY KEY,
+                consumed_seq INTEGER NOT NULL DEFAULT 0
+            );
             "#,
         )?;
         Ok(())
@@ -1115,6 +1119,131 @@ impl TeamStore {
             .collect();
         Ok(spaces)
     }
+
+    /// Self-assign an open, unassigned item (store arbitrates under the write lock).
+    pub fn claim(
+        &self,
+        space: &str,
+        actor: &Actor,
+        item_id: i64,
+    ) -> Result<BoardItem, BoardError> {
+        Self::require(actor, &[Role::User, Role::Lead, Role::Worker], "claim")?;
+        let conn = self.conn.lock();
+        if actor.role == Role::Worker && !Self::claims_open(&conn, space)? {
+            return Err(BoardError::Authority(
+                "claims are lead-only on this board — ask the lead to assign the item to you"
+                    .into(),
+            ));
+        }
+        let item = Self::load_item(&conn, space, item_id)?;
+        if item.state != "open" {
+            return Err(BoardError::Bad(format!(
+                "item #{item_id} is {} — only open items can be claimed",
+                item.state
+            )));
+        }
+        if !item.assignee.is_empty() {
+            return Err(BoardError::Bad(format!(
+                "item #{item_id} is already claimed by {}",
+                item.assignee
+            )));
+        }
+        let seq = Self::next_seq(&conn, space)?;
+        conn.execute(
+            "UPDATE team_items SET assignee = ?, updated_seq = ? WHERE space = ? AND id = ?",
+            params![actor.id, seq, space, item_id],
+        )?;
+        let _ = Self::write_event(
+            &conn,
+            space,
+            seq,
+            ITEM_ASSIGNED,
+            actor,
+            Some(item_id),
+            if item.case_id.is_empty() {
+                None
+            } else {
+                Some(item.case_id.as_str())
+            },
+            json!({
+                "assignee": actor.id,
+                "previous": "",
+                "claimed": true,
+            }),
+        )?;
+        drop(conn);
+        self.get_item(space, item_id, actor).map(|mut item| {
+            item.seq = Some(seq);
+            item
+        })
+    }
+
+    fn cursor(&self, conn: &Connection, key: &str) -> Result<i64, BoardError> {
+        Ok(conn
+            .query_row(
+                "SELECT consumed_seq FROM team_cursors WHERE cursor_key = ?",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    fn set_cursor(conn: &Connection, key: &str, upto_seq: i64) -> Result<(), BoardError> {
+        conn.execute(
+            "INSERT INTO team_cursors (cursor_key, consumed_seq) VALUES (?, ?)
+             ON CONFLICT(cursor_key) DO UPDATE SET consumed_seq = excluded.consumed_seq",
+            params![key, upto_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Unconsumed events this actor is subscribed to (assignment-relation feed).
+    pub fn feed_for(
+        &self,
+        space: &str,
+        actor_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>, BoardError> {
+        let key = format!("feed:{actor_id}:{space}");
+        let conn = self.conn.lock();
+        let since = self.cursor(&conn, &key)?;
+        let slice = Self::worker_slice(&conn, space, actor_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT space, seq, kind, actor, role, item_id, case_id, payload, ts
+             FROM team_events WHERE space = ? AND seq > ? ORDER BY seq LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![space, since, limit], Self::row_to_event)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let event = row?;
+            let actor = event.get("actor").and_then(|a| a.as_str()).unwrap_or("");
+            if actor == actor_id {
+                continue;
+            }
+            let kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            let payload = event.get("payload").cloned().unwrap_or(json!({}));
+            if kind == ITEM_ASSIGNED
+                && (payload.get("assignee").and_then(|a| a.as_str()) == Some(actor_id)
+                    || payload.get("previous").and_then(|a| a.as_str()) == Some(actor_id))
+            {
+                out.push(event);
+                continue;
+            }
+            if let Some(item_id) = event.get("item_id").and_then(|i| i.as_i64()) {
+                if slice.contains(&item_id) {
+                    out.push(event);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn consume_feed(&self, space: &str, actor_id: &str, upto_seq: i64) -> Result<(), BoardError> {
+        let key = format!("feed:{actor_id}:{space}");
+        let conn = self.conn.lock();
+        Self::set_cursor(&conn, &key, upto_seq)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1289,30 @@ impl AttachmentStore {
             std::fs::write(&target, data).map_err(|e| BoardError::Bad(e.to_string()))?;
         }
         Ok(format!("{ATTACHMENT_SCHEME}{stored}#blob"))
+    }
+
+    /// Store one attachment with a content-addressed name; returns `attachment://` ref.
+    pub fn put_bytes(&self, data: &[u8], filename: &str, stored: &str) -> Result<String, BoardError> {
+        let stored = validate_stored_name(stored)?;
+        if data.is_empty() {
+            return Err(BoardError::Bad("empty attachment".into()));
+        }
+        if data.len() > 10 * 1024 * 1024 {
+            return Err(BoardError::Bad("attachment exceeds 10MB".into()));
+        }
+        std::fs::create_dir_all(&self.root).map_err(|e| BoardError::Bad(e.to_string()))?;
+        let target = self.root.join(&stored);
+        if !target.exists() {
+            let tmp = self.root.join(format!("{stored}.tmp"));
+            std::fs::write(&tmp, data).map_err(|e| BoardError::Bad(e.to_string()))?;
+            std::fs::rename(&tmp, &target).map_err(|e| BoardError::Bad(e.to_string()))?;
+        }
+        let safe_name = Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("blob")
+            .replace('#', "_");
+        Ok(format!("{ATTACHMENT_SCHEME}{stored}#{safe_name}"))
     }
 }
 

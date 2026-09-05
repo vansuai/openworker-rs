@@ -323,6 +323,37 @@ impl PersonaStore {
         self.state.read().unwrap().entries.get(persona_id).cloned()
     }
 
+    /// Media folder for an installed persona (`personas-installed/{id}/media`), if present.
+    pub fn media_dir(&self, persona_id: &str) -> Option<PathBuf> {
+        if persona_id.is_empty() || persona_id.contains('/') || persona_id.contains('\\') {
+            return None;
+        }
+        let dir = self.installed_dir.join(persona_id).join("media");
+        if dir.is_dir() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    /// Sharing v1 export: zip manifest (+ skills/) into dest_dir.
+    pub fn export_persona(&self, persona_id: &str, dest_dir: &str) -> Value {
+        let snap = self.installed_dir.join(persona_id);
+        let md = snap.join("manifest.md");
+        if !md.is_file() {
+            return json!({ "ok": false, "error": "this coworker has no shareable bundle" });
+        }
+        let dest = PathBuf::from(shellexpand::tilde(dest_dir).as_ref());
+        if !dest.is_dir() {
+            return json!({ "ok": false, "error": "destination folder does not exist" });
+        }
+        let zip_path = dest.join(format!("{persona_id}-coworker.zip"));
+        match write_persona_zip(&md, &snap.join("skills"), &zip_path) {
+            Ok(()) => json!({ "ok": true, "path": zip_path.to_string_lossy() }),
+            Err(e) => json!({ "ok": false, "error": format!("could not write the archive: {e}") }),
+        }
+    }
+
     /// The current default persona id.
     pub fn default_persona(&self) -> String {
         self.state.read().unwrap().default_id.clone()
@@ -542,4 +573,44 @@ impl PersonaStore {
         self.save_state();
         Ok(summaries)
     }
+}
+
+fn write_persona_zip(manifest: &Path, skills_dir: &Path, zip_path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let file = std::fs::File::create(zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("manifest.md", opts)
+        .map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(manifest).map_err(|e| e.to_string())?;
+    zip.write_all(&bytes).map_err(|e| e.to_string())?;
+    if skills_dir.is_dir() {
+        add_dir_to_zip(&mut zip, skills_dir, Path::new("skills"), opts)?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    dir: &Path,
+    prefix: &Path,
+    opts: zip::write::FileOptions<'_, ()>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = prefix.join(entry.file_name());
+        if path.is_dir() {
+            add_dir_to_zip(zip, &path, &name, opts)?;
+        } else if path.is_file() {
+            zip.start_file(name.to_string_lossy(), opts)
+                .map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }

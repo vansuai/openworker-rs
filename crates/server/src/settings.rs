@@ -308,3 +308,131 @@ pub async fn handler_verify_provider(
 ) -> Json<Value> {
     Json(serde_json::json!({ "ok": true }))
 }
+
+pub async fn handler_set_context_bar(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let shown = body
+        .get("context_bar")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    state.settings.set_context_bar(shown).await;
+    Json(serde_json::json!({ "ok": true, "context_bar": shown }))
+}
+
+pub async fn handler_set_auto_approve(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let on = body
+        .get("auto_approve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    state.settings.set_auto_approve(on).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "auto_approve": state.settings.auto_approve().await,
+        "auto_approve_shadow": state.settings.auto_approve_shadow().await,
+    }))
+}
+
+pub async fn handler_set_auto_approve_shadow(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let on = body
+        .get("auto_approve_shadow")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    state.settings.set_auto_approve_shadow(on).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "auto_approve": state.settings.auto_approve().await,
+        "auto_approve_shadow": state.settings.auto_approve_shadow().await,
+    }))
+}
+
+pub async fn handler_set_compaction(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let threshold = body
+        .get("compaction_threshold_pct")
+        .and_then(|v| v.as_f64());
+    let cap = body.get("compaction_cap_tokens").and_then(|v| v.as_i64());
+    let model = body
+        .get("compaction_model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match state
+        .settings
+        .set_compaction_settings(threshold, cap, model)
+        .await
+    {
+        Ok(v) => Json(v),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codex OAuth surface (status reads tokens; signin is a minimal stub)
+// ---------------------------------------------------------------------------
+
+const CODEX_PROFILE: &str = "openai-codex";
+
+fn codex_account_label(profile: &serde_json::Map<String, Value>) -> Option<String> {
+    profile
+        .get("account_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            profile
+                .get("email")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
+pub async fn handler_codex_status(State(state): State<AppState>) -> Json<Value> {
+    let profile = state.settings.get_provider_config(CODEX_PROFILE).await;
+    let signed_in = profile
+        .as_ref()
+        .and_then(|p| p.get("access_token").or_else(|| p.get("refresh_token")))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let account = profile.as_ref().and_then(|p| codex_account_label(p));
+    Json(serde_json::json!({
+        "signed_in": signed_in,
+        "account": account,
+        "authorizing": false,
+        "last_error": Value::Null,
+        "authorize_url": Value::Null,
+    }))
+}
+
+pub async fn handler_codex_signin(State(_state): State<AppState>) -> Json<Value> {
+    // Full browser OAuth (PKCE + loopback) is not ported yet. Status reading works;
+    // clients should surface this honest stub rather than hanging on a missing flow.
+    Json(serde_json::json!({
+        "ok": false,
+        "started": false,
+        "error": "Codex OAuth browser sign-in is not yet available in the Rust server — use the Python sidecar, or place tokens in the secrets profile provider:openai-codex",
+    }))
+}
+
+pub async fn handler_codex_signout(State(state): State<AppState>) -> Json<Value> {
+    let had = state
+        .settings
+        .get_provider_config(CODEX_PROFILE)
+        .await
+        .is_some();
+    state.settings.delete_provider(CODEX_PROFILE).await;
+    state
+        .provider
+        .update_secrets(state.settings.secrets_providers_async().await);
+    Json(serde_json::json!({ "ok": true, "had_tokens": had }))
+}
