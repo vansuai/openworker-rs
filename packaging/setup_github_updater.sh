@@ -7,11 +7,11 @@
 #   export GH_TOKEN=ghp_...   # classic PAT: repo + workflow
 #   bash packaging/setup_github_updater.sh
 #
-# Or: bash packaging/setup_github_updater.sh ygqbasic/openworker-rs
+# Or: bash packaging/setup_github_updater.sh vansuai/openworker-rs
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REPO="${1:-ygqbasic/openworker-rs}"
+REPO="${1:-vansuai/openworker-rs}"
 KEY_FILE="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.tauri/openworker-updater.key}"
 ENV_FILE="${OCW_UPDATER_ENV:-$ROOT/../.ocw-updater.env}"
 

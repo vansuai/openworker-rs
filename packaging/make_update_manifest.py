@@ -4,7 +4,7 @@
 Run by the release CI job after all platform builds are staged in one directory:
 
     python3 make_update_manifest.py --version 0.1.2 --tag v0.1.2 \
-        --repo ygqbasic/openworker-rs --dist dist/ --out dist/latest.json
+        --repo vansuai/openworker-rs --dist dist/ --out dist/latest.json
 
 Looks for the updater artifacts by their STABLE names (the same names release.yml
 uploads):
@@ -43,7 +43,7 @@ def main() -> int:
     ap.add_argument(
         "--tag", required=True, help="git tag the assets live under, e.g. v0.1.2"
     )
-    ap.add_argument("--repo", required=True, help="owner/name, e.g. ygqbasic/openworker-rs")
+    ap.add_argument("--repo", required=True, help="owner/name, e.g. vansuai/openworker-rs")
     ap.add_argument(
         "--dist", required=True, type=pathlib.Path, help="staged artifacts dir"
     )
