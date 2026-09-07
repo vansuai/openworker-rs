@@ -4,7 +4,7 @@
 Run by the release CI job after all platform builds are staged in one directory:
 
     python3 make_update_manifest.py --version 0.1.2 --tag v0.1.2 \
-        --repo andrewyng/aisuite --dist dist/ --out dist/latest.json
+        --repo ygqbasic/openworker-rs --dist dist/ --out dist/latest.json
 
 Looks for the updater artifacts by their STABLE names (the same names release.yml
 uploads):
@@ -18,9 +18,8 @@ or a half-published release would mix versions. Platforms whose artifact or .sig
 missing are SKIPPED with a warning (e.g. a mac-only hotfix release), so shipped apps
 on other platforms simply see no update rather than a broken one.
 
-The desktop app finds this file through https://download.openworker.com/latest.json
-(branded redirect) falling back to the repo's releases/latest/download/latest.json —
-see tauri.conf.json `plugins.updater.endpoints`.
+The desktop app finds this file through the repo's
+releases/latest/download/latest.json — see tauri.conf.json `plugins.updater.endpoints`.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ def main() -> int:
     ap.add_argument(
         "--tag", required=True, help="git tag the assets live under, e.g. v0.1.2"
     )
-    ap.add_argument("--repo", required=True, help="owner/name, e.g. andrewyng/aisuite")
+    ap.add_argument("--repo", required=True, help="owner/name, e.g. ygqbasic/openworker-rs")
     ap.add_argument(
         "--dist", required=True, type=pathlib.Path, help="staged artifacts dir"
     )

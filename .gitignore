@@ -24,3 +24,8 @@ surfaces/gui/src-tauri/target/
 surfaces/gui/src-tauri/briefing/
 surfaces/gui/src-tauri/briefings/
 .worktrees/
+
+# Updater signing keys (never commit)
+*.key
+*.key.pub
+.ocw-updater.env

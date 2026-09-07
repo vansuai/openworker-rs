@@ -164,11 +164,11 @@ jobs:
           merge-multiple: true
 
       - name: Compose the auto-update manifest (latest.json)
-        # Shipped apps poll releases/latest/download/latest.json (via the branded
-        # download.openworker.com redirect) — publishing this release IS pushing the
-        # update. The tag must match tauri.conf.json's version or installed apps would
-        # see a permanent phantom update; fail loudly on drift. Runs only when signed
-        # updater artifacts exist (i.e. the TAURI_SIGNING_PRIVATE_KEY secret is set).
+        # Shipped apps poll releases/latest/download/latest.json — publishing this
+        # release IS pushing the update. The tag must match tauri.conf.json's version
+        # or installed apps would see a permanent phantom update; fail loudly on drift.
+        # Runs only when signed updater artifacts exist (i.e. the TAURI_SIGNING_PRIVATE_KEY
+        # secret is set).
         run: |
           TAG="${GITHUB_REF_NAME}"
           CONF_VERSION=$(python3 -c "import json; print(json.load(open('surfaces/gui/src-tauri/tauri.conf.json'))['version'])")
