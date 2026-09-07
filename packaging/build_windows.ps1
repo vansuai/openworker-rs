@@ -101,23 +101,25 @@ if ($SidecarKind -eq "python") {
 Write-Host "    -> $Dst"
 
 Write-Host "==> [4/4] tauri build (--bundles $Bundles)" -ForegroundColor Cyan
-# Auto-update artifacts (NSIS setup .exe + minisign .sig): produced only when the updater
-# signing key env is present (CI secret TAURI_SIGNING_PRIVATE_KEY). Keyless builds skip
-# the overlay so dev builds keep working; keyless RELEASES strand installs without
-# auto-update.
-$UpdaterArgs = @()
+# beforeBuildCommand in tauri.conf.json is a Unix shell one-liner (mkdir/rm/cp). On
+# Windows that runs under cmd.exe and fails with "The syntax of the command is
+# incorrect." Sidecar is already staged above, so override to frontend-only build.
+# Auto-update artifacts (NSIS .exe + minisign .sig) when TAURI_SIGNING_PRIVATE_KEY is set.
+$OverlayPath = Join-Path ([IO.Path]::GetTempPath()) "ocw-windows-overlay.json"
+$Overlay = [ordered]@{
+    build = [ordered]@{ beforeBuildCommand = "npm run build" }
+}
 if ($env:TAURI_SIGNING_PRIVATE_KEY) {
-    # Pass the overlay as a FILE: inline JSON loses its quotes through the
-    # PowerShell -> npm.cmd -> cmd hop ("key must be a string", v0.1.3 run).
-    $Overlay = Join-Path ([IO.Path]::GetTempPath()) "ocw-updater-overlay.json"
-    Set-Content -Path $Overlay -Value '{"bundle":{"createUpdaterArtifacts":true}}' -Encoding ascii
-    $UpdaterArgs = @("--config", $Overlay)
+    $Overlay.bundle = [ordered]@{ createUpdaterArtifacts = $true }
 } else {
     Write-Host "    WARNING: no updater signing key - building WITHOUT auto-update artifacts (not releasable)." -ForegroundColor Yellow
 }
+# Pass the overlay as a FILE: inline JSON loses its quotes through the
+# PowerShell -> npm.cmd -> cmd hop ("key must be a string", v0.1.3 run).
+($Overlay | ConvertTo-Json -Compress -Depth 5) | Set-Content -Path $OverlayPath -Encoding ascii
 Push-Location $Gui
 try {
-    & npm run tauri build -- --bundles $Bundles @UpdaterArgs
+    & npm run tauri build -- --bundles $Bundles --config $OverlayPath
     if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
 }
 finally {
