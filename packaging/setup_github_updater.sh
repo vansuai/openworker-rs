@@ -12,8 +12,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${1:-ygqbasic/openworker-rs}"
-OWNER="${REPO%%/*}"
-NAME="${REPO##*/}"
 KEY_FILE="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.tauri/openworker-updater.key}"
 ENV_FILE="${OCW_UPDATER_ENV:-$ROOT/../.ocw-updater.env}"
 
@@ -32,32 +30,22 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 : "${PASSWORD:?set TAURI_SIGNING_PRIVATE_KEY_PASSWORD or put it in $ENV_FILE}"
 
-api() {
-  local method="$1" path="$2"
-  shift 2
-  if [[ -n "${GH_TOKEN:-}" ]]; then
-    curl -sS -X "$method" "https://api.github.com$path" \
-      -H "Authorization: Bearer $GH_TOKEN" \
-      -H "Accept: application/vnd.github+json" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$@"
-  elif command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    gh api -X "$method" "$path" "$@"
-  else
-    echo "error: set GH_TOKEN (PAT with repo+workflow) — github.com HTTPS device login is unreliable here" >&2
-    exit 1
-  fi
-}
+if ! command -v gh >/dev/null; then
+  echo "error: gh CLI required (brew install gh)" >&2
+  exit 1
+fi
+if [[ -z "${GH_TOKEN:-}" ]] && ! gh auth status >/dev/null 2>&1; then
+  echo "error: set GH_TOKEN (PAT with repo+workflow) or run gh auth login" >&2
+  exit 1
+fi
 
 echo "==> ensuring public repo $REPO"
-if ! api GET "/repos/$REPO" >/dev/null 2>&1; then
-  api POST "/user/repos" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\":\"$NAME\",\"private\":false,\"description\":\"OpenWorker desktop — independent auto-update release source\",\"has_issues\":true,\"has_projects\":false,\"has_wiki\":false,\"auto_init\":false}" \
-    >/dev/null
-  echo "    created"
-else
+if gh repo view "$REPO" >/dev/null 2>&1; then
   echo "    already exists"
+else
+  gh repo create "$REPO" --public \
+    --description "OpenWorker desktop — independent auto-update release source"
+  echo "    created"
 fi
 
 if git remote get-url github >/dev/null 2>&1; then
@@ -67,17 +55,19 @@ else
 fi
 
 echo "==> pushing HEAD → github (main)"
-git push -u github HEAD:main
+# Prefer HTTPS+token when SSH cannot see a brand-new repo yet; fall back to SSH.
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" HEAD:main
+  git fetch github main >/dev/null 2>&1 || true
+  git branch --set-upstream-to="github/main" 2>/dev/null || true
+else
+  git push -u github HEAD:main
+fi
 
 echo "==> setting Actions secrets"
-if command -v gh >/dev/null && { [[ -n "${GH_TOKEN:-}" ]] || gh auth status >/dev/null 2>&1; }; then
-  export GH_TOKEN="${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-  gh secret set TAURI_SIGNING_PRIVATE_KEY --repo "$REPO" <"$KEY_FILE"
-  printf '%s' "$PASSWORD" | gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo "$REPO"
-else
-  echo "error: gh CLI required to set secrets once GH_TOKEN is set" >&2
-  exit 1
-fi
+export GH_TOKEN="${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo "$REPO" <"$KEY_FILE"
+printf '%s' "$PASSWORD" | gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo "$REPO"
 
 echo "==> done"
 echo "    endpoint: https://github.com/${REPO}/releases/latest/download/latest.json"
