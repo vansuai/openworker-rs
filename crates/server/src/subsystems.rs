@@ -920,6 +920,7 @@ pub async fn handler_oauth_callback(
                 .to_string();
             return browser_page("Connection failed", FAIL_DETAIL, false, &err, "");
         }
+        state.refresh_gateway().await;
         return browser_page(
             "GitHub connected",
             "You can close this tab and return to OpenWorker.",
@@ -1001,6 +1002,7 @@ pub async fn handler_oauth_callback(
             .to_string();
         return browser_page("Connection failed", FAIL_DETAIL, false, &err, "");
     }
+    state.refresh_gateway().await;
     let title = format!("{} connected", connector_title(&state, &connector));
     browser_page(
         &title,
@@ -1011,9 +1013,7 @@ pub async fn handler_oauth_callback(
     )
 }
 
-/// Loopback landing for the MCP OAuth browser flow. The single-slot pending
-/// flow arrives with the MCP client implementation (阶段 L3); until then no
-/// flow is ever waiting, so stray callbacks get the standard failure page.
+/// Loopback landing for the MCP OAuth browser flow (`coworker/mcp/oauth.py`).
 pub async fn handler_mcp_oauth_callback(
     Query(params): Query<HashMap<String, String>>,
 ) -> axum::response::Html<String> {
@@ -1028,10 +1028,23 @@ pub async fn handler_mcp_oauth_callback(
             );
         }
     }
+    let code = params.get("code").map(String::as_str).unwrap_or("");
+    let state = params.get("state").map(String::as_str);
+    if code.is_empty()
+        || !crate::mcp_oauth::deliver_callback(code, state).await
+    {
+        return browser_page(
+            "Nothing waiting for this sign-in",
+            "The sign-in may have timed out. Return to OpenWorker and start it again.",
+            false,
+            "",
+            "",
+        );
+    }
     browser_page(
-        "Nothing waiting for this sign-in",
-        "The sign-in may have timed out. Return to OpenWorker and start it again.",
-        false,
+        "Signed in",
+        "You can close this tab and return to OpenWorker.",
+        true,
         "",
         "",
     )
@@ -1084,6 +1097,16 @@ pub async fn handler_mcp_delete(
     }
 }
 
+async fn mcp_server_with_auth(state: &AppState, server: crate::mcp::McpServerDef) -> crate::mcp::McpServerDef {
+    let mut merged = server;
+    if merged.auth.as_deref() == Some("oauth") {
+        for (k, v) in crate::mcp_oauth::auth_headers(&state.settings, &merged.name).await {
+            merged.headers.insert(k, v);
+        }
+    }
+    merged
+}
+
 pub async fn handler_mcp_tools(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1091,6 +1114,7 @@ pub async fn handler_mcp_tools(
     let Some(server) = state.mcp_store.get(&name) else {
         return Json(json!({"ok": false, "error": format!("server '{name}' not found")}));
     };
+    let server = mcp_server_with_auth(&state, server).await;
     match state.mcp_runtime.tools_for(&server).await {
         Ok(tools) => Json(json!({
             "name": server.name,
@@ -1159,6 +1183,7 @@ pub async fn handler_mcp_trust_convert(
     };
     let store = risk_override_store(&state);
     let mut trusted = Vec::new();
+    let server = mcp_server_with_auth(&state, server).await;
     match state.mcp_runtime.tools_for(&server).await {
         Ok(tools) => {
             for t in tools {
@@ -1196,6 +1221,29 @@ pub async fn handler_mcp_connect(
     let Some(server) = state.mcp_store.get(&name) else {
         return Json(json!({"ok": false, "error": format!("server '{name}' not found")}));
     };
+    let port = state.config.port;
+    if server.auth.as_deref() == Some("oauth") {
+        let url = match server.url.as_deref() {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => {
+                return Json(json!({
+                    "ok": false,
+                    "error": format!("MCP server '{name}' is oauth but has no url"),
+                }));
+            }
+        };
+        if let Err(e) = crate::mcp_oauth::interactive_connect(
+            &state.settings,
+            &name,
+            &url,
+            port,
+        )
+        .await
+        {
+            return Json(json!({"ok": false, "error": e}));
+        }
+    }
+    let server = mcp_server_with_auth(&state, server).await;
     match state.mcp_runtime.connect_and_list(&server).await {
         Ok(tools) => Json(json!({
             "ok": true,
@@ -1239,6 +1287,7 @@ pub async fn handler_mcp_reload(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 pub async fn handler_connectors_list(State(state): State<AppState>) -> Json<Value> {
+    state.sync_connector_connected().await;
     let connectors = state.connector_store.list();
     Json(json!({ "connectors": connectors }))
 }
@@ -1277,18 +1326,39 @@ pub async fn handler_slack_status(State(state): State<AppState>) -> Json<Value> 
         .get("signed_in")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // Gateway/relay adapter not yet ported — report offline honestly.
+    let statuses = state.gateway.status().await;
+    let slack_status = statuses.iter().find(|s| s.platform == "slack");
+    let relay_state = if slack_status.map(|s| s.running).unwrap_or(false) {
+        "online"
+    } else {
+        "offline"
+    };
+    let last_error = slack_status
+        .and_then(|s| s.last_error.clone())
+        .unwrap_or_default();
+    let mut teams = Map::new();
+    let all = state.settings.secrets_all().await;
+    for (key, profile) in all {
+        if let Some(team_id) = key.strip_prefix("slack:team:") {
+            let token_ok = profile
+                .get("bot_token")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            teams.insert(team_id.to_string(), json!({ "token_ok": token_ok }));
+        }
+    }
     Json(json!({
         "ok": true,
         "mode": mode,
         "relay": {
-            "state": "offline",
+            "state": relay_state,
             "reconnects": 0,
             "last_event_at": Value::Null,
-            "last_error": "",
+            "last_error": last_error,
         },
         "signed_in": signed_in,
-        "teams": {},
+        "teams": teams,
     }))
 }
 
@@ -1309,6 +1379,16 @@ pub async fn handler_github_status(State(state): State<AppState>) -> Json<Value>
         .get("signed_in")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let statuses = state.gateway.status().await;
+    let github_status = statuses.iter().find(|s| s.platform == "github");
+    let relay_state = if github_status.map(|s| s.running).unwrap_or(false) {
+        "online"
+    } else {
+        "offline"
+    };
+    let last_error = github_status
+        .and_then(|s| s.last_error.clone())
+        .unwrap_or_default();
     // Enumerate local install profiles for the GUI list.
     let mut installs = Map::new();
     let all = state.settings.secrets_all().await;
@@ -1328,10 +1408,10 @@ pub async fn handler_github_status(State(state): State<AppState>) -> Json<Value>
         "ok": true,
         "mode": mode,
         "relay": {
-            "state": "offline",
+            "state": relay_state,
             "reconnects": 0,
             "last_event_at": Value::Null,
-            "last_error": "",
+            "last_error": last_error,
         },
         "signed_in": signed_in,
         "installs": installs,
@@ -1370,6 +1450,7 @@ pub async fn handler_github_installation_disconnect(
             }
         }
     }
+    state.refresh_gateway().await;
     Json(json!({"ok": true, "remaining_installs": remaining}))
 }
 
@@ -1635,6 +1716,7 @@ pub async fn handler_connector_connect(
         .secrets_put(&format!("{name}:default"), profile)
         .await;
     state.connector_store.set_connected(&name, true);
+    state.refresh_gateway().await;
     Json(json!({"ok": true, "account": identity}))
 }
 
@@ -1655,13 +1737,13 @@ pub async fn handler_connector_disconnect(
                             .await;
                     }
                 }
-                "google-calendar" => {
+                "google_calendar" => {
                     let accounts =
-                        connector_accounts::list_accounts(&state.settings, "google-calendar").await;
+                        connector_accounts::list_accounts(&state.settings, "google_calendar").await;
                     for (id, _) in accounts {
                         state
                             .settings
-                            .secrets_delete(&format!("google-calendar:account:{id}"))
+                            .secrets_delete(&format!("google_calendar:account:{id}"))
                             .await;
                     }
                 }
@@ -1688,6 +1770,7 @@ pub async fn handler_connector_disconnect(
             ocw_connectors::clear_slack_directory_cache(Some(&name));
             state.connector_store.set_connected(&name, false);
             state.settings.secrets_delete(&format!("{name}:default")).await;
+            state.refresh_gateway().await;
             Json(json!({"ok": true}))
         }
         None => Json(json!({"ok": false, "error": format!("unknown connector: {name}")})),
@@ -1726,6 +1809,15 @@ pub async fn handler_connector_connect_managed(
         Some(d) => d.clone(),
         None => return Json(json!({"ok": false, "error": format!("unknown connector: {name}")})),
     };
+    if descriptor.managed_paused {
+        return Json(json!({
+            "ok": false,
+            "error": format!(
+                "one-click connect for {} is coming soon — connect manually for now",
+                descriptor.title
+            ),
+        }));
+    }
     if !cloud_signed_in(&state.settings).await {
         return Json(json!({
             "ok": false,
@@ -1756,21 +1848,102 @@ pub async fn handler_connector_connect_managed(
     Json(resp)
 }
 
+async fn run_connector_mcp_connect(state: AppState, name: String) {
+    let Some(d) = ocw_connectors::get_descriptor(&name) else {
+        return;
+    };
+    if d.mcp_url.is_empty() {
+        return;
+    }
+
+    let pinned: Vec<Value> = crate::mcp_pins::mcp_pinned_tools(&name)
+        .iter()
+        .map(|t| json!(t))
+        .collect();
+    let mut seed = json!({
+        "url": d.mcp_url,
+        "auth": "oauth",
+        "requires_approval": false,
+        "enabled": true,
+    });
+    if !pinned.is_empty() {
+        if let Some(o) = seed.as_object_mut() {
+            o.insert("include_tools".into(), Value::Array(pinned));
+        }
+    }
+    if state.mcp_store.get(&name).is_some() {
+        let _ = state.mcp_store.update(&name, seed);
+    } else if let Err(e) = state.mcp_store.create(&name, seed) {
+        tracing::warn!("mcp connect seed failed for {name}: {e}");
+        return;
+    }
+
+    let port = state.config.port;
+    if let Err(e) = crate::mcp_oauth::interactive_connect(
+        &state.settings,
+        &name,
+        &d.mcp_url,
+        port,
+    )
+    .await
+    {
+        tracing::warn!("mcp oauth failed for {name}: {e}");
+        let _ = state.mcp_store.delete(&name);
+        return;
+    }
+
+    let Some(server) = state.mcp_store.get(&name) else {
+        return;
+    };
+    let server = mcp_server_with_auth(&state, server).await;
+    match state.mcp_runtime.connect_and_list(&server).await {
+        Ok(_) => {
+            let mut profile = state
+                .settings
+                .secrets_get(&format!("{name}:default"))
+                .await
+                .unwrap_or_default();
+            profile.insert("mode".into(), json!("mcp"));
+            profile.insert("enabled".into(), json!(true));
+            state
+                .settings
+                .secrets_put(&format!("{name}:default"), profile)
+                .await;
+            state.connector_store.set_connected(&name, true);
+        }
+        Err(e) => {
+            tracing::warn!("mcp connect_and_list failed for {name}: {e}");
+            let _ = state.mcp_store.delete(&name);
+        }
+    }
+}
+
 pub async fn handler_connector_mcp_connect(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    // OAuth browser flow for MCP-backed connectors is not ported yet.
-    // Never return started:true — that was a fake-success stub.
-    let known_mcp = matches!(name.as_str(), "jira" | "monday" | "asana" | "linear" | "notion");
-    if !known_mcp {
+    let Some(d) = ocw_connectors::get_descriptor(&name) else {
+        return Json(json!({"ok": false, "error": format!("unknown connector: {name}")}));
+    };
+    if d.mcp_url.is_empty() {
         return Json(json!({"ok": false, "error": format!("{name} has no MCP connect path")}));
     }
-    Json(json!({
-        "ok": false,
-        "error": "OAuth MCP connect is not yet available in the Rust server",
-    }))
+
+    let state_bg = state.clone();
+    let name_bg = name.clone();
+    tokio::spawn(async move {
+        run_connector_mcp_connect(state_bg, name_bg).await;
+    });
+
+    let authorize_url = crate::mcp_oauth::last_authorize_url().await;
+    let mut out = json!({"ok": true, "started": true});
+    if let Some(url) = authorize_url {
+        if let Some(o) = out.as_object_mut() {
+            o.insert("authorize_url".into(), json!(url));
+        }
+    }
+    Json(out)
 }
 
 pub async fn handler_connector_tools_patch(
@@ -1906,8 +2079,50 @@ pub async fn handler_connector_unauthorized(
         return Json(json!({"ok": false, "error": "item has no user_id"}));
     }
     allow_user_in_profile(&state, &name, user_id).await;
-    // allow_deliver would re-inject through the inbound path once the gateway
-    // is wired; for now the allow-list update is the durable effect.
+    if action == "allow_deliver" {
+        use ocw_connectors::{MessageEvent, MessageType, SessionSource};
+        let opt_str = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        };
+        let event = MessageEvent {
+            text: item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            source: SessionSource {
+                platform: item
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&name)
+                    .to_string(),
+                chat_id: item
+                    .get("chat_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                user_id: opt_str("user_id"),
+                user_name: opt_str("user_name"),
+                chat_name: opt_str("chat_name"),
+                chat_type: item
+                    .get("chat_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("dm")
+                    .to_string(),
+                thread_id: opt_str("thread_id"),
+                team_id: opt_str("team_id"),
+            },
+            message_id: None,
+            message_type: MessageType::Text,
+            reply_to_message_id: None,
+            raw: None,
+            mentions_me: false,
+        };
+        crate::inbound::reinject(&state.inbound_slot, event).await;
+    }
     Json(json!({"ok": true}))
 }
 
@@ -1961,6 +2176,7 @@ pub async fn handler_slack_workspace_disconnect(
         }
     }
     state.connector_store.set_connected("slack", !remaining.is_empty());
+    state.refresh_gateway().await;
     Json(json!({"ok": true, "remaining_workspaces": remaining.len()}))
 }
 

@@ -120,6 +120,7 @@ const TEMPLATES: QuickTemplate[] = [
     blurb: "A 5-bullet tech & world news digest, saved as markdown.",
     cadence: "Daily",
     conns: [],
+    consent: true,
     day: "daily",
     time: "08:00",
     instructions: () =>
@@ -157,7 +158,7 @@ export function AutomationQuickstart({
     title: string;
     instructions: string;
     cron?: string;
-    permissions?: { tool: string; target: string; access: "read" | "write" }[];
+    permissions?: { tool: string; target?: string; access: "read" | "write" }[];
   }) => void;
 }) {
   const [pickedKey, setPickedKey] = useState<string | null>(null);
@@ -279,14 +280,23 @@ export function AutomationQuickstart({
 
   const create = () => {
     if (!picked) return;
+    // §25 consent: channel-bound write recipes mint send_message → target;
+    // news mints a name-only web_search grant (fixed search provider).
+    let permissions:
+      | { tool: string; target?: string; access: "read" | "write" }[]
+      | undefined;
+    if (picked.consent && consent) {
+      if (picked.key === "news") {
+        permissions = [{ tool: "web_search", access: "write" }];
+      } else if (channel) {
+        permissions = [{ tool: "send_message", target: channel, access: "write" }];
+      }
+    }
     onCreate({
       title: picked.title,
       instructions: picked.instructions({ repo, channel, deliver }),
       cron: cronFor(day, time),
-      permissions:
-        picked.consent && consent && channel
-          ? [{ tool: "send_message", target: channel, access: "write" }]
-          : [],
+      permissions: permissions ?? [],
     });
   };
 
@@ -541,12 +551,21 @@ export function AutomationQuickstart({
                     data-testid="ob-consent"
                   />
                   <span>
-                    Allow this automation to post its digest to{" "}
-                    <b className="text-ink" title={channel || undefined}>
-                      {channelLabel || "the channel"}
-                      {channelWorkspace ? ` (${channelWorkspace})` : ""}
-                    </b>{" "}
-                    without asking each time. Anything else still asks first.
+                    {picked.key === "news" ? (
+                      <>
+                        Allow this automation to search the web via your configured search
+                        provider without asking each time. Anything else still asks first.
+                      </>
+                    ) : (
+                      <>
+                        Allow this automation to post its digest to{" "}
+                        <b className="text-ink" title={channel || undefined}>
+                          {channelLabel || "the channel"}
+                          {channelWorkspace ? ` (${channelWorkspace})` : ""}
+                        </b>{" "}
+                        without asking each time. Anything else still asks first.
+                      </>
+                    )}
                   </span>
                 </label>
               ) : picked.conns.length > 0 ? (

@@ -25,12 +25,66 @@ pub fn normalize_tool_input(input: Value) -> Value {
     match input {
         Value::Object(mut map) => {
             merge_salvaged_raw(&mut map);
-            Value::Object(map)
+            let mut value = Value::Object(map);
+            unwrap_repeated_elements(&mut value);
+            value
         }
         Value::String(s) => parse_tool_arguments(&s),
         Value::Null => Value::Null,
         other => json!({ "_raw": other.to_string() }),
     }
+}
+
+/// MiniMax renders array parameters as XML repeated elements, which decode back as
+/// `{"param": {"item": [...]}}`. Replaying that shape to the vendor adds another
+/// wrapper level per turn (histories have been seen six deep), so collapse it here —
+/// before the arguments are executed *and* before they are stored for the next turn.
+fn unwrap_repeated_elements(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                unwrap_child(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                unwrap_child(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collapse wrappers at one argument position. The arguments object itself is never
+/// collapsed — `{"todos": [...]}` has to stay an object for the engine and the GUI.
+fn unwrap_child(value: &mut Value) {
+    for _ in 0..8 {
+        if !unwrap_one_wrapper(value) {
+            break;
+        }
+    }
+    unwrap_repeated_elements(value);
+}
+
+/// Replace a bare `{"item": …}` / `{"items": …}` wrapper with its payload. Objects that
+/// also carry sibling fields are real payloads (a todo item, a diff hunk) and are left
+/// alone, as are wrappers whose payload is a scalar — `{"item": ""}` is an omitted
+/// element, not an array.
+fn unwrap_one_wrapper(value: &mut Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    if !map.keys().all(|k| k == "item" || k == "items") {
+        return false;
+    }
+    let Some(child) = map.get("item").or_else(|| map.get("items")) else {
+        return false;
+    };
+    if !child.is_array() && !child.is_object() {
+        return false;
+    }
+    *value = child.clone();
+    true
 }
 
 /// Best-effort recovery of `{path, content, …}` from non-JSON tool-input text.
@@ -271,5 +325,67 @@ Details here path=briefing.md"#;
         let v = normalize_tool_input(input);
         assert_eq!(v["path"], "notes.md");
         assert_eq!(v["content"], "hello");
+    }
+
+    /// MiniMax serializes array parameters as XML repeated elements, which arrive as
+    /// `{"todos": {"item": [...]}}`. Replaying that shape back into the vendor adds
+    /// another wrapper level per turn, so unwrap it on the way in.
+    #[test]
+    fn single_item_wrapper_unwrapped() {
+        let v = parse_tool_arguments(
+            r#"{"todos":{"item":[{"content":"a","status":"pending"}]}}"#,
+        );
+        assert_eq!(v["todos"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nested_item_wrappers_unwrapped() {
+        for depth in 2..=6 {
+            let mut value = json!([{"content": "a", "status": "pending"}]);
+            for _ in 0..depth {
+                value = json!({"item": value});
+            }
+            let v = normalize_tool_input(json!({"todos": value}));
+            assert_eq!(
+                v["todos"].as_array().map(|a| a.len()),
+                Some(1),
+                "depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_unwrap_leaves_real_objects_alone() {
+        // An object that also carries sibling fields is a todo item, not a wrapper.
+        let v = parse_tool_arguments(
+            r#"{"todos":[{"content":"a","status":"pending","item":"note"}]}"#,
+        );
+        let item = &v["todos"].as_array().unwrap()[0];
+        assert_eq!(item["content"], "a");
+        assert_eq!(item["item"], "note");
+    }
+
+    #[test]
+    fn wrappers_inside_nested_objects_unwrapped() {
+        let v = parse_tool_arguments(
+            r#"{"plan":{"steps":{"item":[{"title":"a"}]}},"path":"briefing.md"}"#,
+        );
+        assert_eq!(v["plan"]["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(v["path"], "briefing.md");
+    }
+
+    /// The arguments object itself must stay an object: collapsing a bare single-key
+    /// payload would turn the common `{"todos": […]}` into a top-level array.
+    #[test]
+    fn arguments_object_is_never_collapsed() {
+        for raw in [
+            r#"{"todos":[{"content":"a","status":"pending"}]}"#,
+            r#"{"items":[{"content":"a","status":"pending"}]}"#,
+        ] {
+            let v = parse_tool_arguments(raw);
+            assert!(v.is_object(), "{raw}");
+            let key = if raw.starts_with(r#"{"todos"#) { "todos" } else { "items" };
+            assert_eq!(v[key].as_array().unwrap().len(), 1);
+        }
     }
 }

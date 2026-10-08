@@ -281,7 +281,10 @@ function Buttons({
 }) {
   const { t } = useTranslation();
   const connector = item.category === "connector";
-  const offerStanding = !!(runTask && item.standingTarget);
+  // §25: task-persistent grant — target-bound tools OR name-only web_search in a run.
+  const offerStanding = !!(
+    runTask && (item.standingTarget || item.name === "web_search")
+  );
   const verbKey = TOOL_VERBS[item.name];
   const verbName = verbKey ? t(verbKey).toLowerCase() : item.name;
   // §1.9: egress grants are destination-shaped. web_fetch offers the DOMAIN — tool-wide
@@ -327,8 +330,19 @@ function Buttons({
       {offerStanding && (
         <button
           className="btn"
-          title={t("approval.btn.always_task_title", { name: item.name, target: item.standingTarget, task: runTask?.title || t("approval.btn.this_automation") })}
+          title={
+            item.standingTarget
+              ? t("approval.btn.always_task_title", {
+                  name: item.name,
+                  target: item.standingTarget,
+                  task: runTask?.title || t("approval.btn.this_automation"),
+                })
+              : t("approval.btn.always_task_search_title", {
+                  task: runTask?.title || t("approval.btn.this_automation"),
+                })
+          }
           onClick={() => onApprove("always_task")}
+          data-testid="approval-always-task"
         >
           {t("approval.btn.allow_every_time")}
         </button>
@@ -438,7 +452,9 @@ export function ApprovalCard({
   const grants = item.name === "create_scheduled_task" ? permissionLines(item.args) : [];
   // "requires approval" is the engine's default boilerplate — only surface a real reason.
   const reason = item.reason && item.reason !== "requires approval" ? item.reason : "";
-  const offerStanding = !!(runTask && item.standingTarget);
+  const offerStanding = !!(
+    runTask && (item.standingTarget || item.name === "web_search")
+  );
   const dock = compact ? " approval-dock" : "";
   // OPE-114 §1: the command text cannot tell you the agent wrote this file a moment ago.
   const provenance = item.provenance ? (

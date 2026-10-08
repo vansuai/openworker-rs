@@ -9,7 +9,8 @@ use parking_lot::RwLock as PlRwLock;
 use tokio::sync::broadcast;
 
 use crate::automations::AutomationStore;
-use crate::connectors::ConnectorStore;
+use crate::cloud;
+use crate::connectors::{profile_connected, ConnectorStore};
 use crate::mcp::McpStore;
 use crate::mcp_runtime::McpRuntime;
 use crate::personas::PersonaStore;
@@ -17,6 +18,7 @@ use crate::stores::{
     AuditStore, BrowserController, ChannelBuffer, PersonaConnectionStore, SessionConnectionStore,
     SubscriptionStore, UnattendedStore, UnroutedStore,
 };
+use crate::inbound::{self, InboundDeps, InboundSlot};
 use ocw_data::ConversationStore;
 use ocw_data::InboxRouting;
 use ocw_data::InboxStore;
@@ -24,8 +26,10 @@ use ocw_data::{MemoryBackend, SQLiteMemoryStore};
 use ocw_data::{render_memory_block, Scope};
 use ocw_provider::Provider;
 use ocw_provider::{self, model_context_windows, model_labels, models_for_provider};
+use ocw_connectors::{Gateway, TokenProvider};
 use ocw_shell::LocalExecutor;
 use ocw_skills::{SessionSkillStore, SkillStore};
+use tracing;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::RwLock as TokioRwLock;
@@ -766,6 +770,31 @@ impl SettingsManager {
         })
     }
 
+    /// Sync read for tool callbacks — uses `try_read()` so Tokio worker threads
+    /// never block on the async secrets lock.
+    pub fn secrets_get_sync(&self, key: &str) -> Option<Map<String, Value>> {
+        let env = self.secret_env();
+        self.secrets
+            .try_read()
+            .ok()
+            .and_then(|s| s.providers.get(key).cloned())
+            .map(|v| {
+                resolve_secret_value(&v, &env)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+    }
+
+    /// All profile keys in the secrets store (sync). Used by messaging tools to
+    /// enumerate `slack:team:*` workspaces.
+    pub fn secrets_profile_keys_sync(&self) -> Vec<String> {
+        self.secrets
+            .try_read()
+            .map(|s| s.providers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Write a value to the secrets store under the given key.
     pub async fn secrets_put(&self, key: &str, value: Map<String, Value>) {
         self.secrets
@@ -1431,6 +1460,62 @@ impl SessionRunState {
 }
 
 // ---------------------------------------------------------------------------
+// Gateway connected sync
+// ---------------------------------------------------------------------------
+
+/// Whether a connector counts as connected given stored secrets.
+fn connector_connected_from_secrets(
+    d: &ocw_connectors::ConnectorDescriptor,
+    all: &HashMap<String, Map<String, Value>>,
+) -> bool {
+    if !d.available {
+        return false;
+    }
+    if d.auth == "none" {
+        return true;
+    }
+    match d.name.as_str() {
+        "gmail" => return all.keys().any(|k| k.starts_with("gmail:account:")),
+        "google_calendar" => {
+            return all.keys().any(|k| k.starts_with("google_calendar:account:"));
+        }
+        "hubspot" => return all.keys().any(|k| k.starts_with("hubspot:portal:")),
+        "slack" => {
+            if all.keys().any(|k| k.starts_with("slack:team:")) {
+                return true;
+            }
+        }
+        "github" => {
+            if all.keys().any(|k| k.starts_with("github:install:")) {
+                return true;
+            }
+            if all.keys().any(|k| k.starts_with("github:account:")) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    if !d.mcp_url.is_empty() {
+        let default = all
+            .get(&format!("{}:default", d.name))
+            .cloned()
+            .unwrap_or_default();
+        if default.get("mode").and_then(|v| v.as_str()) == Some("mcp") {
+            let oauth = all.get(&format!("mcp-oauth:{}", d.name));
+            return oauth
+                .and_then(|p| p.get("access_token").and_then(|v| v.as_str()))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+        }
+    }
+    let profile = all
+        .get(&format!("{}:default", d.name))
+        .cloned()
+        .unwrap_or_default();
+    profile_connected(d, &profile)
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -1465,6 +1550,10 @@ pub struct AppState {
     pub mcp_runtime: Arc<McpRuntime>,
     /// Connector store (descriptors + connection state).
     pub connector_store: Arc<ConnectorStore>,
+    /// Inbound messaging gateway (Slack/Telegram/GitHub relay listeners).
+    pub gateway: Arc<Gateway>,
+    /// Late-bound inbound router deps (filled at end of `AppState::new`).
+    pub inbound_slot: InboundSlot,
     /// Cross-session inbox for human-attention items (approvals/questions/notifications).
     pub inbox_store: Arc<InboxStore>,
     /// Named inboxes + delivery bindings (Slack/Telegram mirroring).
@@ -1597,6 +1686,16 @@ impl AppState {
 
         let (event_broadcast, _) = broadcast::channel(256);
 
+        let channel_buffer = Arc::new(ChannelBuffer::new(
+            crate::stores::BUFFER_CAP,
+            Some(data_dir.join("channels.json")),
+        ));
+        let inbound_slot = inbound::new_slot();
+        let gateway = Arc::new(Gateway::new(inbound::make_handler(
+            Arc::clone(&inbound_slot),
+            Arc::clone(&channel_buffer),
+        )));
+
         // Open the SQLite-backed memory store at `<data_dir>/coworker.db` (mirror of
         // `coworker/memory/sqlite_store.py`). Dyn-dispatched via `MemoryBackend`.
         let memory_db = data_dir.join("coworker.db");
@@ -1629,6 +1728,8 @@ impl AppState {
             mcp_store: Arc::new(McpStore::new(&data_dir)),
             mcp_runtime: Arc::new(McpRuntime::new()),
             connector_store: Arc::new(ConnectorStore::new()),
+            gateway,
+            inbound_slot,
             inbox_store: Arc::new(
                 InboxStore::new(Some(data_dir.join("inbox.json")))
                     .unwrap_or_else(|_| InboxStore::new(None::<&str>).expect("in-memory inbox")),
@@ -1646,10 +1747,7 @@ impl AppState {
                 crate::stores::UNROUTED_CAP,
             )),
             audit: Arc::new(AuditStore::open(data_dir.join("audit.jsonl"))),
-            channel_buffer: Arc::new(ChannelBuffer::new(
-                crate::stores::BUFFER_CAP,
-                Some(data_dir.join("channels.json")),
-            )),
+            channel_buffer,
             browser: Arc::new(BrowserController::new()),
             autotitle_attempts: Arc::new(StdRwLock::new(HashMap::new())),
             autotitle_inflight: Arc::new(StdRwLock::new(HashSet::new())),
@@ -1659,10 +1757,160 @@ impl AppState {
                 data_dir.join("memory-settings.json"),
             )),
         };
+        state.wire_inbound_deps();
         if state.settings.effective_default_model_cached().is_empty() {
             let _ = state.default_model_or_configured();
         }
         state
+    }
+
+    /// Install late-bound inbound router callbacks (avoids init cycles with Gateway).
+    fn wire_inbound_deps(&self) {
+        let settings = self.settings.clone();
+        let settings_dm = self.settings.clone();
+        let channel_buffer = Arc::clone(&self.channel_buffer);
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let unrouted = Arc::clone(&self.unrouted);
+        let parked = Arc::clone(&self.parked_messages);
+        let inbox_store = Arc::clone(&self.inbox_store);
+        let session_connections = Arc::clone(&self.session_connections);
+        let persona_store_for_defaults = self.clone();
+        let deliver_state = self.clone();
+
+        let deps = InboundDeps {
+            settings,
+            channel_buffer,
+            subscriptions,
+            unrouted,
+            parked,
+            inbox_store,
+            get_dm_session: Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(settings_dm.get_dm_session())
+                })
+            }),
+            deliver: Arc::new(move |session_id, text, source| {
+                let ts = source
+                    .get("ts")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0)
+                    });
+                let msg = json!({
+                    "role": "user",
+                    "content": text,
+                    "ts": ts,
+                    "source": source.clone(),
+                });
+                deliver_state.push_message_sync(session_id, msg);
+                deliver_state.broadcast_sync(
+                    session_id,
+                    json!({
+                        "type": "turn_start",
+                        "data": {
+                            "input": text,
+                            "source": source,
+                        }
+                    }),
+                );
+                deliver_state
+                    .broadcast_sync(session_id, json!({"type": "turn_done", "data": {}}));
+                deliver_state.persist_turn(session_id);
+            }),
+            connector_allowed: Arc::new(move |session_id, connector| {
+                let connected = persona_store_for_defaults
+                    .connector_store
+                    .list()
+                    .iter()
+                    .any(|c| {
+                        c.get("name").and_then(|v| v.as_str()) == Some(connector)
+                            && c.get("connected").and_then(|v| v.as_bool()).unwrap_or(false)
+                    });
+                if !connected {
+                    return false;
+                }
+                let overrides = session_connections.get(session_id);
+                if let Some(&v) = overrides.get(connector) {
+                    return v;
+                }
+                let persona = persona_store_for_defaults.persona_of(session_id);
+                let defaults = persona_store_for_defaults.persona_defaults(&persona);
+                defaults.get(connector).copied().unwrap_or(true)
+            }),
+        };
+
+        inbound::install(&self.inbound_slot, deps);
+    }
+
+    /// Hot-reload inbound listeners from secrets and sync connector connected flags.
+    pub async fn refresh_gateway(&self) -> Vec<String> {
+        let relay_url = self.config.cloud_relay_ws_url.trim().to_string();
+        if !relay_url.is_empty() {
+            let settings = self.settings.clone();
+            let config = self.config.clone();
+            let token_provider: TokenProvider = Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        cloud::fresh_access_token(&settings, &config)
+                            .await
+                            .unwrap_or_default()
+                    })
+                })
+            });
+            self.gateway.set_relay(relay_url, token_provider).await;
+        }
+
+        let profiles = self.build_gateway_profiles().await;
+        let started = self
+            .gateway
+            .start_from_profiles(profiles)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("gateway refresh failed: {e}");
+                Vec::new()
+            });
+        self.sync_connector_connected().await;
+        tracing::info!(
+            "messaging gateway reloaded: {}",
+            if started.is_empty() {
+                "none".into()
+            } else {
+                started.join(", ")
+            }
+        );
+        started
+    }
+
+    /// Sync in-memory `connected` flags from stored profiles (mirrors Python list).
+    pub async fn sync_connector_connected(&self) {
+        let all = self.settings.secrets_all().await;
+        for d in self.connector_store.list_descriptors() {
+            let connected = connector_connected_from_secrets(d, &all);
+            self.connector_store.set_connected(&d.name, connected);
+        }
+    }
+
+    async fn build_gateway_profiles(&self) -> Vec<(String, Value)> {
+        let mut profiles = Vec::new();
+        for platform in ["telegram", "slack", "github"] {
+            if let Some(p) = self
+                .settings
+                .secrets_get(&format!("{platform}:default"))
+                .await
+            {
+                profiles.push((platform.to_string(), Value::Object(p)));
+            }
+        }
+        let all = self.settings.secrets_all().await;
+        for (key, profile) in all {
+            if key.starts_with("slack:team:") && key.len() > "slack:team:".len() {
+                profiles.push((key, Value::Object(profile)));
+            }
+        }
+        profiles
     }
 
     /// Get or create a per-workspace shell executor and register its tools.

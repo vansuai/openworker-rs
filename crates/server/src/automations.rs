@@ -146,12 +146,23 @@ impl ScheduledTask {
     /// target is empty or the entry already exists. Mirrors Python
     /// `ScheduledTask.add_rule` (`coworker/automation/models.py`).
     pub fn add_rule(&mut self, tool: &str, target: &str) -> bool {
-        let entry = if target.is_empty() {
-            tool.to_string()
-        } else {
-            format!("{} {}", tool, target)
-        };
+        let entry = format!("{} {}", tool, target);
         if tool.is_empty() || target.is_empty() || self.always_allowed_tools.contains(&entry) {
+            return false;
+        }
+        self.always_allowed_tools.push(entry);
+        true
+    }
+
+    /// Add a name-only legacy grant (bare tool name, no target). Used for
+    /// `web_search` task-scoped "Allow every time" — destination is the
+    /// configured provider, so tool-wide is provider-wide (§1.9).
+    pub fn add_name_allow(&mut self, tool: &str) -> bool {
+        if tool.is_empty() || !ocw_engine::name_only_grantable(tool) {
+            return false;
+        }
+        let entry = tool.to_string();
+        if self.always_allowed_tools.contains(&entry) {
             return false;
         }
         self.always_allowed_tools.push(entry);
@@ -656,15 +667,9 @@ pub async fn handler_create(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "local".to_string());
-    let permissions: Vec<String> = body
-        .get("permissions")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // GUI (and agent tool) send `{tool, target, access}` objects — validate
+    // through `grant_entries` like Python's `create_automation`.
+    let permissions = grant_entries(body.get("permissions"));
 
     if title.is_empty() {
         return Err(Error::BadRequest("title is required".into()));
@@ -1035,6 +1040,10 @@ pub(crate) struct SchedulingOrigin {
 /// only `access: "write"` items whose tool declares a target argument (which
 /// excludes exec/destructive tools by construction) and whose target is
 /// non-empty become grants; reads are disclosure-only and dropped. Fail-closed.
+///
+/// Extension: `name_only_grantable` tools (`web_search`) may be granted as a
+/// bare tool name without a target — the destination is the configured
+/// search provider (§1.9).
 fn grant_entries(permissions: Option<&Value>) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     let Some(arr) = permissions.and_then(|v| v.as_array()) else {
@@ -1054,13 +1063,23 @@ fn grant_entries(permissions: Option<&Value>) -> Vec<String> {
             .unwrap_or("")
             .trim()
             .to_string();
+        if tool.is_empty() {
+            continue;
+        }
+        // Name-only grantable tools (web_search): store bare tool name.
+        if ocw_engine::name_only_grantable(&tool) {
+            if !entries.contains(&tool) {
+                entries.push(tool);
+            }
+            continue;
+        }
         let target = obj
             .get("target")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim()
             .to_string();
-        if tool.is_empty() || target.is_empty() || ocw_engine::target_arg_for(&tool).is_none() {
+        if target.is_empty() || ocw_engine::target_arg_for(&tool).is_none() {
             continue;
         }
         let entry = format!("{} {}", tool, target);
@@ -1438,6 +1457,8 @@ mod tests {
                 {"tool": "send_message", "target": "alice", "access": "write"},
                 {"tool": "connector__slack", "target": "#gen", "access": "read"},
                 {"tool": "web_search", "target": "q", "access": "write"},
+                {"tool": "web_search", "access": "write"},
+                {"tool": "web_fetch", "target": "https://x", "access": "write"},
                 {"tool": "write_file", "target": "p", "access": "write"},
                 {"tool": "send_message", "target": "", "access": "write"}
             ]
@@ -1447,9 +1468,21 @@ mod tests {
             vec![
                 "connector__slack #gen".to_string(),
                 "send_message alice".to_string(),
+                "web_search".to_string(),
             ]
         );
         assert_eq!(grant_entries(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn add_name_allow_web_search_only() {
+        let mut t = sample_task("task-1");
+        assert!(t.add_name_allow("web_search"));
+        assert_eq!(t.always_allowed_tools, vec!["web_search".to_string()]);
+        assert!(!t.add_name_allow("web_search"), "duplicate must be rejected");
+        assert!(!t.add_name_allow("web_fetch"), "web_fetch is not name-only grantable");
+        assert!(!t.add_name_allow(""), "empty tool must be rejected");
+        assert_eq!(t.always_allowed_tools.len(), 1);
     }
 
     // -- schedule timezone handling (parity with Python's _tz + croniter) -----

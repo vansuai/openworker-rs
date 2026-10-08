@@ -67,24 +67,80 @@ fn parse_reasoning(msg: &Value) -> Option<String> {
     }
 }
 
+fn json_usize(v: Option<&Value>) -> usize {
+    let v = match v {
+        Some(v) => v,
+        None => return 0,
+    };
+    v.as_u64()
+        .or_else(|| v.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+        .or_else(|| {
+            v.as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        })
+        .unwrap_or(0) as usize
+}
+
 fn extract_usage(response: &Value) -> Option<TokenUsage> {
     let usage = response.get("usage")?;
-    let prompt = usage.get("prompt_tokens")?.as_u64()? as usize;
-    let completion = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let cached = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    if usage.is_null() || !usage.is_object() {
+        return None;
+    }
+    let prompt = {
+        let n = json_usize(usage.get("prompt_tokens"));
+        if n > 0 {
+            n
+        } else {
+            json_usize(usage.get("input_tokens"))
+        }
+    };
+    let completion = {
+        let n = json_usize(usage.get("completion_tokens"));
+        if n > 0 {
+            n
+        } else {
+            json_usize(usage.get("output_tokens"))
+        }
+    };
+    let cached = json_usize(
+        usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens")),
+    );
+    if prompt == 0 && completion == 0 && cached == 0 {
+        return None;
+    }
     Some(TokenUsage {
         input: prompt.saturating_sub(cached),
         output: completion,
         cache_read: cached,
         cache_write: 0,
     })
+}
+
+fn merge_usage(prev: Option<TokenUsage>, next: TokenUsage) -> TokenUsage {
+    match prev {
+        None => next,
+        Some(p) => TokenUsage {
+            input: if next.input > 0 { next.input } else { p.input },
+            output: if next.output > 0 {
+                next.output
+            } else {
+                p.output
+            },
+            cache_read: if next.cache_read > 0 {
+                next.cache_read
+            } else {
+                p.cache_read
+            },
+            cache_write: if next.cache_write > 0 {
+                next.cache_write
+            } else {
+                p.cache_write
+            },
+        },
+    }
 }
 
 fn build_body(model: &str, messages: &[Value], tools: Option<&[Value]>, settings: &Value) -> Value {
@@ -297,9 +353,8 @@ impl SSEIterator {
                 let payload = if args_raw.is_empty() {
                     Value::Null
                 } else {
-                    serde_json::from_str(&args_raw).unwrap_or_else(|_| {
-                        serde_json::json!({ "_raw": args_raw })
-                    })
+                    serde_json::from_str(&args_raw)
+                        .unwrap_or_else(|_| serde_json::json!({ "_raw": args_raw }))
                 };
                 out.push(ToolCall {
                     id,
@@ -311,9 +366,8 @@ impl SSEIterator {
             let arguments: Value = if args_raw.is_empty() {
                 Value::Object(Map::new())
             } else {
-                serde_json::from_str(&args_raw).unwrap_or_else(|_| {
-                    serde_json::json!({ "_raw": args_raw })
-                })
+                serde_json::from_str(&args_raw)
+                    .unwrap_or_else(|_| serde_json::json!({ "_raw": args_raw }))
             };
             out.push(ToolCall {
                 id,
@@ -322,6 +376,37 @@ impl SSEIterator {
             });
         }
         out
+    }
+
+    fn take_turn(&mut self) -> Option<StreamEvent> {
+        if self.text_parts.is_empty()
+            && self.tool_accum.is_empty()
+            && self.reasoning_parts.is_empty()
+            && self.finish_reason.is_none()
+            && self.usage.is_none()
+        {
+            return None;
+        }
+        let reasoning = if self.reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(self.reasoning_parts.join(""))
+        };
+        let text = if self.text_parts.is_empty() {
+            None
+        } else {
+            Some(self.text_parts.join(""))
+        };
+        let tcs = self.finalize_tool_calls();
+        Some(StreamEvent::Turn {
+            turn: AssistantTurn {
+                text,
+                tool_calls: tcs,
+                finish_reason: self.finish_reason.clone(),
+                reasoning,
+                usage: self.usage.clone(),
+            },
+        })
     }
 }
 
@@ -338,133 +423,93 @@ impl Iterator for SSEIterator {
                 continue;
             };
 
-            // Usage-only chunk
-            if json.get("choices").is_none() {
-                if let Some(u) = extract_usage(&json) {
-                    self.usage = Some(u);
-                }
+            // Capture usage on every chunk (finish, include_usage trailer, or
+            // a lone `usage` object). Last non-zero field wins so a finish
+            // chunk with `prompt_tokens: 0` doesn't clobber a later full count.
+            if let Some(u) = extract_usage(&json) {
+                self.usage = Some(merge_usage(self.usage.take(), u));
+            }
+
+            let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
                 continue;
-            }
+            };
+            // OpenAI include_usage trailer: `choices: []` + usage. Don't treat
+            // an empty array as end-of-stream (`first()?` would yield None).
+            let Some(choice) = choices.first() else {
+                continue;
+            };
 
-            let choices = json.get("choices")?.as_array()?;
-            let delta = choices.first()?.get("delta")?;
-
-            // Text delta
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                self.text_parts.push(text.to_string());
-                return Some(StreamEvent::TextDelta {
-                    text: text.to_string(),
-                });
-            }
-
-            // Reasoning delta
-            if let Some(reasoning) = parse_reasoning(delta) {
-                self.reasoning_parts.push(reasoning.clone());
-                return Some(StreamEvent::ReasoningDelta { reasoning });
-            }
-
-            // Tool call delta — aggregate by `index` so a single tool call
-            // reassembles from many deltas. Per the OpenAI streaming spec:
-            //  - First delta: {index, id, function: {name, arguments: ""}}
-            //  - Subsequent deltas: {index, function: {arguments: "<chunk>"}}
-            // Without index-based accumulation, a JSON `arguments` payload with N
-            // tokens spawns N pseudo tool calls, each with an empty name and a
-            // partial JSON body that the engine later surfaces as a phantom tool.
-            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                for tc in tcs {
-                    let idx = tc
-                        .get("index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
-                    let entry = self
-                        .tool_accum
-                        .entry(idx)
-                        .or_insert_with(|| (String::new(), String::new(), String::new()));
-                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                        if !id.is_empty() {
-                            entry.0 = id.to_string();
-                        }
+            let mut pending: Option<StreamEvent> = None;
+            if let Some(delta) = choice.get("delta") {
+                if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        self.text_parts.push(text.to_string());
+                        pending = Some(StreamEvent::TextDelta {
+                            text: text.to_string(),
+                        });
                     }
-                    if let Some(name) = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                    {
-                        if !name.is_empty() {
-                            entry.1 = name.to_string();
-                        }
+                }
+
+                if pending.is_none() {
+                    if let Some(reasoning) = parse_reasoning(delta) {
+                        self.reasoning_parts.push(reasoning.clone());
+                        pending = Some(StreamEvent::ReasoningDelta { reasoning });
                     }
-                    if let Some(args) = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|v| v.as_str())
-                    {
-                        entry.2.push_str(args);
+                }
+
+                // Tool call delta — aggregate by `index` so a single tool call
+                // reassembles from many deltas. Per the OpenAI streaming spec:
+                //  - First delta: {index, id, function: {name, arguments: ""}}
+                //  - Subsequent deltas: {index, function: {arguments: "<chunk>"}}
+                // Without index-based accumulation, a JSON `arguments` payload with N
+                // tokens spawns N pseudo tool calls, each with an empty name and a
+                // partial JSON body that the engine later surfaces as a phantom tool.
+                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let entry = self
+                            .tool_accum
+                            .entry(idx)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            if !id.is_empty() {
+                                entry.0 = id.to_string();
+                            }
+                        }
+                        if let Some(name) = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !name.is_empty() {
+                                entry.1 = name.to_string();
+                            }
+                        }
+                        if let Some(args) = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                        {
+                            entry.2.push_str(args);
+                        }
                     }
                 }
             }
 
-            // Final chunk
-            if let Some(fr) = choices
-                .first()?
-                .get("finish_reason")
-                .and_then(|v| v.as_str())
-            {
-                if let Some(u) = extract_usage(&json) {
-                    self.usage = Some(u);
+            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                if !fr.is_empty() && fr != "null" {
+                    self.finish_reason = Some(fr.to_string());
+                    // Keep draining: the include_usage chunk arrives AFTER this.
                 }
-                self.done = true;
-                let reasoning = if self.reasoning_parts.is_empty() {
-                    None
-                } else {
-                    Some(self.reasoning_parts.join(""))
-                };
-                let text = if self.text_parts.is_empty() {
-                    None
-                } else {
-                    Some(self.text_parts.join(""))
-                };
-                let tcs = self.finalize_tool_calls();
-                return Some(StreamEvent::Turn {
-                    turn: AssistantTurn {
-                        text,
-                        tool_calls: tcs,
-                        finish_reason: Some(fr.to_string()),
-                        reasoning,
-                        usage: self.usage.clone(),
-                    },
-                });
+            }
+
+            if let Some(ev) = pending {
+                return Some(ev);
             }
         }
 
-        // Stream ended without finish_reason
-        if !self.text_parts.is_empty()
-            || !self.tool_accum.is_empty()
-            || !self.reasoning_parts.is_empty()
-        {
-            self.done = true;
-            let reasoning = if self.reasoning_parts.is_empty() {
-                None
-            } else {
-                Some(self.reasoning_parts.join(""))
-            };
-            let text = if self.text_parts.is_empty() {
-                None
-            } else {
-                Some(self.text_parts.join(""))
-            };
-            let tcs = self.finalize_tool_calls();
-            return Some(StreamEvent::Turn {
-                turn: AssistantTurn {
-                    text,
-                    tool_calls: tcs,
-                    finish_reason: self.finish_reason.clone(),
-                    reasoning,
-                    usage: self.usage.clone(),
-                },
-            });
-        }
-        None
+        self.done = true;
+        self.take_turn()
     }
 }
 
@@ -564,7 +609,11 @@ mod tests {
                 tool_calls = turn.tool_calls;
             }
         }
-        assert_eq!(tool_calls.len(), 1, "expected exactly one tool call after aggregation");
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "expected exactly one tool call after aggregation"
+        );
         let tc = &tool_calls[0];
         assert_eq!(tc.id, "call_1");
         assert_eq!(tc.name, "web_search");
@@ -604,5 +653,54 @@ mod tests {
         // The raw JSON got concatenated; downstream should see the rescued payload.
         let q = tcs[0].arguments.get("q").and_then(|v| v.as_str());
         assert_eq!(q, Some("abcd"));
+    }
+
+    fn drain_turn(body: &str) -> AssistantTurn {
+        let mut iter = SSEIterator::new(body);
+        let mut turn = None;
+        while let Some(ev) = iter.next() {
+            if let StreamEvent::Turn { turn: t } = ev {
+                turn = Some(t);
+            }
+        }
+        turn.expect("stream should emit a Turn")
+    }
+
+    /// OpenAI `stream_options.include_usage`: prompt counts arrive on a trailing
+    /// chunk with `choices: []` AFTER the finish_reason chunk. Emitting the turn
+    /// at finish_reason drops Input (MiniMax-M3 and other compat vendors).
+    #[test]
+    fn streaming_usage_from_trailing_empty_choices_chunk() {
+        let body = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "\n",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":140,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":40}}}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let turn = drain_turn(body);
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 9);
+        assert_eq!(usage.cache_read, 40);
+    }
+
+    /// Some vendors put a partial usage object on the finish chunk (`prompt_tokens: 0`)
+    /// and the real prompt count on the following include_usage chunk. Keep both.
+    #[test]
+    fn streaming_usage_merges_finish_chunk_with_later_prompt_count() {
+        let body = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":1400}}"#,
+            "\n",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1366,"completion_tokens":1400}}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let turn = drain_turn(body);
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.input, 1366);
+        assert_eq!(usage.output, 1400);
     }
 }

@@ -547,6 +547,16 @@ pub fn target_arg_for(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Tools eligible for a task-scoped **name-only** grant (no target binding).
+///
+/// Narrow: only `web_search`. Its destination is the configured search provider
+/// (§1.9), so a tool-wide grant is provider-wide — the same shape as the session
+/// "Allow searches" button, but durable on the automation. `web_fetch` stays
+/// domain-scoped; shell never gets a standing grant.
+pub fn name_only_grantable(tool_name: &str) -> bool {
+    tool_name == "web_search"
+}
+
 /// The target value iff this call is eligible for a task-scoped standing rule
 /// (UX-DECISIONS §25): external-risk only (never exec/write-local — shell asks
 /// forever), the tool must declare a target argument, and the call must actually
@@ -648,6 +658,14 @@ mod tests {
         // web tools are not in TARGET_ARGS.
         assert_eq!(target_arg_for("web_search"), None);
         assert_eq!(target_arg_for("read_file"), None);
+    }
+
+    #[test]
+    fn name_only_grantable_is_web_search_only() {
+        assert!(name_only_grantable("web_search"));
+        assert!(!name_only_grantable("web_fetch"));
+        assert!(!name_only_grantable("send_message"));
+        assert!(!name_only_grantable("run_shell"));
     }
 
     #[test]

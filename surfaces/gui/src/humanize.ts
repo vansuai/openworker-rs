@@ -4,6 +4,7 @@
 // model-written intent and is preferred when present. Fallback: "Used <tool> — <short args>".
 
 import { shortArgs } from "./components/ApprovalCard";
+import { coerceTodoItems } from "./todoUtils";
 
 // A one-line sentence in three segments so the UI can emphasize the object:
 // "Read " + <b>runbook.md</b> + " from the shared folder".
@@ -58,9 +59,11 @@ export function humanizeTool(name: string, args: any): HumanLine {
     case "todo_write": {
       // `todos` is current; `items` renders histories from before the rename (the old
       // key breaks Together's GLM-5.2 chat template — see coworker/tools/todo.py).
-      const items = Array.isArray(a.todos) ? a.todos : Array.isArray(a.items) ? a.items : [];
+      // coerceTodoItems also covers MiniMax's `{"item":[…]}` wrappers and its
+      // one-item flattened form, which used to render as "Updated the plan — 0 items".
+      const items = coerceTodoItems(a);
       if (items.length === 1) {
-        const it = items[0] || {};
+        const it = (items[0] || {}) as Record<string, unknown>;
         const status = String(it.status || "").replace(/_/g, " ");
         return {
           pre: "Updated the plan — ",

@@ -68,7 +68,7 @@ import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
 import { TeamChatView } from "./components/TeamChatView";
-import { coerceTodoArray } from "./todoUtils";
+import { coerceTodoItems } from "./todoUtils";
 
 type SettingsTab = "appearance" | "models" | "context" | "skills" | "voice" | "memory" | "personas";
 
@@ -86,10 +86,9 @@ const FILE_WRITE_TOOLS = new Set(["write_file", "apply_patch", "apply_unified_di
 
 // Models sometimes pass todo items as bare strings instead of {content, status} objects (the
 // backend tool normalizes them the same way; the GUI reads the raw proposal args, so mirror it).
-function normalizeTodos(raw: unknown): TodoItem[] {
-  const arr = coerceTodoArray(raw);
+function normalizeTodos(items: unknown[]): TodoItem[] {
   const statuses = new Set(["pending", "in_progress", "done"]);
-  return arr.map((entry: any) => {
+  return items.map((entry: any) => {
     if (entry && typeof entry === "object") {
       const status = entry.status === "completed" ? "done" : entry.status; // common model alias
       return {
@@ -673,8 +672,7 @@ export function App() {
           break;
         }
         case "tool_proposed":
-          if (d.name === "todo_write" && (d.arguments?.todos || d.arguments?.items))
-            setTodo(normalizeTodos(d.arguments.todos ?? d.arguments.items));
+          if (d.name === "todo_write") setTodo(normalizeTodos(coerceTodoItems(d.arguments)));
           setItems((p) => [
             ...p,
             { kind: "tool", id: newId(), name: d.name, args: d.arguments, status: "…" },
@@ -1045,6 +1043,24 @@ export function App() {
     const t = window.setTimeout(() => setRunToast(null), 5000);
     return () => window.clearTimeout(t);
   }, [runToast]);
+
+  useEffect(() => {
+    if (!isTauri() || surface === "session") return;
+    const onDown = (event: globalThis.PointerEvent) => {
+      if (event.button !== 0 || event.clientY > 48) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest(
+          "button, a, input, textarea, select, [role='button'], [role='menuitem']",
+        )
+      ) {
+        return;
+      }
+      startWindowDrag();
+    };
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  }, [surface]);
 
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
   const selectSession = async (id: string, ws: string, ag: string) => {
@@ -1438,9 +1454,11 @@ export function App() {
         onCollapse={toggleNav}
         onPeekLeave={() => setNavPeek(false)}
       />
-      {/* Drag bar for non-session surfaces (session has the sidebar .brand as drag region). */}
+      {/* Drag bar for non-session surfaces (session has the sidebar .brand as drag region).
+          pointer-events: none so header buttons (e.g. "+ New automation") stay fully
+          clickable; native data-tauri-drag-region would steal the whole 48px strip. */}
       {surface !== "session" && (
-        <div className="titlebar-drag" data-tauri-drag-region onMouseDown={(e) => { if ((e.target as HTMLElement).closest('button, a, input, textarea, select')) return; import('./tauri').then(m => m.startWindowDrag()); }} />
+        <div className="titlebar-drag titlebar-drag-passthrough" aria-hidden="true" />
       )}
       {surface === "scheduled" ? (
         <ScheduledView

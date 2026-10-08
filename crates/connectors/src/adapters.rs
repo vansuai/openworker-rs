@@ -126,6 +126,7 @@ pub fn slack_to_message_source(event: &Value, sender_name: &str, channel_name: &
 /// harness); outbound `send` uses the `chat.postMessage` HTTP API.
 pub struct SlackAdapter {
     bot_token: String,
+    app_token: String,
     bot_user_id: Arc<Mutex<Option<String>>>,
     name_cache: Arc<Mutex<std::collections::HashMap<String, String>>>,
     channel_cache: Arc<Mutex<std::collections::HashMap<String, String>>>,
@@ -133,16 +134,14 @@ pub struct SlackAdapter {
     interaction_handler: Arc<Mutex<Option<InteractionHandler>>>,
     client: reqwest::Client,
     api_base: String,
+    running: Arc<Mutex<bool>>,
 }
 
 impl SlackAdapter {
     pub fn new(bot_token: String, app_token: String) -> Self {
-        // app_token is required for Socket Mode (long-lived WebSocket). For
-        // this Rust port we run inbound from an external relay, so we still
-        // accept both but only `bot_token` is used at runtime.
-        let _ = app_token;
         Self {
             bot_token,
+            app_token,
             bot_user_id: Arc::new(Mutex::new(None)),
             name_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             channel_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -154,7 +153,156 @@ impl SlackAdapter {
                 .unwrap(),
             api_base: std::env::var("SLACK_API_URL")
                 .unwrap_or_else(|_| "https://slack.com/api/".into()),
+            running: Arc::new(Mutex::new(false)),
         }
+    }
+
+    pub fn stop(&self) {
+        *self.running.lock() = false;
+    }
+
+    /// Socket Mode long-poll loop: `apps.connections.open` → WSS, ack envelopes,
+    /// dispatch `message` events to the registered handler.
+    pub async fn run_socket_mode_loop(&self) {
+        *self.running.lock() = true;
+        while *self.running.lock() {
+            let ws_url = match self.open_socket_mode_url().await {
+                Ok(u) => u,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            if !*self.running.lock() {
+                break;
+            }
+            if self.socket_mode_session(&ws_url).await {
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn open_socket_mode_url(&self) -> Result<String, String> {
+        let resp = self
+            .client
+            .post(format!("{}apps.connections.open", self.api_base))
+            .bearer_auth(&self.app_token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("apps.connections.open HTTP {}", resp.status()));
+        }
+        let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+        if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            return Err(format!("apps.connections.open failed: {err}"));
+        }
+        json.get("url")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "apps.connections.open: missing url".into())
+    }
+
+    async fn socket_mode_session(&self, ws_url: &str) -> bool {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await else {
+            return false;
+        };
+        while *self.running.lock() {
+            tokio::select! {
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            let Ok(envelope) = serde_json::from_str::<Value>(&text) else { continue };
+                            if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+                                let ack = serde_json::json!({"envelope_id": envelope_id});
+                                let _ = ws.send(WsMessage::Text(ack.to_string())).await;
+                            }
+                            if envelope.get("type").and_then(|v| v.as_str()) == Some("events_api") {
+                                if let Some(event) = envelope
+                                    .get("payload")
+                                    .and_then(|p| p.get("event"))
+                                {
+                                    self.dispatch_socket_event(event).await;
+                                }
+                            } else if envelope.get("type").and_then(|v| v.as_str()) == Some("interactive") {
+                                if let Some(payload) = envelope.get("payload") {
+                                    self.dispatch_socket_interaction(payload).await;
+                                }
+                            }
+                        }
+                        Some(Ok(WsMessage::Ping(p))) => {
+                            let _ = ws.send(WsMessage::Pong(p)).await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => return true,
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if !*self.running.lock() { return false; }
+                }
+            }
+        }
+        false
+    }
+
+    async fn dispatch_socket_event(&self, event: &Value) {
+        let bot_user_id = self.bot_user_id.lock().clone();
+        let Some(mut mapped) = slack_event_to_event(event, bot_user_id.as_deref()) else {
+            return;
+        };
+        if mapped.source.user_name.is_none() {
+            mapped.source.user_name = self
+                .resolve_user_name(mapped.source.user_id.as_deref())
+                .await;
+        }
+        if mapped.source.chat_name.is_none() {
+            mapped.source.chat_name = self
+                .resolve_channel_name(Some(&mapped.source.chat_id))
+                .await;
+        }
+        mapped.text = self.resolve_mentions(&mapped.text).await;
+        self.handle_message(mapped).await;
+    }
+
+    async fn dispatch_socket_interaction(&self, body: &Value) {
+        let actions = body.get("actions").and_then(|v| v.as_array());
+        let value = actions
+            .and_then(|a| a.first())
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let user = body.get("user");
+        let channel = body
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ts = body
+            .get("message")
+            .and_then(|m| m.get("ts"))
+            .and_then(|v| v.as_str());
+        let event = InteractionEvent {
+            platform: "slack".into(),
+            chat_id: channel.to_string(),
+            message_id: ts.map(String::from),
+            value: value.to_string(),
+            user_id: user.and_then(|u| u.get("id")).and_then(|v| v.as_str()).map(String::from),
+            user_name: user
+                .and_then(|u| u.get("username").or_else(|| u.get("name")))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            team_id: body.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_str()).map(String::from),
+            response_url: body.get("response_url").and_then(|v| v.as_str()).map(String::from),
+        };
+        self.handle_interaction(event).await;
     }
 
     /// Inject the resolved `bot_user_id` after `auth.test` succeeds. Without it
@@ -381,13 +529,14 @@ impl BasePlatformAdapter for SlackAdapter {
                 .unwrap_or("unknown");
             return Err(format!("slack auth.test failed: {err}"));
         }
-        // Mirror into bot_user_id field; we keep it on `self` (not `&mut`) so
-        // it's a write-once mutation handled by the gateway on the first
-        // successful inbound event.
+        if let Some(uid) = json.get("user_id").and_then(|v| v.as_str()) {
+            *self.bot_user_id.lock() = Some(uid.to_string());
+        }
         Ok(true)
     }
 
     async fn disconnect(&self) -> Result<(), String> {
+        self.stop();
         Ok(())
     }
 

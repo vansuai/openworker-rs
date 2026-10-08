@@ -184,7 +184,7 @@ pub struct GeminiClient {
 impl GeminiClient {
     pub fn new(api_key: String, default_model: String) -> Self {
         Self {
-            http: Client::new(),
+            http: crate::http::client(),
             api_key,
             default_model,
         }

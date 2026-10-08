@@ -1,6 +1,7 @@
 //! Anthropic Messages API client — native Claude support.
 
 use crate::error::Error;
+use crate::http;
 use crate::tool_args::{normalize_tool_input, parse_tool_arguments};
 use crate::types::{AssistantTurn, ModelCapabilities, StreamEvent, TokenUsage, ToolCall};
 use reqwest::blocking::Client;
@@ -37,6 +38,46 @@ fn uses_budget_thinking(model: &str) -> bool {
 
 fn needs_refusal_fallback(model: &str) -> bool {
     model.starts_with("claude-fable") || model.starts_with("claude-mythos")
+}
+
+fn json_usize(v: Option<&Value>) -> usize {
+    let v = match v {
+        Some(v) => v,
+        None => return 0,
+    };
+    v.as_u64()
+        .or_else(|| v.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+        .or_else(|| {
+            v.as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        })
+        .unwrap_or(0) as usize
+}
+
+/// Merge an Anthropic `usage` object into the running counts. Input often
+/// arrives on `message_start` and output on `message_delta`; compat vendors
+/// (MiniMax) may send the whole object only on `message_delta`.
+fn usage_from_anthropic(u: &Value, prev: Option<TokenUsage>) -> TokenUsage {
+    let prev = prev.unwrap_or_default();
+    let input = json_usize(u.get("input_tokens"));
+    let output = json_usize(u.get("output_tokens"));
+    let cache_read = json_usize(u.get("cache_read_input_tokens"));
+    let cache_write = json_usize(u.get("cache_creation_input_tokens"));
+    TokenUsage {
+        input: if input > 0 { input } else { prev.input },
+        output: if output > 0 { output } else { prev.output },
+        cache_read: if cache_read > 0 {
+            cache_read
+        } else {
+            prev.cache_read
+        },
+        cache_write: if cache_write > 0 {
+            cache_write
+        } else {
+            prev.cache_write
+        },
+    }
 }
 
 fn stop_reason_map(reason: &str) -> &str {
@@ -242,42 +283,49 @@ fn image_block(url: &str) -> Value {
 }
 
 fn convert_tools(tools: &[Value]) -> Vec<Value> {
-    tools.iter().map(|t| {
-        let empty = serde_json::Map::new();
-        let function = t.get("function").and_then(|v| v.as_object()).unwrap_or(&empty);
-        let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let mut entry = serde_json::json!({ "name": name });
-        if let Some(desc) = function.get("description").and_then(|v| v.as_str()) {
-            if let Some(obj) = entry.as_object_mut() {
-                obj.insert("description".to_string(), serde_json::json!(desc));
-            }
-        }
-        let params = function.get("parameters")
-            .and_then(|v| v.as_object())
-            .map(strip_schema);
-        let schema = match params {
-            Some(p) => {
-                let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("object");
-                let mut schema_obj = serde_json::Map::new();
-                schema_obj.insert("type".to_string(), serde_json::json!(t));
-                schema_obj.insert(
-                    "properties".to_string(),
-                    p.get("properties")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default())),
-                );
-                if let Some(required) = p.get("required") {
-                    schema_obj.insert("required".to_string(), required.clone());
+    tools
+        .iter()
+        .map(|t| {
+            let empty = serde_json::Map::new();
+            let function = t
+                .get("function")
+                .and_then(|v| v.as_object())
+                .unwrap_or(&empty);
+            let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let mut entry = serde_json::json!({ "name": name });
+            if let Some(desc) = function.get("description").and_then(|v| v.as_str()) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("description".to_string(), serde_json::json!(desc));
                 }
-                serde_json::Value::Object(schema_obj)
             }
-            None => serde_json::json!({ "type": "object", "properties": {} }),
-        };
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("input_schema".to_string(), schema);
-        }
-        entry
-    }).collect()
+            let params = function
+                .get("parameters")
+                .and_then(|v| v.as_object())
+                .map(strip_schema);
+            let schema = match params {
+                Some(p) => {
+                    let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("object");
+                    let mut schema_obj = serde_json::Map::new();
+                    schema_obj.insert("type".to_string(), serde_json::json!(t));
+                    schema_obj.insert(
+                        "properties".to_string(),
+                        p.get("properties")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Object(Default::default())),
+                    );
+                    if let Some(required) = p.get("required") {
+                        schema_obj.insert("required".to_string(), required.clone());
+                    }
+                    serde_json::Value::Object(schema_obj)
+                }
+                None => serde_json::json!({ "type": "object", "properties": {} }),
+            };
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("input_schema".to_string(), schema);
+            }
+            entry
+        })
+        .collect()
 }
 
 fn strip_schema(obj: &serde_json::Map<String, Value>) -> Value {
@@ -320,6 +368,24 @@ fn strip_schema(obj: &serde_json::Map<String, Value>) -> Value {
 // Anthropic client
 // ---------------------------------------------------------------------------
 
+/// Reads a response body, reporting the underlying transport cause on failure —
+/// `reqwest::Error`'s Display hides it behind "error decoding response body".
+fn read_body_text(resp: reqwest::blocking::Response, vendor: &str) -> Result<String, Error> {
+    match resp.text() {
+        Ok(text) => Ok(text),
+        Err(e) => {
+            let mut chain = vec![e.to_string()];
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                chain.push(s.to_string());
+                src = s.source();
+            }
+            eprintln!("[ocw-provider] {vendor} response body read failed: {}", chain.join(" <- "));
+            Err(Error::Http(e))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AnthropicClient {
     http: Client,
@@ -350,7 +416,7 @@ impl AnthropicClient {
         vendor: String,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: http::client(),
             api_key,
             default_model,
             thinking_budget,
@@ -503,7 +569,7 @@ impl AnthropicClient {
             return Err(Error::from_response(status, &body, "anthropic"));
         }
 
-        let body = resp.text()?;
+        let body = read_body_text(resp, &self.vendor)?;
         let mut iter = AnthropicStreamIter::new(&body);
         let mut final_turn: Option<AssistantTurn> = None;
         while let Some(ev) = iter.next() {
@@ -551,7 +617,7 @@ impl AnthropicClient {
             return Err(Error::from_response(status, &body, "anthropic"));
         }
 
-        let body = resp.text()?;
+        let body = read_body_text(resp, &self.vendor)?;
         Ok(AnthropicStreamIter::new(&body))
     }
 }
@@ -615,17 +681,7 @@ impl Iterator for AnthropicStreamIter {
                 "message_start" => {
                     if let Some(msg) = event.get("message") {
                         if let Some(u) = msg.get("usage") {
-                            self.usage = Some(TokenUsage {
-                                input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                                    as usize,
-                                output: 0,
-                                cache_read: u
-                                    .get("cache_read_input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    as usize,
-                                cache_write: 0,
-                            });
+                            self.usage = Some(usage_from_anthropic(u, None));
                         }
                     }
                 }
@@ -728,17 +784,8 @@ impl Iterator for AnthropicStreamIter {
                             self.stop_reason = Some(stop_reason_map(reason).to_string());
                         }
                     }
-                    if let Some(u) = event.get("usage").and_then(|v| v.as_object()) {
-                        let out =
-                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        if out > 0 {
-                            self.usage = Some(TokenUsage {
-                                input: self.usage.as_ref().map(|t| t.input).unwrap_or(0),
-                                output: out,
-                                cache_read: self.usage.as_ref().map(|t| t.cache_read).unwrap_or(0),
-                                cache_write: 0,
-                            });
-                        }
+                    if let Some(u) = event.get("usage") {
+                        self.usage = Some(usage_from_anthropic(u, self.usage.clone()));
                     }
                     self.done = true;
                     let tcs = self
@@ -820,5 +867,144 @@ impl crate::router::Provider for AnthropicClient {
 
     fn name(&self) -> &str {
         &self.vendor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::StreamEvent;
+
+    /// `reqwest::blocking::Client::new()` carries a 30 s total timeout, which
+    /// truncates any SSE response that takes longer than that — the engine sees
+    /// it as "error decoding response body". A slower stream must still finish.
+    /// Ignored by default because it deliberately runs ~40 s.
+    #[test]
+    #[ignore = "slow (~40s): streams SSE past reqwest's 30s blocking default"]
+    fn complete_survives_streams_longer_than_30s() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        use serde_json::json;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Read until the header terminator appears anywhere — the client
+            // pipelines the JSON body right after it, so the buffer will not
+            // end on the blank line.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = writeln!(sock, "HTTP/1.1 200 OK");
+            let _ = writeln!(sock, "content-type: text/event-stream");
+            let _ = writeln!(sock, "cache-control: no-cache");
+            let _ = writeln!(sock);
+            let send = |sock: &mut std::net::TcpStream, event: &str, data: Value| {
+                let _ = write!(sock, "event: {event}\ndata: {data}\n\n");
+                let _ = sock.flush();
+            };
+            send(
+                &mut sock,
+                "message_start",
+                json!({"type": "message_start", "message": {"role": "assistant", "content": []}}),
+            );
+            send(
+                &mut sock,
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text", "text": ""}}),
+            );
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(2000));
+                send(
+                    &mut sock,
+                    "content_block_delta",
+                    json!({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "text_delta", "text": "chunk "}}),
+                );
+            }
+            send(
+                &mut sock,
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                       "usage": {"output_tokens": 20}}),
+            );
+        });
+
+        let client = AnthropicClient::with_base_url(
+            "test-key".into(),
+            "claude-test".into(),
+            0,
+            format!("http://127.0.0.1:{port}"),
+            "anthropic".into(),
+        );
+        let turn = client
+            .complete(
+                "claude-test",
+                vec![json!({"role": "user", "content": "go"})],
+                None,
+                json!({}),
+            )
+            .expect("a stream longer than 30s must not be truncated");
+
+        let text = turn.text.unwrap();
+        assert!(text.contains("chunk"), "unexpected text: {text:?}");
+        let _ = server.join();
+    }
+
+    fn drain_turn(body: &str) -> AssistantTurn {
+        let mut iter = AnthropicStreamIter::new(body);
+        let mut turn = None;
+        while let Some(ev) = iter.next() {
+            if let StreamEvent::Turn { turn: t } = ev {
+                turn = Some(t);
+            }
+        }
+        turn.expect("stream should emit a Turn")
+    }
+
+    /// Compat vendors (MiniMax Anthropic API) sometimes omit `input_tokens` on
+    /// `message_start` and only send the full usage object on `message_delta`.
+    #[test]
+    fn streaming_usage_reads_input_tokens_from_message_delta() {
+        let body = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1366,"output_tokens":1400}}"#,
+            "\n",
+        );
+        let usage = drain_turn(body).usage.expect("usage");
+        assert_eq!(usage.input, 1366);
+        assert_eq!(usage.output, 1400);
+    }
+
+    #[test]
+    fn streaming_usage_keeps_message_start_input_when_delta_omits_it() {
+        let body = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":25}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+            "\n",
+        );
+        let usage = drain_turn(body).usage.expect("usage");
+        assert_eq!(usage.input, 7);
+        assert_eq!(usage.output, 42);
+        assert_eq!(usage.cache_read, 100);
+        assert_eq!(usage.cache_write, 25);
     }
 }

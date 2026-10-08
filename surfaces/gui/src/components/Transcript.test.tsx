@@ -205,4 +205,32 @@ describe("humanizeTool", () => {
     const line = humanizeTool("todo_write", { items: [{ content: "Old plan", status: "pending" }] });
     expect(line.obj).toContain("Old plan");
   });
+
+  // MiniMax wraps array params in {"item": …} and flattens one-item lists onto the top
+  // level; both used to render as "Updated the plan — 0 items" for a real, saved plan.
+  it("renders todo_write through the item wrapper", () => {
+    const line = humanizeTool("todo_write", {
+      todos: { item: { item: [{ content: "Post the digest", status: "done" }] } },
+    });
+    expect(line.pre).toBe("Updated the plan — ");
+    expect(line.obj).toContain("Post the digest");
+    expect(line.post).toBe(" → done");
+  });
+
+  it("renders a flattened single-item todo_write", () => {
+    const line = humanizeTool("todo_write", {
+      content: "Write the briefing",
+      status: "in_progress",
+      todos: "",
+    });
+    expect(line.pre).toBe("Updated the plan — ");
+    expect(line.obj).toContain("Write the briefing");
+  });
+
+  it("counts multi-item todo_write from the coerced array", () => {
+    const line = humanizeTool("todo_write", {
+      todos: { item: [{ content: "a", status: "pending" }, { content: "b", status: "done" }] },
+    });
+    expect(line.pre).toBe("Updated the plan — 2 items");
+  });
 });

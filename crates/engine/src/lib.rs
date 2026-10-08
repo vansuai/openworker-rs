@@ -33,8 +33,8 @@ pub use engine::{
 };
 pub use events::{Event, EventData, EventType};
 pub use permissions::{
-    classify_risk, classify_risk_with, standing_target_candidate, standing_target_candidate_with,
-    target_arg_for, Decision, Mode, PermissionEngine, RiskClass,
+    classify_risk, classify_risk_with, name_only_grantable, standing_target_candidate,
+    standing_target_candidate_with, target_arg_for, Decision, Mode, PermissionEngine, RiskClass,
 };
 pub use provenance::{
     attach_approval_display, command_paths, created_paths, referenced_paths, resolve,

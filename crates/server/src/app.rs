@@ -1474,6 +1474,8 @@ pub async fn run(state: AppState) -> std::io::Result<()> {
 
     tracing::info!("OpenWorker server listening on {}", addr);
 
+    state.refresh_gateway().await;
+
     // Start the background scheduler.
     let sched_state = state.clone();
     tokio::spawn(async move {

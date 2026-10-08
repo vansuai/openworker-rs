@@ -1403,8 +1403,13 @@ export async function mockApi(page: import("@playwright/test").Page) {
       if (!body.title || !body.instructions || !(body.cron || body.fire_at))
         return json({ ok: false, error: "missing fields" });
       const grants = (body.permissions || [])
-        .filter((g: any) => g && g.access === "write" && g.tool && g.target)
-        .map((g: any) => ({ entry: `${g.tool} ${g.target}`, tool: g.tool, target: g.target }));
+        .filter((g: any) => g && g.access === "write" && g.tool)
+        .filter((g: any) => g.target || g.tool === "web_search")
+        .map((g: any) =>
+          g.target
+            ? { entry: `${g.tool} ${g.target}`, tool: g.tool, target: g.target }
+            : { entry: g.tool, tool: g.tool, target: null },
+        );
       const task = {
         ...AUTOMATION,
         id: `task-ob-${automations.length}`,

@@ -1031,6 +1031,12 @@ button.btn.sm.danger-btn:hover { border-color: var(--danger); }
   padding-left: 82px; /* clear the macOS traffic lights */
   user-select: none;
 }
+/* Non-session overlay: pass hits through so header actions (e.g. "+ New automation")
+   stay fully clickable. Native data-tauri-drag-region on this strip stole the top
+   48px and left only the button's lower sliver live. Window drag is JS on empty pixels. */
+.titlebar-drag-passthrough {
+  pointer-events: none;
+}
 .titlebar-brand { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; color: var(--muted); user-select: none; }
 .titlebar-brand .mark { color: var(--accent); }
 /* The sidebar's brand row IS the desktop title bar (pin control + wordmark). On desktop the
@@ -1228,9 +1234,29 @@ button.btn.ghost:hover { color: var(--ink); }
 .tmpl-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .tmpl-input::placeholder { color: var(--faint); }
 .tmpl-textarea { resize: vertical; min-height: 64px; line-height: 1.45; }
-.tmpl-sched { display: flex; gap: 14px; flex-wrap: wrap; }
+.tmpl-sched { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
 .tmpl-field { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--muted); }
-.tmpl-time, .tmpl-select { padding: 6px 9px; }
+/* At (time) and Repeat (<select>) share one control box. Native menulist appearance
+   otherwise paints Repeat as a shorter OS widget next to the styled time field. */
+.tmpl-time, .tmpl-select {
+  height: 34px;
+  padding: 0 10px;
+  line-height: 32px;
+  font: inherit;
+  font-size: 13px;
+}
+.tmpl-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  cursor: pointer;
+  background-color: var(--panel);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 12px;
+}
+.tmpl-time::-webkit-datetime-edit { padding: 0; display: inline-flex; align-items: center; }
 .tmpl-form-actions { display: flex; align-items: center; gap: 12px; margin-top: 2px; }
 
 

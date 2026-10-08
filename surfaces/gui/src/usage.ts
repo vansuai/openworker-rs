@@ -16,6 +16,15 @@ const num = (v: any): number => {
   return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
+/** First positive count among aliases (OpenAI `prompt_tokens`, Anthropic `input_tokens`, …). */
+const pick = (raw: any, ...keys: string[]): number => {
+  for (const key of keys) {
+    const n = num(raw?.[key]);
+    if (n > 0) return n;
+  }
+  return 0;
+};
+
 /** Fold one turn's usage sidecar into the session accumulation.
  *  `fallbackModel` covers older servers that omit `usage.model` — use the session's
  *  current model instead of bucketing under "unknown". */
@@ -30,10 +39,10 @@ export function addTurnUsage(
     typeof fallbackModel === "string" && fallbackModel ? fallbackModel : null;
   const turn: TurnUsage = {
     model: fromSidecar || fromFallback,
-    input: num(raw.input),
-    output: num(raw.output),
-    cache_read: num(raw.cache_read),
-    cache_write: num(raw.cache_write),
+    input: pick(raw, "input", "input_tokens", "prompt_tokens"),
+    output: pick(raw, "output", "output_tokens", "completion_tokens"),
+    cache_read: pick(raw, "cache_read", "cache_read_input_tokens"),
+    cache_write: pick(raw, "cache_write", "cache_creation_input_tokens"),
   };
   const key = turn.model || "unknown";
   const cur = prev.byModel[key];

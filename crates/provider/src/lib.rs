@@ -20,6 +20,7 @@ mod bedrock;
 mod codex;
 mod error;
 mod friendly_error;
+mod http;
 #[allow(dead_code)]
 #[allow(clippy::double_ended_iterator_last, clippy::while_let_on_iterator)]
 mod gemini;

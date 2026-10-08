@@ -93,6 +93,20 @@ impl McpRuntime {
         self.connect_and_list(server).await
     }
 
+    /// Short-lived connection: initialize → tools/call → return MCP result.
+    pub async fn call_tool(
+        &self,
+        server: &McpServerDef,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        match server.transport.as_str() {
+            "stdio" => self.call_tool_stdio(server, tool_name, arguments).await,
+            "http" => self.call_tool_http(server, tool_name, arguments).await,
+            other => Err(format!("unsupported MCP transport: {other}")),
+        }
+    }
+
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -201,10 +215,10 @@ impl McpRuntime {
     // -- http -----------------------------------------------------------------
 
     async fn connect_http(&self, server: &McpServerDef) -> Result<Vec<McpToolInfo>, String> {
-        if server.auth.as_deref() == Some("oauth") {
-            return Err(
-                "OAuth MCP connect is not yet available in the Rust server".into(),
-            );
+        if server.auth.as_deref() == Some("oauth")
+            && !server.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"))
+        {
+            return Err("OAuth MCP server has no stored tokens — reconnect from Settings".into());
         }
 
         let url = server
@@ -261,6 +275,137 @@ impl McpRuntime {
         .await?;
 
         Ok(parse_tools_result(&listed))
+    }
+
+    async fn call_tool_stdio(
+        &self,
+        server: &McpServerDef,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        let command = server
+            .command
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| format!("MCP server '{}' is stdio but has no command", server.name))?;
+
+        let mut cmd = Command::new(command);
+        cmd.args(&server.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if !server.env.is_empty() {
+            for (k, v) in &server.env {
+                cmd.env(k, v);
+            }
+        }
+        if let Some(cwd) = &server.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn MCP server '{command}': {e}"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "MCP process missing stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "MCP process missing stdout".to_string())?;
+        let mut reader = BufReader::new(stdout);
+
+        let init_id = self.next_request_id();
+        write_ndjson(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": init_id,
+                "method": "initialize",
+                "params": Self::init_params(),
+            }),
+        )
+        .await?;
+        let _init = read_response(&mut reader, init_id, DEFAULT_TIMEOUT).await?;
+        write_ndjson(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await?;
+
+        let call_id = self.next_request_id();
+        write_ndjson(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": call_id,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }),
+        )
+        .await?;
+        let result = read_response(&mut reader, call_id, DEFAULT_TIMEOUT).await?;
+        drop(stdin);
+        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+        Ok(result)
+    }
+
+    async fn call_tool_http(
+        &self,
+        server: &McpServerDef,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        if server.auth.as_deref() == Some("oauth")
+            && !server.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"))
+        {
+            return Err("OAuth MCP server has no stored tokens — reconnect from Settings".into());
+        }
+        let url = server
+            .url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| format!("MCP server '{}' is http but has no url", server.name))?;
+
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| format!("http client error: {e}"))?;
+        let mut session_id: Option<String> = None;
+
+        let init_id = self.next_request_id();
+        http_rpc(
+            &client,
+            url,
+            &server.headers,
+            &mut session_id,
+            init_id,
+            "initialize",
+            Some(Self::init_params()),
+        )
+        .await?;
+        let _ = http_notify(
+            &client,
+            url,
+            &server.headers,
+            &session_id,
+            "notifications/initialized",
+        )
+        .await;
+
+        let call_id = self.next_request_id();
+        http_rpc(
+            &client,
+            url,
+            &server.headers,
+            &mut session_id,
+            call_id,
+            "tools/call",
+            Some(json!({"name": tool_name, "arguments": arguments})),
+        )
+        .await
     }
 }
 
@@ -553,7 +698,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn http_oauth_returns_clear_error() {
+    async fn http_oauth_without_tokens_errors() {
         let server = McpServerDef {
             name: "oauth-svc".into(),
             transport: "http".into(),
@@ -571,7 +716,61 @@ for line in sys.stdin:
         };
         let runtime = McpRuntime::new();
         let err = runtime.connect_and_list(&server).await.unwrap_err();
-        assert!(err.contains("OAuth"), "err={err}");
+        assert!(err.contains("no stored tokens"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_returns_result() {
+        let server = McpServerDef {
+            name: "mock-call".into(),
+            transport: "stdio".into(),
+            command: Some("python3".into()),
+            args: vec![
+                "-c".into(),
+                r#"
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}]}})
+        break
+"#
+                .into(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        let runtime = McpRuntime::new();
+        let result = runtime
+            .call_tool(&server, "echo", json!({"msg": "hi"}))
+            .await
+            .expect("call");
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|t| t.get("text"))
+                .and_then(|t| t.as_str()),
+            Some("pong")
+        );
     }
 
     #[tokio::test]

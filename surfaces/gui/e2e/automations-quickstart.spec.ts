@@ -107,14 +107,15 @@ test("read-only recipe (Morning brief) carries disclosure, not a grant", async (
   await expect(page.getByTestId("ob-consent")).toHaveCount(0);
 });
 
-test("no-connection template: When is editable and create opens the detail", async ({ page }) => {
+test("Morning news briefing consents to web_search and lands the grant", async ({ page }) => {
   await openQuickstart(page);
   // The card says so on its face.
   await expect(page.getByTestId("qs-template-news")).toContainText("No connections needed");
   await page.getByTestId("qs-template-news").click();
 
-  // No connect rows, no consent — just When (day × time) and an enabled Create.
-  await expect(page.getByTestId("ob-consent")).toHaveCount(0);
+  // §25 search consent pre-checked; When (day × time) editable; Create enabled.
+  await expect(page.getByTestId("ob-consent")).toBeChecked();
+  await expect(page.getByTestId("qs-configure")).toContainText("search the web");
   await expect(
     page.getByTestId("ob-recipe").getByRole("button", { name: "Day" }),
   ).toContainText("Every day");
@@ -123,4 +124,45 @@ test("no-connection template: When is editable and create opens the detail", asy
 
   await expect(page.getByRole("button", { name: /Run now/ })).toBeVisible();
   await expect(page.getByText("Morning news briefing").first()).toBeVisible();
+  await expect(page.getByTestId("task-grants")).toContainText("web_search");
+});
+
+test("blank form: search consent and a connected Slack row", async ({ page }) => {
+  await openAutomations(page);
+  await page.getByRole("button", { name: "+ New automation" }).click();
+  const form = page.getByTestId("na-form");
+  await form.getByPlaceholder("Title (e.g. Daily standup notes)").fill("Custom briefing");
+  await form.getByPlaceholder(/What should it do/).fill("Search and write a note.");
+  await form.getByTestId("na-search-consent").check();
+
+  await form.getByTestId("na-add-conn").selectOption("slack");
+  await expect(form.getByTestId("na-conn-slack")).toContainText("Connected");
+  await expect(form.getByTestId("na-connect-slack")).toHaveCount(0);
+
+  await form.getByTestId("na-create").click();
+  await expect(page.getByRole("button", { name: /Run now/ })).toBeVisible();
+  await expect(page.getByTestId("task-grants")).toContainText("web_search");
+});
+
+test("new automation button is clickable at the top of its hit box", async ({ page }) => {
+  await openAutomations(page);
+  const btn = page.getByRole("button", { name: "+ New automation" });
+  const box = await btn.boundingBox();
+  expect(box).toBeTruthy();
+  // The desktop titlebar overlay used to cover the top ~24px of this control.
+  await page.mouse.click(box!.x + box!.width / 2, box!.y + 3);
+  await expect(page.getByText("Start from a template")).toBeVisible();
+});
+
+test("At and Repeat controls share height and top edge", async ({ page }) => {
+  await openAutomations(page);
+  await page.getByRole("button", { name: "+ New automation" }).click();
+  const time = page.locator(".tmpl-time");
+  const select = page.locator(".tmpl-select");
+  const t = await time.boundingBox();
+  const s = await select.boundingBox();
+  expect(t).toBeTruthy();
+  expect(s).toBeTruthy();
+  expect(t!.height).toBe(s!.height);
+  expect(Math.abs(t!.y - s!.y)).toBeLessThan(2);
 });

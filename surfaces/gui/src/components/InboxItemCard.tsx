@@ -397,16 +397,24 @@ export function InboxItemCard({
             {item.data?.tool ? approvalActionLabels(item.data.tool).allow : t("inbox.approve")}
           </button>
           {/* Task-persistent standing grant (§25) — present only when the approval was
-              raised inside an automation run AND the call can carry a tool+target rule.
-              In-app only by construction: Slack mirrors render Approve/Deny buttons. */}
-          {item.data?.task_id && item.data?.standing_target && (
+              raised inside an automation run AND the call can carry a tool+target rule
+              or a name-only grantable tool (web_search). In-app only by construction:
+              Slack mirrors render Approve/Deny buttons. */}
+          {item.data?.task_id && (item.data?.standing_target || item.data?.name_allow) && (
             <button
               className={BTN_BORDERED}
-              title={t("inbox.always_task_title", {
-                target: item.data.standing_target,
-                task: item.data.task_title || t("approval.btn.this_automation"),
-              })}
+              title={
+                item.data.standing_target
+                  ? t("inbox.always_task_title", {
+                      target: item.data.standing_target,
+                      task: item.data.task_title || t("approval.btn.this_automation"),
+                    })
+                  : t("inbox.always_task_search_title", {
+                      task: item.data.task_title || t("approval.btn.this_automation"),
+                    })
+              }
               onClick={() => onResolve(item.id, "always_task")}
+              data-testid="inbox-always-task"
             >
               {t("approval.btn.allow_every_time")}
             </button>

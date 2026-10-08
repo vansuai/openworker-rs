@@ -336,7 +336,8 @@ impl RateLimiter {
 // Engine helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_builtin_registry(
+pub(crate) fn populate_builtin_registry(
+    reg: &mut ocw_engine::ToolRegistry,
     workspace_root: &str,
     todo_list: StdArc<ocw_tools::TodoList>,
     provider: StdArc<dyn ocw_provider::Provider>,
@@ -358,8 +359,8 @@ pub(crate) fn build_builtin_registry(
         Option<String>,
         StdArc<dyn Fn() -> bool + Send + Sync>,
     )>,
-) -> StdArc<ocw_engine::ToolRegistry> {
-    let mut reg = ocw_engine::ToolRegistry::new();
+    connectors: Option<crate::connector_tools::ConnectorSessionArgs>,
+) {
     let agent_config = crate::agents::get_agent(agent);
     let context = crate::agents::AgentContext {
         workspace: Some(std::path::PathBuf::from(workspace_root)),
@@ -367,7 +368,7 @@ pub(crate) fn build_builtin_registry(
         model: model.to_string(),
         todo_list,
     };
-    agent_config.register_tools(&mut reg, &context);
+    agent_config.register_tools(reg, &context);
 
     // Register load_skill tool for skill progressive disclosure.
     // Mirrors Python's agent.py: skill_loader = SkillLoader(_skill_dirs(ws));
@@ -380,7 +381,7 @@ pub(crate) fn build_builtin_registry(
         skill_loader,
         StdArc::new(|| None), // allow all skills; session filtering can be added later
     );
-    load_skill_tool.register(&mut reg);
+    load_skill_tool.register(reg);
 
     // Agent-facing scheduling tools (create/list/update/delete scheduled
     // tasks) — only for live knowledge-family sessions that have a workspace,
@@ -388,7 +389,7 @@ pub(crate) fn build_builtin_registry(
     if let Some((store, origin_session_id)) = automations {
         if agent_config.family == "knowledge" && agent_config.needs_workspace {
             crate::automations::register_scheduling_tools(
-                &mut reg,
+                reg,
                 store,
                 crate::automations::SchedulingOrigin {
                     workspace: workspace_root.to_string(),
@@ -401,7 +402,7 @@ pub(crate) fn build_builtin_registry(
     }
 
     if let Some(board_args) = board {
-        crate::board_tools::register_board_tools(&mut reg, board_args);
+        crate::board_tools::register_board_tools(reg, board_args);
     }
 
     // Agent-facing memory tools (remember / memory_read / memory_update /
@@ -410,11 +411,53 @@ pub(crate) fn build_builtin_registry(
     // `memory_store=self.memory_store`); None for tests / when memory is
     // intentionally disabled at a call site.
     if let Some((store, workspace, saving)) = memory {
-        crate::memory_tools::register_memory_tools(&mut reg, store, workspace, saving, None);
+        crate::memory_tools::register_memory_tools(reg, store, workspace, saving, None);
+    }
+
+    if let Some(conn) = connectors {
+        crate::connector_tools::register_connector_session_tools(
+            reg,
+            workspace_root,
+            agent_config.messaging,
+            agent_config.connectors,
+            &conn,
+        );
     }
 
     // Shell executor is managed separately (persistent per-workspace) and registered
     // in init_engine where we have access to the shell executor map.
+}
+
+pub(crate) fn build_builtin_registry(
+    workspace_root: &str,
+    todo_list: StdArc<ocw_tools::TodoList>,
+    provider: StdArc<dyn ocw_provider::Provider>,
+    model: &str,
+    agent: &str,
+    skill_store: &ocw_skills::SkillStore,
+    automations: Option<(StdArc<crate::automations::AutomationStore>, String)>,
+    board: Option<crate::board_tools::BoardToolsArgs>,
+    memory: Option<(
+        StdArc<dyn ocw_data::MemoryBackend>,
+        Option<String>,
+        StdArc<dyn Fn() -> bool + Send + Sync>,
+    )>,
+    connectors: Option<crate::connector_tools::ConnectorSessionArgs>,
+) -> StdArc<ocw_engine::ToolRegistry> {
+    let mut reg = ocw_engine::ToolRegistry::new();
+    populate_builtin_registry(
+        &mut reg,
+        workspace_root,
+        todo_list,
+        provider,
+        model,
+        agent,
+        skill_store,
+        automations,
+        board,
+        memory,
+        connectors,
+    );
     StdArc::new(reg)
 }
 
@@ -498,6 +541,50 @@ async fn init_engine(state: &AppState, ctx: &SessionCtx) {
         eng.set_audit_context(ctx_map);
     }
     *ctx.run.engine.write() = Some(eng);
+}
+
+/// True when this session is a headless scheduled/catchup automation run
+/// (not a manual "Run now"). Those keep the scheduled approver — WriteLocal
+/// auto-allows, no live approval card — matching Python's `_build_task_engine`.
+async fn headless_automation_task(
+    state: &AppState,
+    session_id: &str,
+) -> Option<crate::automations::ScheduledTask> {
+    let run_id = session_id.strip_prefix("__run__")?;
+    let store = state.automations.read().await;
+    let run = store.get_run(run_id)?;
+    if run.trigger == "manual" {
+        return None;
+    }
+    store.get(&run.task_id)
+}
+
+/// Wire the right approver for this turn: scheduled (headless) vs live inbox.
+async fn wire_turn_approver(
+    eng: ocw_engine::TurnEngine,
+    state: &AppState,
+    session_id: &str,
+    persona_id: Option<String>,
+    perms: StdArc<tokio::sync::Mutex<ocw_engine::PermissionEngine>>,
+) -> ocw_engine::TurnEngine {
+    if let Some(task) = headless_automation_task(state, session_id).await {
+        // Headless schedule/catchup: keep `_scheduled_approver` semantics.
+        // Do not mark attended — Auto-Approve reviewer stays off.
+        eng.with_approver(crate::scheduler::make_scheduled_approver(
+            state.clone(),
+            &task,
+            session_id.to_string(),
+            perms,
+        ))
+    } else {
+        eng.with_approver(make_inbox_approver(
+            state.clone(),
+            session_id.to_string(),
+            persona_id,
+            perms,
+        ))
+        .with_is_attended(|| true)
+    }
 }
 
 /// Build an `AuditSink` callback that appends tool lifecycle events to the
@@ -585,6 +672,9 @@ fn make_inbox_approver(
                 "task_id": task_id,
                 "task_title": task_title,
                 "standing_target": standing_target,
+                "name_allow": standing_target.is_none()
+                    && ocw_engine::name_only_grantable(&req.tool_name)
+                    && task_id.is_some(),
             });
             let item = state.inbox_store.add_approval(
                 &session_id,
@@ -628,10 +718,8 @@ fn make_inbox_approver(
             let resolution = state.inbox_store.wait(&item.id).await;
             if resolution == "always_task" {
                 // Mint a standing rule on the owning task ("Allow every time",
-                // §25). Mirrors Python's `mint_task_rule`: run session + rule
-                // eligibility + dedupe are all re-checked server-side, and the
-                // mint result never changes this call's outcome — `approval_outcome`
-                // returns ONCE regardless.
+                // §25). Target-bound tools use add_rule; name-only grantable
+                // tools (web_search) use add_name_allow + session allow.
                 if let Some(mut task) = owning_task {
                     if let Some(target) = standing_target {
                         if task.add_rule(&req.tool_name, &target) {
@@ -658,6 +746,34 @@ fn make_inbox_approver(
                                 format!(
                                     "allow every time: {} → {} (task {})",
                                     req.tool_name, target, task.id
+                                )
+                                .into(),
+                            );
+                            state.audit.append(&event);
+                        }
+                    } else if ocw_engine::name_only_grantable(&req.tool_name) {
+                        if task.add_name_allow(&req.tool_name) {
+                            {
+                                let store = state.automations.read().await;
+                                store.save_task(task.clone());
+                            }
+                            let mut guard = perms.lock().await;
+                            guard.allow_tool_for_session(req.tool_name.clone());
+                            drop(guard);
+                            let mut event = serde_json::Map::new();
+                            event.insert("session_id".into(), session_id.clone().into());
+                            event.insert("tool".into(), req.tool_name.clone().into());
+                            event.insert(
+                                "arguments".into(),
+                                permission_args_to_value(&req),
+                            );
+                            event.insert("stage".into(), "standing_rule_minted".into());
+                            event.insert("status".into(), "granted".into());
+                            event.insert(
+                                "reason".into(),
+                                format!(
+                                    "allow every time: {} (name-only, task {})",
+                                    req.tool_name, task.id
                                 )
                                 .into(),
                             );
@@ -1423,7 +1539,9 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
                 crate::team_tick::kick_team_tick(board_kick_state.clone());
             })),
         };
-        let registry = build_builtin_registry(
+        let mut registry = ocw_engine::ToolRegistry::new();
+        populate_builtin_registry(
+            &mut registry,
             &workspace,
             StdArc::clone(&todo_list),
             StdArc::clone(&provider),
@@ -1446,9 +1564,21 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
                     })
                 },
             )),
+            Some(crate::connector_tools::ConnectorSessionArgs::from_store(
+                state.settings.clone(),
+                &state.connector_store,
+            )),
         );
+        crate::mcp_tools::register_mcp_session_tools(
+            &mut registry,
+            &state.mcp_store,
+            &state.mcp_runtime,
+            &state.settings,
+        )
+        .await;
+        let registry = StdArc::new(registry);
         let permissions = StdArc::new(tokio::sync::Mutex::new(ocw_engine::PermissionEngine::new(
-            state.config.data_dir.join("permissions.json"),
+            std::path::PathBuf::from(&workspace),
         )));
         // Automation run sessions carry their task's standing allowances across
         // engine (re)builds — mirrors Python's `_seed_task_permissions` in the
@@ -1558,38 +1688,39 @@ async fn on_user_message(ctx: SessionCtx, state: AppState, msg: UserMessage) {
         .map(|s| s.model)
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| state.default_model_or_configured());
-    eng = eng
-        .with_approver(make_inbox_approver(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-            perms,
-        ))
-        .with_question_asker(make_inbox_question_asker(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-        ))
-        .with_directory_requester(make_inbox_directory_requester(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-        ))
-        .with_plan_approver(make_inbox_plan_approver(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id),
-        ))
-        .with_is_attended(|| true)
-        .with_compaction_settings({
-            let settings = state.settings.clone();
-            move || settings.compaction_settings_sync()
-        })
-        .with_cancel(StdArc::clone(&run.cancel));
+    let headless = headless_automation_task(&state, &session_id).await.is_some();
+    eng = wire_turn_approver(
+        eng,
+        &state,
+        &session_id,
+        Some(persona_id.clone()),
+        perms,
+    )
+    .await
+    .with_question_asker(make_inbox_question_asker(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id.clone()),
+    ))
+    .with_directory_requester(make_inbox_directory_requester(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id.clone()),
+    ))
+    .with_plan_approver(make_inbox_plan_approver(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id),
+    ))
+    .with_compaction_settings({
+        let settings = state.settings.clone();
+        move || settings.compaction_settings_sync()
+    })
+    .with_cancel(StdArc::clone(&run.cancel));
 
-    // Auto-Approve: only attach the live reviewer when the setting is on
-    // (mirrors Python's conditional reviewer wiring).
-    if state.settings.auto_approve_sync() {
+    // Auto-Approve: attended sessions only (§1.5). Headless scheduled runs never
+    // get the live reviewer (Python's `_build_task_engine` stays Interactive).
+    if !headless && state.settings.auto_approve_sync() {
         eng = eng.with_reviewer(make_session_reviewer(
             StdArc::clone(&state.provider),
             reviewer_model,
@@ -1718,29 +1849,30 @@ async fn on_retry(ctx: SessionCtx, state: AppState) {
         }
     };
     let perms = eng.permissions_handle();
-    eng = eng
-        .with_approver(make_inbox_approver(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-            perms,
-        ))
-        .with_question_asker(make_inbox_question_asker(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-        ))
-        .with_directory_requester(make_inbox_directory_requester(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id.clone()),
-        ))
-        .with_plan_approver(make_inbox_plan_approver(
-            state.clone(),
-            session_id.clone(),
-            Some(persona_id),
-        ))
-        .with_cancel(StdArc::clone(&run.cancel));
+    eng = wire_turn_approver(
+        eng,
+        &state,
+        &session_id,
+        Some(persona_id.clone()),
+        perms,
+    )
+    .await
+    .with_question_asker(make_inbox_question_asker(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id.clone()),
+    ))
+    .with_directory_requester(make_inbox_directory_requester(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id.clone()),
+    ))
+    .with_plan_approver(make_inbox_plan_approver(
+        state.clone(),
+        session_id.clone(),
+        Some(persona_id),
+    ))
+    .with_cancel(StdArc::clone(&run.cancel));
 
     let park_state = state.clone();
     let park_sid = session_id.clone();
@@ -1881,6 +2013,7 @@ mod tests {
             agent,
             &ocw_skills::SkillStore::new(workspace.to_path_buf()),
             automations,
+            None,
             None,
             None,
         )

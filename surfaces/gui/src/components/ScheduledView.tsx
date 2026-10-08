@@ -1,18 +1,29 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  announceAutomationsChanged,
+  cloudLogin,
+  connectManaged,
   createAutomation,
   deleteAutomation,
   getAutomation,
   getAutomations,
+  getCloudStatus,
+  getConnectors,
+  getRecentChannels,
   markAutomationSeen,
-  announceAutomationsChanged,
   updateAutomation,
+  waitForCloudSignIn,
   type Automation,
   type AutomationRun,
+  type CloudStatus,
+  type Connector,
+  type RecentChannel,
 } from "../api";
+import { ConnectorBadge } from "../connectors/ConnectorIcon";
+import { AutomationQuickstart, Spinner } from "./AutomationQuickstart";
 import { Icon } from "./Icon";
 import { PanelHead } from "./IntegrationsView";
-import { AutomationQuickstart } from "./AutomationQuickstart";
+import { ChannelPicker } from "./SubscriptionsChip";
 
 // Shared utility strings (the §28 page shell — mirrors IntegrationsView's constants).
 const CARD = "rounded-xl2 border border-line bg-panel";
@@ -88,7 +99,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
     title: string;
     instructions: string;
     cron?: string;
-    permissions?: { tool: string; target: string; access: "read" | "write" }[];
+    permissions?: { tool: string; target?: string; access: "read" | "write" }[];
   }) => {
     setBusy(payload.title);
     try {
@@ -196,24 +207,127 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
   );
 }
 
-function NewAutomationForm({
+type AutomationPermission = { tool: string; target?: string; access: "read" | "write" };
+
+/** Blank "+ New automation" form — not a template. Optional connections and the
+ *  web_search standing grant ride out as `permissions` (the server's grant_entries). */
+export function NewAutomationForm({
   busy,
   onCancel,
   onCreate,
 }: {
   busy: boolean;
   onCancel: () => void;
-  onCreate: (p: { title: string; instructions: string; cron?: string }) => void;
+  onCreate: (p: {
+    title: string;
+    instructions: string;
+    cron?: string;
+    permissions?: AutomationPermission[];
+  }) => void;
 }) {
   const [title, setTitle] = useState("");
   const [instructions, setInstructions] = useState("");
   const [time, setTime] = useState("09:00");
   const [freq, setFreq] = useState("daily");
+  const [allowSearch, setAllowSearch] = useState(false);
+  const [added, setAdded] = useState<string[]>([]);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const [cloud, setCloud] = useState<CloudStatus | null>(null);
+  const [pendingConn, setPendingConn] = useState<string | null>(null);
+  const [connFlow, setConnFlow] = useState<{ name: string; phase: "opening" | "waiting" } | null>(
+    null,
+  );
+  const [signinPhase, setSigninPhase] = useState<"opening" | "waiting" | null>(null);
+  const [recent, setRecent] = useState<RecentChannel[]>([]);
+  const [channel, setChannel] = useState("");
+  const [postConsent, setPostConsent] = useState(false);
+  const signinPollRef = useRef<(() => void) | null>(null);
+
+  const refresh = () => {
+    getConnectors().then(setConnectors).catch(() => {});
+    getCloudStatus().then(setCloud).catch(() => {});
+  };
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 3000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    if (connFlow && connectors.find((c) => c.name === connFlow.name)?.connected) setConnFlow(null);
+  }, [connectors, connFlow]);
+  useEffect(() => {
+    if (added.some((n) => connectors.find((c) => c.name === n)?.channels)) {
+      getRecentChannels().then(setRecent).catch(() => {});
+    }
+  }, [added, connectors]);
+  useEffect(() => {
+    return () => {
+      signinPollRef.current?.();
+      signinPollRef.current = null;
+    };
+  }, []);
+
+  const connOf = (name: string) => connectors.find((c) => c.name === name);
+  const remaining = connectors.filter((c) => c.available !== false && !added.includes(c.name));
+  const missing = added.filter((n) => !connOf(n)?.connected);
+  const channelReady = added.some((n) => {
+    const c = connOf(n);
+    return !!c?.channels && c.connected;
+  });
+
+  const startConnect = async (name: string) => {
+    if (!cloud?.signed_in) {
+      setPendingConn(name);
+      return;
+    }
+    setConnFlow({ name, phase: "opening" });
+    await connectManaged(name).catch(() => {});
+    setConnFlow((f) => (f?.name === name ? { name, phase: "waiting" } : f));
+    refresh();
+  };
+
+  const signInThenConnect = async () => {
+    setSigninPhase("opening");
+    await cloudLogin().catch(() => {});
+    setSigninPhase("waiting");
+    signinPollRef.current = waitForCloudSignIn(async (s) => {
+      signinPollRef.current = null;
+      setSigninPhase(null);
+      if (!s?.signed_in) return;
+      setCloud(s);
+      if (pendingConn) {
+        const name = pendingConn;
+        setConnFlow({ name, phase: "opening" });
+        await connectManaged(name).catch(() => {});
+        setConnFlow((f) => (f?.name === name ? { name, phase: "waiting" } : f));
+        setPendingConn(null);
+        refresh();
+      }
+    });
+  };
 
   const valid = title.trim() && instructions.trim();
+  const gateHint =
+    missing.length > 0
+      ? `Connect ${missing.map((n) => connOf(n)?.title || n).join(" and ")} to continue`
+      : "";
+
+  const submit = () => {
+    const permissions: AutomationPermission[] = [];
+    if (allowSearch) permissions.push({ tool: "web_search", access: "write" });
+    if (channelReady && postConsent && channel.trim()) {
+      permissions.push({ tool: "send_message", target: channel.trim(), access: "write" });
+    }
+    onCreate({
+      title: title.trim(),
+      instructions: instructions.trim(),
+      cron: toCron(time, freq),
+      ...(permissions.length ? { permissions } : {}),
+    });
+  };
 
   return (
-    <div className={CARD + " tmpl-form p-4 mb-4"}>
+    <div className={CARD + " tmpl-form p-4 mb-4"} data-testid="na-form">
       <div className="text-[11px] uppercase tracking-[0.05em] text-faint mb-2.5">
         New automation
       </div>
@@ -252,17 +366,191 @@ function NewAutomationForm({
           </select>
         </label>
       </div>
+
+      <div className="mt-3">
+        <div className="text-[11px] uppercase tracking-[0.05em] text-faint mb-1.5">Connections</div>
+        {added.map((name) => {
+          const c = connOf(name);
+          const flow = connFlow?.name === name ? connFlow : null;
+          return (
+            <div key={name} className="border-b border-line" data-testid={`na-conn-${name}`}>
+              <div className="flex items-center gap-3 py-2">
+                {c && <ConnectorBadge connector={c} size={22} title={c.title} />}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] font-medium">{c?.title || name}</span>
+                  {c?.blurb && <span className="block text-[11.5px] text-faint">{c.blurb}</span>}
+                </span>
+                {c?.connected ? (
+                  <span className="text-[12.5px] text-ok">✓ Connected</span>
+                ) : flow ? (
+                  <span className="inline-flex items-center gap-2 text-[12px] text-muted">
+                    <Spinner />
+                    {flow.phase === "opening"
+                      ? "Opening browser…"
+                      : `Waiting for ${c?.title || name}…`}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="px-3 py-1 rounded-full border border-line text-[12.5px] hover:bg-paper"
+                    onClick={() => startConnect(name)}
+                    data-testid={`na-connect-${name}`}
+                  >
+                    Connect
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="link text-[12px]"
+                  onClick={() => {
+                    setAdded((cur) => cur.filter((n) => n !== name));
+                    if (connFlow?.name === name) setConnFlow(null);
+                    if (pendingConn === name) setPendingConn(null);
+                  }}
+                  data-testid={`na-remove-${name}`}
+                >
+                  Remove
+                </button>
+              </div>
+              {flow?.phase === "waiting" && (
+                <div
+                  className="flex items-start gap-2 bg-accentSoft/50 rounded-lg px-3 py-2 mb-2 text-[12px] text-muted"
+                  data-testid="na-connect-wait"
+                >
+                  <span>↗</span>
+                  <span className="flex-1 min-w-0">
+                    <b className="text-ink font-medium">
+                      Finish connecting {c?.title || name} in your browser.
+                    </b>{" "}
+                    Approve it there, then come back — this page updates by itself.
+                  </span>
+                  <button
+                    type="button"
+                    className="text-faint underline hover:text-muted shrink-0"
+                    onClick={() => setConnFlow(null)}
+                    data-testid="na-connect-cancel"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {remaining.length > 0 && (
+          <select
+            className="tmpl-input mt-2"
+            data-testid="na-add-conn"
+            aria-label="Add connection"
+            value=""
+            onChange={(e) => {
+              const name = e.target.value;
+              if (!name) return;
+              setAdded((cur) => (cur.includes(name) ? cur : [...cur, name]));
+            }}
+          >
+            <option value="">Add connection…</option>
+            {remaining.map((c) => (
+              <option key={c.name} value={c.name}>
+                {c.title}
+              </option>
+            ))}
+          </select>
+        )}
+        {pendingConn && !cloud?.signed_in && (
+          <div
+            className="bg-accentSoft/50 rounded-xl px-4 py-3 mt-3 text-[12.5px] text-muted"
+            data-testid="na-cloudpane"
+          >
+            <span className="block text-[13px] text-ink font-medium">
+              One sign-in unlocks every one-click connection
+            </span>
+            Connections are brokered by OpenWorker Cloud — your tokens stay on this Mac.
+            <div className="flex items-center gap-3 mt-2">
+              {signinPhase ? (
+                <>
+                  <span className="inline-flex items-center gap-2 text-[12px]">
+                    <Spinner />
+                    {signinPhase === "opening" ? "Opening browser…" : "Waiting for sign-in…"}
+                  </span>
+                  {signinPhase === "waiting" && (
+                    <button
+                      type="button"
+                      className="underline hover:text-muted text-[11.5px] text-faint"
+                      onClick={() => {
+                        signinPollRef.current?.();
+                        signinPollRef.current = null;
+                        setSigninPhase(null);
+                      }}
+                      data-testid="na-signin-cancel"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="px-3.5 py-1 rounded-full border border-line text-[12.5px] text-accent hover:bg-panel"
+                  onClick={signInThenConnect}
+                  data-testid="na-cloud-signin"
+                >
+                  Sign in to OpenWorker Cloud
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+        {channelReady && (
+          <div className="mt-3" data-testid="na-channel">
+            <label className="block text-[12px] text-muted mb-1">Post to channel</label>
+            <ChannelPicker
+              value={channel}
+              onChange={setChannel}
+              recent={recent}
+            />
+            <label className="flex items-start gap-2.5 mt-2.5 text-[12.5px] text-muted select-none">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={postConsent}
+                onChange={(e) => setPostConsent(e.target.checked)}
+                data-testid="na-post-consent"
+              />
+              <span>
+                Allow this automation to post to the chosen channel without asking each time.
+                Anything else still asks first.
+              </span>
+            </label>
+          </div>
+        )}
+      </div>
+
+      <label className="flex items-start gap-2.5 mt-3.5 text-[12.5px] text-muted select-none">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={allowSearch}
+          onChange={(e) => setAllowSearch(e.target.checked)}
+          data-testid="na-search-consent"
+        />
+        <span>
+          Allow this automation to search the web via your configured search provider without
+          asking each time. Anything else still asks first.
+        </span>
+      </label>
+
       <div className="tmpl-form-actions">
+        {gateHint && (
+          <span className="text-[11.5px] text-faint mr-auto" data-testid="na-create-hint">
+            {gateHint}
+          </span>
+        )}
         <button
           className="btn-primary sm"
-          disabled={!valid || busy}
-          onClick={() =>
-            onCreate({
-              title: title.trim(),
-              instructions: instructions.trim(),
-              cron: toCron(time, freq),
-            })
-          }
+          disabled={!valid || busy || missing.length > 0}
+          onClick={submit}
+          data-testid="na-create"
         >
           {busy ? "Creating…" : "Create automation"}
         </button>

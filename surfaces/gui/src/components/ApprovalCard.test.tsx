@@ -198,6 +198,24 @@ describe("InboxItemCard — Allow every time on parked run approvals", () => {
     expect(screen.getByText("Deny")).toBeTruthy();
   });
 
+  it("shows Allow every time for name-only web_search parked run approvals", () => {
+    const onResolve = vi.fn();
+    render(
+      <InboxItemCard
+        item={baseItem({
+          tool: "web_search",
+          arguments: { query: "tech news" },
+          task_id: "task-news",
+          task_title: "Morning news briefing",
+          name_allow: true,
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    fireEvent.click(screen.getByText("Allow every time"));
+    expect(onResolve).toHaveBeenCalledWith("i1", "always_task");
+  });
+
   it("parked approvals with tool data wear the §35 dress — same dialect as the live card", () => {
     const onResolve = vi.fn();
     render(
@@ -540,6 +558,25 @@ describe("ApprovalCard — §1.9 egress cards", () => {
     fireEvent.click(screen.getByText("Allow searches for this session"));
     expect(onApprove).toHaveBeenCalledWith("always_tool"); // tool-wide IS provider-wide here
     expect(screen.getByText(/leaves this computer → your search provider/)).toBeTruthy();
+  });
+
+  it("web_search in a run context offers Allow every time (name-only task grant)", () => {
+    const onApprove = vi.fn();
+    render(
+      <ApprovalCard
+        item={fetchApproval({
+          name: "web_search",
+          args: { query: "tech news" },
+          searchProvider: "duckduckgo",
+        })}
+        onApprove={onApprove}
+        runTask={RUN_TASK}
+      />,
+    );
+    fireEvent.click(screen.getByText("Allow every time"));
+    expect(onApprove).toHaveBeenCalledWith("always_task");
+    // Session-scoped search grant is replaced by the task-persistent one.
+    expect(screen.queryByText("Allow searches for this session")).toBeNull();
   });
 
   it("Auto-Approve fall-through cards hide every session 'always' (§1.5: grants don't skip the reviewer)", () => {

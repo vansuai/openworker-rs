@@ -56,6 +56,24 @@ describe("addTurnUsage", () => {
     const u = addTurnUsage(emptyUsage(), turn(), "gpt-5.5");
     expect(Object.keys(u.byModel)).toEqual(["anthropic:claude-fable-5"]);
   });
+
+  it("accepts OpenAI-shaped prompt_tokens / completion_tokens aliases", () => {
+    const u = addTurnUsage(emptyUsage(), {
+      prompt_tokens: 1366,
+      completion_tokens: 1400,
+    });
+    expect(u.byModel.unknown.input).toBe(1366);
+    expect(u.byModel.unknown.output).toBe(1400);
+  });
+
+  it("accepts Anthropic-shaped input_tokens / output_tokens aliases", () => {
+    const u = addTurnUsage(emptyUsage(), {
+      input_tokens: 200,
+      output_tokens: 50,
+    });
+    expect(u.byModel.unknown.input).toBe(200);
+    expect(u.byModel.unknown.output).toBe(50);
+  });
 });
 
 describe("usageFromMessages", () => {

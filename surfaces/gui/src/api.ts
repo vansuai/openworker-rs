@@ -2118,8 +2118,8 @@ export async function createAutomation(payload: {
   fire_at?: string;
   timezone?: string;
   // §25 standing grants (the creating surface rendered them; submit IS the consent).
-  // Only target-bound write entries survive server-side validation.
-  permissions?: { tool: string; target: string; access: "read" | "write" }[];
+  // Target-bound write entries and name-only web_search survive server-side validation.
+  permissions?: { tool: string; target?: string; access: "read" | "write" }[];
 }): Promise<{ ok: boolean; error?: string; task?: Automation }> {
   const res = await fetch(`${httpBase()}/v1/automations`, {
     method: "POST",

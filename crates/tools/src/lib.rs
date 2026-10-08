@@ -99,7 +99,21 @@ fn extract_todo_array(args: &Map<String, Value>) -> Vec<Value> {
             return arr;
         }
     }
+    // MiniMax also flattens a one-item list onto the top level of the arguments and
+    // leaves `todos` as an empty string.
+    if let Some(item) = flattened_single_todo(map) {
+        return vec![item];
+    }
     vec![]
+}
+
+fn flattened_single_todo(map: &Map<String, Value>) -> Option<Value> {
+    let content = map.get("content")?.as_str()?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let status = map.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+    Some(json!({ "content": content, "status": status }))
 }
 
 fn coerce_todo_value(value: Option<&Value>) -> Option<Vec<Value>> {
@@ -153,6 +167,99 @@ mod todo_tests {
             .unwrap()
             .clone();
         assert_eq!(extract_todo_array(&args).len(), 1);
+    }
+
+    /// Old transcripts store the vendor's `{"todos": {"item": …}}` wrapper verbatim and
+    /// each replayed turn adds a level, so unwrap any depth rather than just one.
+    #[test]
+    fn extract_todo_array_unwraps_nested_item_wrappers() {
+        for depth in 1..=4 {
+            let mut value = json!([{"content": "a", "status": "pending"}]);
+            for _ in 0..depth {
+                value = json!({"item": value});
+            }
+            let args = json!({"todos": value}).as_object().unwrap().clone();
+            assert_eq!(extract_todo_array(&args).len(), 1, "depth {depth}");
+        }
+    }
+
+    /// MiniMax also flattens a one-item list onto the top level of the arguments and
+    /// leaves `todos` as an empty string.
+    #[test]
+    fn extract_todo_array_accepts_flattened_single_item() {
+        let args = json!({
+            "activeForm": "Writing the briefing",
+            "content": "Curate and write the Markdown briefing",
+            "item": "",
+            "status": "in_progress",
+            "todos": ""
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let raw = extract_todo_array(&args);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0]["content"], "Curate and write the Markdown briefing");
+        assert_eq!(raw[0]["status"], "in_progress");
+    }
+
+    #[test]
+    fn flattened_single_item_needs_content() {
+        // An empty `todos` with no item fields is an empty list, not a blank todo.
+        let args = json!({"todos": "", "status": "pending"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(extract_todo_array(&args).is_empty());
+    }
+
+    /// Recorded MiniMax-M3 payloads (one per malformed shape seen in live
+    /// transcripts): each used to store an empty plan.
+    #[test]
+    fn recorded_minimax_payloads_recover_their_plan() {
+        let cases = [
+            (
+                r#"{"todos":{"item":[{"content":"Search AI repos","status":"in_progress"},{"content":"Write briefing","status":"pending"}]}}"#,
+                2,
+            ),
+            (
+                // Three replay rounds stacked three wrapper levels.
+                r#"{"todos":{"item":{"item":{"item":[{"content":"Draft briefing","status":"completed"}]}}}}"#,
+                1,
+            ),
+            (
+                r#"{"activeForm":"Writing the briefing","content":"Curate and write the Markdown briefing","item":"","status":"in_progress","todos":""}"#,
+                1,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let parsed = ocw_provider::parse_tool_arguments(raw);
+            let args = parsed.as_object().unwrap().clone();
+            let items = normalize_todos(&extract_todo_array(&args));
+            assert_eq!(items.len(), expected, "for {raw}");
+        }
+        // The `completed` alias still maps to `done` through the whole chain.
+        let parsed =
+            ocw_provider::parse_tool_arguments(r#"{"todos":{"item":[{"content":"a","status":"completed"}]}}"#);
+        let args = parsed.as_object().unwrap().clone();
+        assert_eq!(normalize_todos(&extract_todo_array(&args))[0].status, "done");
+    }
+
+    #[test]
+    fn todo_write_stores_flattened_single_item() {
+        let todo = TodoList::new();
+        let tool = make_todo_write(todo.clone());
+        let args = json!({
+            "content": "Draft the briefing",
+            "status": "in_progress",
+            "todos": ""
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let result = tool(args);
+        assert_eq!(result.value["count"], 1);
+        assert_eq!(todo.items()[0].content, "Draft the briefing");
     }
 }
 
